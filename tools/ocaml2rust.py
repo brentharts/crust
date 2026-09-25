@@ -89,8 +89,9 @@ class LocalFn:
 
 
 class Emitter:
-    def __init__(self, items, checker):
+    def __init__(self, items, checker, every_function=False):
         self.items, self.c = items, checker
+        self.every_function = every_function
         self.enums = {}                 # rust name -> (TCon, [(v, fields)])
         self.enum_order = []
         self.fns = []                   # emitted function texts
@@ -99,6 +100,7 @@ class Emitter:
         self.counter = 0
         self.globals = {}               # name -> ('fn'|'thunk'|'main', def)
         self.main_types = {}
+        self.lengths = set()            # list types `List.length` is used on
 
     # -- names --
     def fresh(self, base):
@@ -258,6 +260,14 @@ class Emitter:
                                % (name, v, k, name, self.rt(f), name, v,
                                   pat, get, other))
         return out
+
+    def render_lengths(self):
+        """`List.length`'s helper for each list type it is used on -- a
+        recursion the proof lift reads, by its exact text, as the list's
+        size less one."""
+        return ['fn ml_length_%s(v: %s) -> ml_int { if ml_is_%s_Cons(v) '
+                '{ 1i64 + ml_length_%s(ml_%s_Cons_1(v)) } else { 0i64 } }'
+                % ((e,) * 5) for e in sorted(self.lengths)]
 
     def field_rt(self, f):
         return '*mut %s' % self.rt(f) if self.is_enum(f) else self.rt(f)
@@ -547,6 +557,11 @@ class Emitter:
     def x_Application(self, e, ctx):
         f = e.func
         args = e.args
+        if isinstance(f, O.Variable) and f.name == 'List.length' and \
+                len(args) == 1:
+            ename = self.enum(self.apply(args[0].ty, ctx.sub), e.line)
+            self.lengths.add(ename)
+            return 'ml_length_%s(%s)' % (ename, self.expr(args[0], ctx))
         if isinstance(f, O.Variable) and f.name in BUILTINS and \
                 f.name not in ctx.locals and f.name not in ctx.local_fns \
                 and f.name not in self.globals:
@@ -906,6 +921,9 @@ class Emitter:
                     if name is None:
                         raise LowerError("a function must be named", d.line)
                     self.globals[name] = ('fn', d)
+                    if self.every_function and d.scheme is not None and \
+                            not d.scheme.quantified:
+                        self.global_fn(name, [], d.line)
                 elif name is not None and O.is_value(d.value) and \
                         not item.rec:
                     self.globals[name] = ('thunk', d)
@@ -934,6 +952,7 @@ class Emitter:
                'setrlimit(3, &r); } }',
                'fn ml_wrap(v: i64) -> i64 { (v << 1) >> 1 }']
         out += self.render_enums()
+        out += self.render_lengths()
         out += self.fns
         out.append('fn main() { ml_grow_stack(); %s}' % ''.join(main))
         return '\n'.join(out) + '\n'
@@ -951,10 +970,37 @@ def children(e):
                 yield v
 
 
-def lower(code):
-    """The Rust for an OCaml program."""
+def load(path, _seen=None):
+    """A source and what its `(* uses: a.ml b.ml *)` line names, as one
+    program: each used file first (and its own uses before it), each once --
+    the convention `load_unit` keeps for the Rust ports' `// uses:`."""
+    import os
+    import re
+    seen = set() if _seen is None else _seen
+    path = os.path.abspath(path)
+    if path in seen:
+        return ''
+    seen.add(path)
+    with open(path) as fh:
+        code = fh.read()
+    # a line `uses: a.ml b.ml` in a comment -- the header's, as the Rust
+    # ports keep `// uses:` in theirs
+    m = re.search(r'^\s*(?:\(\*)?\s*uses:\s*([\w. ]+?)\s*(?:\*\))?\s*$',
+                  code, re.M)
+    out = ''
+    if m:
+        for name in m.group(1).split():
+            out += load(os.path.join(os.path.dirname(path), name), seen)
+    return out + code + '\n'
+
+
+def lower(code, every_function=False):
+    """The Rust for an OCaml program.  `every_function`: emit each
+    monomorphic top-level function whether the program calls it or not --
+    a module's functions, to be proved (a polymorphic one is emitted at the
+    instances its callers use)."""
     items, c = O.check(code, strict=False)
-    return Emitter(items, c).program()
+    return Emitter(items, c, every_function).program()
 
 
 def main(argv):
@@ -963,10 +1009,12 @@ def main(argv):
         i = argv.index('-o')
         out = argv[i + 1]
         del argv[i:i + 2]
-    with open(argv[0]) as fh:
-        code = fh.read()
+    every = '--every-function' in argv
+    if every:
+        argv.remove('--every-function')
+    code = load(argv[0])
     try:
-        rust = lower(code)
+        rust = lower(code, every)
     except (O.CompileError, LowerError) as exc:
         print('%s: %s' % (argv[0], exc), file=sys.stderr)
         return 1

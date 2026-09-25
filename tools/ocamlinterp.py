@@ -74,7 +74,14 @@ class Interp:
             'fst': Closure(lambda p: p[0]),
             'snd': Closure(lambda p: p[1]),
             'min_int': -(1 << (BITS - 1)), 'max_int': (1 << (BITS - 1)) - 1,
+            'List.length': Closure(self.length),
         }
+
+    def length(self, v):
+        n = 0
+        while isinstance(v, Ctor) and v.name == '::':
+            n, v = n + 1, v.args[1]
+        return n
 
     def emit(self, text):
         self.out.append(text)

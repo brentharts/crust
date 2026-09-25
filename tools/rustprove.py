@@ -254,7 +254,57 @@ class Prover:
                     self._enum_helpers(env, e, enums, ktype, cases, sig, part)
             # size: one more than the sizes of the fields in the group --
             # every type's the same count, so they compare across the group
+            # every integer field in range: what a value that exists when
+            # the code runs is -- an OCaml int in a list is 63-bit, whatever
+            # the model's integers could hold
+            from shivyc.rustproof import _SIGNED_WIDTH as _SW
             for e in group:
+                minors = []
+                for t, v, fields in all_ctors:
+                    parts = []
+                    for i, (fty, _) in enumerate(fields):
+                        if fty in _SW:
+                            lo, hi = -(1 << (_SW[fty] - 1)), \
+                                (1 << (_SW[fty] - 1)) - 1
+                            f = L.Var("_f%d" % i)
+                            parts.append(H.app("andb", H.app(
+                                "int_leb", H.int_literal(lo), f), H.app(
+                                "int_leb", f, H.int_literal(hi))))
+                        elif fty in group:
+                            parts.append(L.Var("_ih%d" % i))
+                    out = L.Var("true")
+                    for part in reversed(parts):
+                        out = part if out == L.Var("true") else \
+                            H.app("andb", part, out)
+                    for i, (fty, _) in reversed(list(enumerate(fields))):
+                        if fty in group:
+                            out = L.Lambda("_ih%d" % i, H.BOOL, out)
+                    for i, (fty, _) in reversed(list(enumerate(fields))):
+                        out = L.Lambda("_f%d" % i, ktype(fty), out)
+                    minors.append(out)
+                motives = [L.Lambda("_", L.Var(t), H.BOOL) for t in group]
+                H.define(env, "ml_inrange_%s" % e, L.Pi("_", L.Var(e),
+                                                        H.BOOL),
+                         L.Lambda("v", L.Var(e), H.app(
+                             "%s.rec" % e, *(motives + minors + [L.Var("v")]))))
+                sig["ml_inrange_%s" % e] = ([L.Var(e)], H.BOOL)
+            for e in group:
+                from shivyc.rustproof import _is_list
+                if _is_list(enums, e):
+                    # List.length: 0 for Nil, one more than the tail's
+                    nat_len = H.app("%s.rec" % e, L.Lambda("_", L.Var(e),
+                                                           H.NAT),
+                                    H.numeral(0), L.Lambda("_h", ktype(
+                                        enums[e][1][1][0][0]), L.Lambda(
+                                        "_t", L.Var(e), L.Lambda(
+                                            "_ih", H.NAT, L.App(
+                                                L.Var("succ"),
+                                                L.Var("_ih"))))),
+                                    L.Var("v"))
+                    H.define(env, "ml_len_%s" % e, L.Pi("_", L.Var(e), H.INT),
+                             L.Lambda("v", L.Var(e), L.App(
+                                 L.Var("Int.ofNat"), nat_len)))
+                    sig["ml_len_%s" % e] = ([L.Var(e)], H.INT)
                 nat_size = size_of(e)
                 H.define(env, "ml_size_%s" % e, L.Pi("_", L.Var(e), H.INT),
                          L.Lambda("v", L.Var(e), L.App(

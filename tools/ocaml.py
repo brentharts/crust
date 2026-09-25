@@ -709,6 +709,13 @@ class Parser:
     def parse_atom(self):
         t = self.cur()
         line = t.line
+        toks = self.tokens[self.pos:self.pos + 3]
+        if len(toks) == 3 and t.type == 'UID' and t.value == 'List' and \
+                toks[1].value == '.' and toks[2].value == 'length':
+            # the one library function the subset has: what a contract
+            # needs to bound a count by the list it counts
+            self.next(), self.next(), self.next()
+            return self.node(Variable('List.length'), line)
         if t.type == 'INT':
             self.next()
             return self.node(Const(int(t.value.replace('_', ''))), line)
@@ -965,6 +972,7 @@ class Checker:
             'print_newline': Scheme([], arrow(UNIT, UNIT)),
             # OCaml's 63-bit bounds
             'min_int': Scheme([], INT), 'max_int': Scheme([], INT),
+            'List.length': Scheme([a], arrow(TCon('list', [a]), INT)),
         }
         self.toplevel = []                      # (name, Scheme, LetDef)
 
