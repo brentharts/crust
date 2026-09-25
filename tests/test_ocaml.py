@@ -89,7 +89,7 @@ class TestRefused(unittest.TestCase):
         'let s = "hi"': "strings",
         "let x = 1.5": "floats",
         "type t = A | B\nlet f x = match x with A | B -> 1": "or-patterns",
-        "let x = List.length": "modules",
+        "let x = String.length": "modules",
         "let r = (fun x -> x) (fun y -> y)\nlet a = r 1\nlet b = r true":
             "expected bool, found int",
         "(* never closed": "unterminated comment",
