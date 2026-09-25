@@ -292,7 +292,51 @@ def _helper_templates(enums):
                                   "x[0]" if ptr else "x",
                                   ', _ => panic!("Match_failure")'
                                   if many else "")))
+        # `List.length` on a list type: its size less one
+        names = [v for v, _ in variants]
+        if names == ["Nil", "Cons"] and len(variants[1][1]) == 2 and \
+                variants[1][1][1] == (name, True):
+            out["ml_length_%s" % name] = ("length", name, None, None, (
+                "fn ml_length_%s(v: %s) -> ml_int { if ml_is_%s_Cons(v) "
+                "{ 1i64 + ml_length_%s(ml_%s_Cons_1(v)) } else { 0i64 } }"
+                % ((name,) * 5)))
     return out
+
+
+def _is_list(enums, name):
+    """`Nil | Cons of a * *mut name`: what ocaml2rust writes for a list."""
+    variants = enums[name]
+    return [v for v, _ in variants] == ["Nil", "Cons"] and \
+        len(variants[1][1]) == 2 and variants[1][1][1] == (name, True)
+
+
+def _linear(enums, name):
+    """Is every value of `name` a chain -- at most one field of each
+    variant of its own type, and none of a type that reaches back to it?
+    Then its constructors below the top are distinct cells (each one's tail
+    is strictly smaller), so a value in memory has fewer than 2^60 of them:
+    a cell is a `malloc` of at least 16 bytes, and there are 2^64 bytes.
+    A tree is not a chain -- its subtrees may be one shared value, and its
+    size is not bounded by the memory it takes."""
+    for _v, fields in enums[name]:
+        own = [f for f, _ in fields if f == name]
+        back = [f for f, _ in fields if f in enums and f != name
+                and name in _reaches(enums, f)]
+        if len(own) > 1 or back:
+            return False
+    return True
+
+
+def _reaches(enums, start):
+    seen, todo = set(), [start]
+    while todo:
+        x = todo.pop()
+        for _v, fields in enums[x]:
+            for f, _ in fields:
+                if f in enums and f not in seen:
+                    seen.add(f)
+                    todo.append(f)
+    return seen
 
 
 def _heap_discipline(source, toks, enums, fn_index):
@@ -878,6 +922,21 @@ class _FnLifter:
         # the signed ranges are not symbolic the way `max_uN` is.
         int_ranges = []
         for frag, ty in params:
+            if ty.kind == "enum":
+                # every integer in it is an OCaml int: true of any value
+                # the running code can hold, as a parameter's range is
+                int_ranges.append("    assert ml_inrange_%s(%s)"
+                                  % (ty.name, frag))
+            if ty.kind == "enum" and _linear(self.unit.enums, ty.name):
+                # a chain in memory: fewer than 2^60 cells (`_linear`) --
+                # for a list, stated on its length
+                if _is_list(self.unit.enums, ty.name):
+                    int_ranges.append("    assert (ml_len_%s(%s) <= Int(%d))"
+                                      % (ty.name, frag, 1 << 60))
+                else:
+                    int_ranges.append(
+                        "    assert (ml_size_%s(%s) <= Int(%d))"
+                        % (ty.name, frag, 1 << 61))
             if ty.kind == "int" and ty.width:
                 lo, hi = _int_range(ty.width)
                 int_ranges.append("    assert ((Int(%d) <= %s) and (%s <= Int(%d)))"
@@ -2107,6 +2166,8 @@ class _FnLifter:
         (e, ty), = args
         if kind == "box":
             return e, ty
+        if kind == "length":
+            return "ml_len_%s(%s)" % (ename, e), _Ty("int", 63)
         if kind == "is":
             return "%s(%s)" % (fname, e), _BOOL
         variants = self.unit.enums[ename]
