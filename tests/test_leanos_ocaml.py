@@ -157,6 +157,29 @@ class TestAgreesWithPython(unittest.TestCase):
                         loader.index("let admit"))
 
 
+class TestGeneratedFromTheEquation(unittest.TestCase):
+    """`generated_crustos.ml` is what `tools/latex2ocaml.py` writes from the
+    CrustOS equation `eq:crustos` in RosettaMath's `crustos_eq.tex`."""
+
+    TEX = os.path.join(ROOT, "..", "RosettaMath", "crustos_eq.tex")
+
+    @unittest.skipUnless(os.path.exists(TEX), "RosettaMath is not beside crust")
+    def test_regenerates_byte_for_byte(self):
+        import latex2ocaml
+        with open(self.TEX) as fh:
+            text = latex2ocaml.convert(fh.read(), "eq:crustos",
+                                       "crustos_prims.ml")
+        with open(os.path.join(LEANOS, "generated_crustos.ml")) as fh:
+            self.assertEqual(fh.read(), text)
+
+    def test_agrees_with_python(self):
+        r = subprocess.run([sys.executable, os.path.join(
+            ROOT, "tools", "crustos_agree.py")], capture_output=True,
+            text=True, timeout=600)
+        self.assertIn("interpreter agrees True ; compiled agrees True",
+                      r.stdout, r.stdout + r.stderr)
+
+
 # Every obligation the kernel does not settle, per module, and why.  A new
 # open obligation fails the proof test, so one cannot appear quietly.
 OPEN = {
