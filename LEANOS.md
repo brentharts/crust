@@ -178,6 +178,21 @@ The first two are one shape -- a guard `x <= max_int - y`, whose right side
 is itself a case the tactic must split before the guard says anything; the
 rest reach a callee's contract through a comparison with a constant.
 
+## A kernel from an equation
+
+`generated_crustos.ml` is not written by hand.  `tools/latex2ocaml.py`
+reads the equation RosettaMath's `crustos_eq.tex` states the CrustOS kernel
+as (`eq:crustos`) and writes the OCaml it describes: the definitions the
+equation makes in its braces and `where` lines, its `Nat.rec` fold as a
+counted recursion, and its two theorems as `[@@requires]`/`[@@ensures]`.
+What the equation names and does not define -- `tick`, `pass`,
+`accepted`, `split`, the context -- is `crustos_prims.ml`, a hand port of
+the model.  `tools/crustos_agree.py` holds the compiled kernel to the
+Python; `tests/test_leanos_ocaml.py` checks that it regenerates byte for
+byte and still agrees.  Proving the equation's theorems again of the
+*compiled* kernel is in progress: the ocamlrust paper's table has where it
+stands.
+
 ## What is claimed at each step, and what is not
 
 Every milestone states its theorem in `LEAN.md` terms: what is modelled,
