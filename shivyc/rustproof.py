@@ -2087,6 +2087,8 @@ class _FnLifter:
             ret = _Ty("nat", 64)
         elif callee.ret == "Int":
             ret = _Ty("int", 64)
+        elif callee.ret in self.unit.enums:
+            ret = _Ty("enum", 0, callee.ret)    # an enum, not a record
         else:
             ret = _Ty("rec", 0, callee.ret)
         return "%s(%s)" % (fname, text), ret
