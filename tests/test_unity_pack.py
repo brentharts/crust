@@ -910,6 +910,16 @@ public class Player : MonoBehaviour {
         self.assertEqual(col["tris"][0], (6.0, -2.0, 4.0, -3.0, 6.0, -3.0))
         self.assertEqual(len(col["tris"]), 2)
 
+    def test_overloaded_helper_inlines_vector2(self):
+        body = ("\n public static Vector3 SetX (Vector3 v, float x)"
+                " { return new Vector3(x, v.y, v.z); }"
+                "\n public static Vector2 SetX (Vector2 v, float x)"
+                " { return new Vector2(x, v.y); }\n")
+        scan = cs2cpp._blank(body)
+        self.assertEqual(cs2cpp.static_method_exprs(body, scan), {})
+        got = cs2cpp.static_method_exprs(body, scan, prefer_first="Vector2")
+        self.assertEqual(got["SetX"][1], "new Vector2(x, v.y)")
+
     def test_property_getters_are_methods(self):
         body = ("\n public int Hits\n {\n  get\n  {\n   return hits * 2;\n  }\n"
                 "  set\n  {\n   hits = value;\n  }\n }\n bool Ready\n {\n"

@@ -7218,7 +7218,10 @@ def _static_helper_methods():
                 body, bs = text[open_i + 1:close], bscan[open_i + 1:close]
                 cname = m.group(1)
                 seen[cname] = seen.get(cname, 0) + 1
-                meths = cs2cpp.static_method_exprs(body, bs, field.findall(bs))
+                # ponytail: C has only Vector2, so `SetX(Vector2)` stands in
+                # for its Vector3 overloads; a Vector3Int receiver is not told apart
+                meths = cs2cpp.static_method_exprs(body, bs, field.findall(bs),
+                                                   prefer_first="Vector2")
                 if meths:
                     got.setdefault(cname, {}).update(meths)
     for cname, n in seen.items():

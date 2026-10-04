@@ -5923,13 +5923,16 @@ def static_setter_stmts(body, bscan, member_names=()):
     return _static_property_accessors(body, bscan, member_names)[1]
 
 
-def static_method_exprs(body, bscan, member_names=()):
+def static_method_exprs(body, bscan, member_names=(), prefer_first=None):
     """``{Name: (params, text, is_void)}`` for static methods declared once
     whose body is one ``return expr;`` / ``=> expr`` (or, for ``void``, one
     statement), naming none of *member_names* nor another static method of
     the type, so a call can be replaced by the body with its parameters
     bound: ``static bool GetBool(string key, bool d = false) { return
-    PlayerPrefs.GetInt(key, d.GetHashCode()) == 1; }``."""
+    PlayerPrefs.GetInt(key, d.GetHashCode()) == 1; }``.
+
+    An overloaded name is kept when exactly one overload's first parameter
+    is of type *prefer_first* -- that overload stands for all of them."""
     import tools.cpprust as cpprust
     head = re.compile(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)?static"
@@ -5958,9 +5961,16 @@ def static_method_exprs(body, bscan, member_names=()):
     names = [d[1] for d in decls]
     own = set(member_names) | set(names)
     out = {}
+    def first_ty(params):
+        prms = parse_params(params)
+        return prms[0].type if prms else None
+
     for ret, name, params, at, kind in decls:
         if names.count(name) != 1:
-            continue
+            if prefer_first is None or first_ty(params) != prefer_first or [
+                    first_ty(d[2]) for d in decls
+                    if d[1] == name].count(prefer_first) != 1:
+                continue
         if kind == "=>":
             end = bscan.find(";", at)
             text = body[at + 2:end].strip() if end >= 0 else ""
