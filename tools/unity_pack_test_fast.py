@@ -723,6 +723,74 @@ public class User : MonoBehaviour {
 
 
 
+class TestStaticStateAndForeach(unittest.TestCase):
+    """Slime Jump forms: a static property over a static backing field
+    (`P += x`, `P++`), a `static Bag b = new Bag();` handle made at the
+    first tick, and `foreach` over a List<int>. Each emptied its method."""
+
+    BAG = "public class Bag { public int n; }\n"
+    P = """using UnityEngine;
+using System.Collections.Generic;
+public class P : MonoBehaviour {
+    static int _pts;
+    public static int Points { get { return _pts; } set { _pts = value; } }
+    static Bag bag = new Bag();
+    List<int> xs = new List<int>();
+    int _f;
+    void Update() {
+        _f++; if (_f > 1) return;
+        Points += 3; Points++;
+        bag.n = 5;
+        xs.Add(2); xs.Add(4);
+        int s = 0;
+        foreach (int x in xs) s += x;
+        Debug.Log("pts " + Points + " bag " + bag.n + " sum " + s);
+    }
+}
+"""
+
+    @needs_cc
+    def test_values_follow_csharp(self):
+        root = project(self, {"P": self.P, "Bag": self.BAG}, [("P",)])
+        self.assertIn("pts 4 bag 5 sum 6", run_frames(self, pack(self, root)))
+
+
+class TestStaticReference(unittest.TestCase):
+    """`static Ach current;` -- a static reference to a packed object, set
+    bare in its class and read as `Ach.current` elsewhere (Slime Jump's
+    `SpeedAchievement.current` emptied `GameManager.Update`)."""
+
+    ACH = """using UnityEngine;
+public class Ach : MonoBehaviour {
+    public static Ach current;
+    public float left = 3f;
+    public float TimeLeft { get { return left; } set { left = value; } }
+    void Start() { current = this; }
+}
+"""
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    int _f;
+    void Update() {
+        _f++;
+        if (Ach.current == null) { Debug.Log("none " + _f); return; }
+        Ach.current.TimeLeft -= 1f;
+        if (Ach.current.TimeLeft <= 0) { Ach.current = null; return; }
+        Debug.Log("left " + (int)Ach.current.TimeLeft);
+    }
+}
+"""
+
+    @needs_cc
+    def test_set_read_and_cleared(self):
+        root = project(self, {"Ach": self.ACH, "Mgr": self.MGR},
+                       [("Ach",), ("Mgr",)])
+        out = run_frames(self, pack(self, root), 5)
+        self.assertIn("left 2", out)
+        self.assertIn("left 1", out)
+        self.assertIn("none 4", out)
+
+
 class TestOtherPosition(unittest.TestCase):
     """`target.position` through a Transform field, read as a vector value:
     it stopped at a member of the field's read and emptied the method

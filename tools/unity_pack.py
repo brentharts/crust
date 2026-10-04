@@ -4631,7 +4631,18 @@ def _new_budget(analyses, plan):
                 if t not in classes or t in _ADDABLE_BUILTINS:
                     continue
                 budget[t] = budget.get(t, 0) + n
+            # `static T f = new T();`: one object, made at the first tick
+            for t in _static_new_fields(c.get("fields"), classes).values():
+                budget[t] = budget.get(t, 0) + 1
     return budget
+
+
+def _static_new_fields(fields, classes):
+    """{name: class} of the `static T f = new T();` fields of a packed T."""
+    return {f["name"]: f["ty"].split(".")[-1] for f in fields or ()
+            if f.get("static") and f.get("new_init")
+            and f["ty"].split(".")[-1] in classes
+            and f["ty"].split(".")[-1] not in _ADDABLE_BUILTINS}
 
 
 def _class_index_width(cname, n, spawn, annotated=None):
@@ -5028,10 +5039,37 @@ def _rewrite_new_packed_class(text, plan):
             continue
         if not int(budget.get(cname) or 0):
             continue
-        text = cs2cpp.code_sub(
-            r"(?<![\w.])new\s+(?:[\w.]+\s*\.\s*)?%s\s*\(" % re.escape(cname),
-            "Object_New_%s(" % _c_ident(cname), text)
+        idn = _c_ident(cname)
+        call = r"(?<![\w.])new\s+(?:[\w.]+\s*\.\s*)?%s\s*\(" % re.escape(cname)
+        ctors = [m for _c, m in (plan.get("_methods_by") or {}).get(cname, [])
+                 if m.get("ctor") and m.get("name") == cname]
+        if len(ctors) < 2:
+            text = cs2cpp.code_sub(call, "Object_New_%s(" % idn, text)
+            continue
+        # overloads by argument type; a call none or several fit is left
+        out, pos = [], 0
+        for m in list(re.finditer(call, cs2cpp._blank(text))):
+            if m.start() < pos:
+                continue
+            got = _match_call_args(text, m.end() - 1)
+            meth = got and _pick_overload(ctors, got[0], ())
+            if not meth:
+                continue
+            args, end = got
+            margs = meth.get("args") or ""
+            out += [text[pos:m.start()], "%s(%s)" % (
+                _object_new_symbol(idn, margs, True),
+                _call_with_defaults(args, cs2cpp.parse_params(margs)).strip())]
+            pos = end
+        text = "".join(out) + text[pos:]
     return text
+
+
+def _object_new_symbol(idn, args_str, overloaded):
+    """`new T(..)`'s C function: one per constructor overload."""
+    if not overloaded:
+        return "Object_New_%s" % idn
+    return "Object_New_%s_%s" % (idn, cs2cpp.method_arg_type_suffix(args_str))
 
 
 def _rewrite_getcomponentsinchildren(text, plan, this_class):
@@ -6985,6 +7023,9 @@ def _fields_in(body, bscan, body_abs=0):
                 default = _parse_csharp_field_init(ty, init_src)
                 if default is not None:
                     entry["default"] = default
+                if re.match(r"\s*new\s+(?:[\w.]+\.)?%s\s*\(\s*\)\s*$"
+                            % re.escape(ty.split(".")[-1]), init_src):
+                    entry["new_init"] = True
         out.append(entry)
     return out
 
@@ -7879,11 +7920,27 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 text)
         for f in sorted((ocl.get("class_consts") or []),
                         key=lambda f: -len(f["name"])):
-            if _is_scalar_static(f):
+            if _is_scalar_static(f) or _is_ref_static(f, plan, ocname):
                 text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\s*\.\s*%s\b(?!\s*\()"
                     % (re.escape(ocname), re.escape(f["name"])),
                     "%s_%s" % (oidn, f["name"]), text)
+            if not _is_ref_static(f, plan, ocname):
+                continue
+            sym = "%s_%s" % (oidn, f["name"])
+            if ocname == this:
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])(?:this\s*\.\s*)?%s\b(?!\s*\()"
+                    % re.escape(f["name"]), sym, text)
+            # an index: null is -1. ponytail: a destroyed object still reads
+            # non-null (Unity's == null is true); clear it in OnDestroy if
+            # that matters
+            text = cs2cpp.code_sub(r"(?<![\w.])%s\s*==\s*null\b" % sym,
+                                   "%s < 0" % sym, text)
+            text = cs2cpp.code_sub(r"(?<![\w.])%s\s*!=\s*null\b" % sym,
+                                   "%s >= 0" % sym, text)
+            text = cs2cpp.code_sub(r"(?<![\w.])%s\s*=\s*null\b" % sym,
+                                   "%s = -1" % sym, text)
         member_names = {n for n, _t, _b, _k in (ocl.get("members") or [])}
         for mem in sorted(member_names, key=len, reverse=True):
             if mem.endswith("_x") or mem.endswith("_y") or mem.endswith("_z"):
@@ -7926,6 +7983,10 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
         if use_inst or ocname in (plan.get("classes") or {}):
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*enabled\b"
+                r"(?!\s*=(?!=))" % re.escape(ocname),
+                "%s_get_enabled(%s)" % (oidn, inst), text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b"
                 % re.escape(ocname),
@@ -7988,6 +8049,49 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                     "%s(" % sym, text)
             text = _fill_defaults_after(
                 text, sym, cs2cpp.parse_params(m.get("args") or ""))
+        text = _lower_static_properties(text, plan, ocname, pairs, overloaded,
+                                        ocname == this)
+    return text
+
+
+def _lower_static_properties(text, plan, ocname, pairs, overloaded, own):
+    """A static property of *ocname* used by name -- `Type.Name`, or bare
+    `Name` inside the type -- as the `get_Name` / `set_Name` functions
+    `properties_as_methods` made: `Name = x;` the setter, `Name += x;` /
+    `Name++;` the setter of the getter's value, a read the getter (when its
+    type has a C value)."""
+    oidn = _c_ident(ocname)
+    acc = {m["name"]: m for _c, m in pairs
+           if m.get("static") and m["name"][:4] in ("get_", "set_")
+           and m["name"] not in overloaded
+           and m["name"][4:] not in ("Instance", "instance")}
+    for prop in sorted({n[4:] for n in acc}, key=len, reverse=True):
+        get, put = acc.get("get_" + prop), acc.get("set_" + prop)
+        if get is not None and _ret_c_ty(get.get("ret"), plan) in (None, "void"):
+            get = None
+        recv = r"(?<![\w.])(?:%s\s*\.\s*%s%s)" % (
+            re.escape(ocname), re.escape(prop),
+            r"|(?<![\w.])%s" % re.escape(prop) if own else "")
+        gsym = "%s_get_%s()" % (oidn, prop)
+        if put is not None:
+            ssym = "%s_set_%s" % (oidn, prop)
+            if get is not None:
+                text = cs2cpp.code_sub(
+                    r"(?:%s)\s*([-+*/])=\s*([^;]+);" % recv,
+                    lambda m, s=ssym, g=gsym: "%s(%s %s (%s));" % (
+                        s, g, m.group(1), m.group(2).strip()), text)
+                text = cs2cpp.code_sub(
+                    r"(?:(?:%s)\s*(\+\+|--)|(\+\+|--)\s*(?:%s))\s*;"
+                    % (recv, recv),
+                    lambda m, s=ssym, g=gsym: "%s(%s %s 1);" % (
+                        s, g, (m.group(1) or m.group(2))[0]), text)
+            text = cs2cpp.code_sub(
+                r"(?:%s)\s*=(?!=)\s*([^;]+);" % recv,
+                lambda m, s=ssym: "%s(%s);" % (s, m.group(1).strip()), text)
+        if get is not None:
+            text = cs2cpp.code_sub(
+                r"(?:%s)\b(?!\s*(?:\(|[-+*/]?=(?!=)|\+\+|--))" % recv,
+                gsym, text)
     return text
 
 
@@ -13455,9 +13559,25 @@ def _emit_class_scalar_statics(p, plan, cl, idn):
                     qual, idn, fname, int(val)))
         elif f.get("ty") in ("StreamWriter", "StreamReader"):
             p("static FILE *%s_%s;" % (idn, fname))
+        elif fname in _static_new_fields([f], plan.get("classes") or {}):
+            p("static int %s_%s = -1; /* made at the first tick */"
+              % (idn, fname))
+        elif _is_ref_static(f, plan, cl.get("name")):
+            p("static int %s_%s = -1;" % (idn, fname))
         # List / Dictionary / SortedList / ref arrays: preamble above.
     if any(_is_scalar_static(f) for f in (cl.get("class_consts") or [])):
         p("")
+
+
+def _is_ref_static(f, plan, cname):
+    """`static Other current;`: a packed object's index, -1 for null. A
+    singleton's own `instance` is `Cls_instance` already, a `= new T()` a
+    made-at-first-tick handle."""
+    classes = plan.get("classes") or {}
+    return (f.get("static") and not f.get("const") and f.get("ty") in classes
+            and not (f["name"] in ("instance", "Instance") and cname in (
+                plan.get("singleton_instance_types") or ()))
+            and not _static_new_fields([f], classes))
 
 
 def _is_scalar_static(f):
@@ -13822,6 +13942,10 @@ def _emit_engine_class_groups(
             _has("OnEnable"), _has("OnDisable"), _has("OnDestroy"))
         p("/* awoken (1), started (2), enabled (4): per instance */")
         p("static unsigned char _%s_life[%d];" % (idn, cap))
+        # ponytail: `enabled` reads "enabled and active" (Unity's stays true
+        # on an inactive GameObject); a per-row enabled bit if that matters
+        p("static int %s_get_enabled(unsigned i) { return (_%s_life[i] & 4)"
+          " != 0; }" % (idn, idn))
         # Unity's messages as a GameObject becomes active (Awake the first
         # time, then OnEnable), inactive (OnDisable), or is destroyed
         # (OnDisable if enabled, then OnDestroy). Called directly: a
@@ -18523,25 +18647,29 @@ def emit_engine(plan, analyses, used_apis):
         cap = max(1, int(cl["n"]) + _mb_pool_extra(plan, cname))
         ctors = [m for _c, m in methods_by.get(cname, [])
                  if m.get("ctor") and m.get("name") == cname]
-        ctor = ctors[0] if len(ctors) == 1 else None
-        plist = _method_c_params(ctor.get("args") or "") if ctor else ""
-        if ctor:
-            p("static void %s_%s(unsigned i%s);" % (
-                idn, cname, (", " + plist) if plist else ""))
-        p("/* new %s(..) — next free pool slot, then the constructor. */"
-          % cname)
-        p("static int Object_New_%s(%s) {" % (idn, plist or "void"))
-        p("    int ex;")
-        p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
-        p("    ex = _%s_inst_count;" % idn)
-        p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
-        if ctor:
-            names = _method_c_arg_names(ctor.get("args") or "")
-            p("    %s_%s((unsigned)ex%s);" % (
-                idn, cname, "".join(", " + n for n in names)))
-        p("    return ex;")
-        p("}")
-        p("")
+        ov = len(ctors) > 1
+        for ctor in ctors or [None]:
+            args = (ctor or {}).get("args") or ""
+            plist = _method_c_params(args)
+            csym = _method_c_symbol(idn, cname, args, ov)
+            if ctor:
+                p("static void %s(unsigned i%s);" % (
+                    csym, (", " + plist) if plist else ""))
+            p("/* new %s(..) — next free pool slot, then the constructor. */"
+              % cname)
+            p("static int %s(%s) {" % (_object_new_symbol(idn, args, ov),
+                                       plist or "void"))
+            p("    int ex;")
+            p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+            p("    ex = _%s_inst_count;" % idn)
+            p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+            if ctor:
+                names = _method_c_arg_names(args)
+                p("    %s((unsigned)ex%s);" % (
+                    csym, "".join(", " + n for n in names)))
+            p("    return ex;")
+            p("}")
+            p("")
 
     # A class reached through another's handle field (`other.hp` ->
     # `Other_AT(..).hp`) is read from that class's group, which may come
@@ -18812,6 +18940,27 @@ def emit_engine(plan, analyses, used_apis):
             p("            for (_k = 0u; _k < %du; _k = _k + 1u) "
               "_%s_seed_strings(_k);"
               % (max(1, int(plan["classes"][cname]["n"])), idn))
+        p("        }")
+        p("    }")
+    made = []
+    for cname, cl in sorted(plan["classes"].items()):
+        for fname, t in sorted(_static_new_fields(
+                cl.get("class_consts"), plan["classes"]).items()):
+            ctors = [m for _c, m in methods_by.get(t, [])
+                     if m.get("ctor") and m.get("name") == t]
+            if ctors and not any(not (m.get("args") or "").strip()
+                                 for m in ctors):
+                continue
+            made.append("%s_%s = %s();" % (
+                _c_ident(cname), fname,
+                _object_new_symbol(_c_ident(t), "", len(ctors) > 1)))
+    if made:
+        p("    {")
+        p("        static int _engine_statics_made = 0;")
+        p("        if (!_engine_statics_made) {")
+        p("            _engine_statics_made = 1;")
+        for s in made:
+            p("            " + s)
         p("        }")
         p("    }")
     seeded = sorted(plan.get("ref_array_seeds") or {})
@@ -22503,6 +22652,10 @@ def _reference_holds(text, cl, plan, site):
             "idx:") else None
         if other in classes:
             holds[name] = other
+    for oname, ocl in classes.items():
+        for f in ocl.get("class_consts") or []:
+            if f.get("static") and f.get("ty") in classes:
+                holds["%s_%s" % (_c_ident(oname), f["name"])] = f["ty"]
     for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
         if prm.type in classes:
             holds[prm.name] = prm.type
@@ -22634,7 +22787,12 @@ def _handle_field_access(text, plan, holds):
         ocl = classes.get(other)
         if not ocl:
             continue
-        names = [m[0] for m in ocl.get("members") or ()]
+        # an `idx:` member of no packed class (a collection type the planner
+        # did not parse) has no faithful accessor: left, the method stubs
+        names = [m[0] for m in ocl.get("members") or ()
+                 if not str(m[3]).startswith("idx:")
+                 or str(m[3])[4:] in classes or str(m[3])[4:] in (
+                     "LineRenderer", "AnimationCurve")]
         if not names:
             continue
         o = _c_ident(other)
@@ -22735,6 +22893,10 @@ def _local_handle_fields(text, cl, plan, site):
                          cs2cpp._blank(text)):
         if m.group(1) in classes:
             holds[m.group(2)] = m.group(1)
+    # a `static T f = new T();` handle: bare in its class, `Cls.f` elsewhere
+    for oname, ocl in classes.items():
+        for f, t in _static_new_fields(ocl.get("class_consts"), classes).items():
+            holds[f if oname == cl.get("name") else "%s.%s" % (oname, f)] = t
     text = _handle_method_calls(text, plan, holds)
     text = _handle_field_access(text, plan, holds)
     text = _handle_positions(text, plan, holds)
@@ -24344,6 +24506,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
         "Keyboard_current()", text)
+    # a null compare lowered first (an inlined static getter's), as above
+    text = cs2cpp.code_sub(r"Keyboard_current\(\)\s*([!=])=\s*-1\b",
+                           r"Keyboard_current() \1= 0", text)
     # Debug.Log / print → Debug_Log. Drop optional context object arg.
     text = cs2cpp.lower_bindings(text, _UNITY_API_LOG)
     text = _strip_debug_log_context_arg(text)
@@ -24658,6 +24823,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if str(kind).startswith("idx:")
         and _c_ident(kind.split(":", 1)[1]) in handle_fields.values()
         and n in handle_fields}
+    for oname, ocl in plan["classes"].items():
+        for f in ocl.get("class_consts") or []:
+            if _is_ref_static(f, plan, oname):
+                field_holds["%s_%s" % (_c_ident(oname), f["name"])] = f["ty"]
     text = _handle_method_calls(text, plan, field_holds)
     text = _handle_field_access(text, plan, field_holds)
     text = _handle_positions(text, plan, field_holds)
@@ -24732,6 +24901,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(r"std::vector<\s*std::string\s*>",
                            "std::vector<fastring>", text)
     text = _lower_list_searches(text, cl, plan)
+    scan = cs2cpp._blank(text)
+    vecs = set(re.findall(r"std::vector<[^;{}]*?>\s*&?\s*(\w+)\s*[;=]", scan))
+    heads = re.findall(r"(?<![\w])foreach\s*\([^;{}]*?\bin\s+(\w+)\s*\)", scan)
+    if heads and len(heads) == scan.count("foreach") and set(heads) <= vecs:
+        text = cs2cpp._lower_foreach(text)
     _sl = set(re.findall(r"std::vector<fastring>\s*&?\s*(\w+)\s*[;=]",
                          cs2cpp._blank(text)))
     text = _own_string_locals(text, string_idents, int_idents,
