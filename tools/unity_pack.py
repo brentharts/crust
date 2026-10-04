@@ -7875,7 +7875,11 @@ def _reachable_emit_methods(methods, extra_roots=()):
             for other in by_name:
                 if other in reach:
                     continue
-                if re.search(r"(?<![\w.])%s\s*\(" % re.escape(other), body):
+                # a property's accessor: by the property's own name
+                pat = (r"(?<![\w.])%s\b" % re.escape(other[4:])
+                       if other[:4] in ("get_", "set_")
+                       else r"(?<![\w.])%s\s*\(" % re.escape(other))
+                if re.search(pat, body):
                     reach.add(other)
                     queue.append(other)
     return reach
@@ -22109,6 +22113,23 @@ def _handle_method_calls(text, plan, holds):
             pat, lambda m, o=_c_ident(other): "%s_%s(%s%s" % (
                 o, m.group(2), m.group(1), ")" if m.group(3) else ", "),
             text)
+        # `other.P` an instance property: its get_P / set_P methods
+        o = _c_ident(other)
+        for prop in sorted({n[4:] for n in names if n.startswith("get_")}
+                           & {n[4:] for n in names if n.startswith("set_")},
+                           key=len, reverse=True):
+            head = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*%s\b" % (
+                re.escape(recv), re.escape(prop))
+            text = cs2cpp.code_sub(
+                head + r"\s*([-+*/]?)=(?!=)\s*([^;]*);",
+                lambda m, r=recv, p=prop: (
+                    "%s_set_%s(%s, %s);" % (o, p, r, m.group(2))
+                    if not m.group(1) else
+                    "%s_set_%s(%s, %s_get_%s(%s) %s (%s));" % (
+                        o, p, r, o, p, r, m.group(1), m.group(2))), text)
+            text = cs2cpp.code_sub(
+                head + r"(?!\s*(?:\(|\+\+|--))",
+                "%s_get_%s(%s)" % (o, prop, recv), text)
     return text
 
 
@@ -22131,6 +22152,34 @@ def _reference_holds(text, cl, plan, site):
         if m.group(1) in classes:
             holds[m.group(2)] = m.group(1)
     return holds
+
+
+def _lower_own_properties(text, cl, plan, site):
+    """An instance property of this class used by name: a read calls its
+    getter, `Name = x;` its setter -- the `get_Name` / `set_Name` methods
+    `properties_as_methods` made. A getter whose type has no C value is
+    left (the method stubs)."""
+    meths = {m["name"]: m for _c, m in
+             (plan.get("_methods_by") or {}).get(cl["name"], [])
+             if not m.get("static")}
+    me = (site or {}).get("method")
+    for name, m in sorted(meths.items()):
+        if not name.startswith("set_") or me == name:
+            continue
+        prop = name[4:]
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*=(?!=)\s*([^;]+);"
+            % re.escape(prop), r"%s(\1);" % name, text)
+    for name, m in sorted(meths.items()):
+        if not name.startswith("get_") or me == name:
+            continue
+        rty = _ret_c_ty(m.get("ret"), plan)
+        if not rty or rty == "void":
+            continue
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\b(?!\s*(?:\(|[-+*/]?=(?!=)|\+\+|--))"
+            % re.escape(name[4:]), "%s()" % name, text)
+    return text
 
 
 def _lower_godot_tree(text, cl, plan, site):

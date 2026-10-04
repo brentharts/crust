@@ -910,6 +910,21 @@ public class Player : MonoBehaviour {
         self.assertEqual(col["tris"][0], (6.0, -2.0, 4.0, -3.0, 6.0, -3.0))
         self.assertEqual(len(col["tris"]), 2)
 
+    def test_property_getters_are_methods(self):
+        body = ("\n public int Hits\n {\n  get\n  {\n   return hits * 2;\n  }\n"
+                "  set\n  {\n   hits = value;\n  }\n }\n bool Ready\n {\n"
+                "  get => hits > 0;\n }\n")
+        ms = {m["name"]: m for m in cs2cpp.properties_as_methods(
+            body, cs2cpp._blank(body))}
+        self.assertEqual(sorted(ms), ["get_Hits", "get_Ready", "set_Hits"])
+        self.assertEqual(ms["get_Ready"]["body"], "return hits > 0;")
+        self.assertEqual(ms["get_Hits"]["ret"], "int")
+        # a private property's getter is reached through its name
+        reach = unity_pack._reachable_emit_methods([
+            {"name": "Update", "body": "if (Ready) f();"},
+            {"name": "get_Ready", "body": "return 1;"}])
+        self.assertIn("get_Ready", reach)
+
     def test_list_searches_per_element_type(self):
         root = self._mini({"Player.cs": """using UnityEngine;
 using System.Collections.Generic;
