@@ -2737,6 +2737,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if not far:
                 far = re.search(
                     r"(?m)^\s+m_FarClipPlane:\s*([0-9.eE+-]+)", block)
+            cull = re.search(
+                r"m_CullingMask:\s*\n\s+serializedVersion:\s*\d+\s*\n"
+                r"\s+m_Bits:\s*(-?\d+)", block)
             rec["camera"] = {
                 "orthographic": int(ortho.group(1)) if ortho else 1,
                 "orthographic_size": (
@@ -2747,6 +2750,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 # Unity defaults when YAML omits clip planes.
                 "near_clip": float(near.group(1)) if near else 0.3,
                 "far_clip": float(far.group(1)) if far else 1000.0,
+                "culling_mask": int(cull.group(1)) & 0xFFFFFFFF
+                if cull else 0xFFFFFFFF,
             }
         if kind in _JOINT2D_KINDS:
             rec["joint2d"] = _parse_joint2d(kind, block)
@@ -3377,6 +3382,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_b": cam["bg_b"],
                 "near_clip": cam["near_clip"],
                 "far_clip": cam["far_clip"],
+                "culling_mask": cam.get("culling_mask", 0xFFFFFFFF),
             })
         # Camera-only GOs are not packed as scripted instances.
         if (cam is not None and script is None and sprite is None
@@ -19117,6 +19123,25 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_collect(out, &n, max);")
     if plan.get("lines"):
         p("    _lr_collect(out, &n, max);")
+    # The main camera's culling mask (Slime Jump hides its World Map layer).
+    # ponytail: authored GOs' layers only -- a spawned object or a runtime
+    # `gameObject.layer =` is always drawn; a live layer table if needed
+    mask = int((plan.get("camera") or {}).get("culling_mask", 0xFFFFFFFF))
+    gl = plan.get("go_layers") or []
+    culled = [0 if mask >> (int(l) & 31) & 1 else 1 for l in gl]
+    if any(culled):
+        p("    {")
+        p("        static const unsigned char culled[%d] = { %s };"
+          % (len(culled), ", ".join(map(str, culled))))
+        p("        int r, w = 0;")
+        p("        for (r = 0; r < n; r = r + 1)")
+        p("            if (out[r].go < 0 || out[r].go >= %d || !culled[out[r].go]) {"
+          % len(culled))
+        p("                out[w] = out[r];")
+        p("                w = w + 1;")
+        p("            }")
+        p("        n = w;")
+        p("    }")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
@@ -26136,6 +26161,7 @@ def _load_scenes_lights_cameras(root, assets):
             "(looked for .unity / blender_pack.json, or a Godot project.godot / .tscn)" % root)
     _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
         len(objects), len(lights), len(cameras), len(hierarchy)))
+    _mark_hierarchy_live(objects, hierarchy)
     _apply_camera_script_view_to_cameras(cameras, objects)
     sw, sh = _ui_layout_screen(root, objects)
     _apply_layout_groups(objects, sw, sh)
@@ -26804,7 +26830,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 4
+_SCENE_CACHE_VERSION = 6
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
