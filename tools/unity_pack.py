@@ -27075,6 +27075,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         _gpu.build_lights(plan, _load_sorting_layers(root))
     engine = emit_engine(plan, analyses, used_apis)
     _used_helpers = plan.pop("_cs_str_used", None) or set()
+    _used_helpers = {h for h in _used_helpers if not re.search(
+        r"^static [\w\s*]+\b%s\(" % re.escape(h), engine, re.M)}
     helpers_c = _string_helpers_c(_used_helpers)
     if (runtime.needs_math(runtime.closure(
             {h for h in _used_helpers if runtime.is_runtime_helper(h)}))

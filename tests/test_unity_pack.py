@@ -966,6 +966,24 @@ public class Player : MonoBehaviour {
 """})
         self.assertEqual(self._run(root, log=True), ["v 7 2 hp 8", "dt True"])
 
+    def test_inverse_lerp_with_rect_normalize_defined_once(self):
+        root = self._mini({"Player.cs": """using UnityEngine;
+
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private bool _done;
+
+    public void Update() {
+        if (_done) return;
+        _done = true;
+        Rect r = new Rect(0, 0, 4, 2);
+        Debug.Log("il " + Mathf.InverseLerp(0, 10, 5) + " " + Rect.PointToNormalized(r, new Vector2(1, 1)).x);
+    }
+}
+"""})
+        self.assertEqual(self._run(root, log=True), ["il 0.5 0.25"])
+
     def test_list_searches_per_element_type(self):
         root = self._mini({"Player.cs": """using UnityEngine;
 using System.Collections.Generic;
