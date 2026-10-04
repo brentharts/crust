@@ -173,7 +173,10 @@ def _raise_unknown_component_type(t, analyses, ops=("AddComponent", "GetComponen
 
 def _mb_bases_from_header(scan, name_end, brace):
     """C# ``class Foo : Bar, IBaz`` → ``[\"Bar\", \"IBaz\"]`` (simple names)."""
-    header = scan[name_end:brace]
+    # `class S<T> : Base where T : Base`: neither the type parameters nor
+    # the constraint clause name a base
+    header = re.sub(r"^\s*<[^:{]*?>", "", scan[name_end:brace])
+    header = re.split(r"\bwhere\b", header, maxsplit=1)[0]
     if ":" not in header:
         return []
     clause = header.split(":", 1)[1]
@@ -4699,6 +4702,179 @@ def _validate_addcomponent_types(types, plan, analyses=None):
                 t, analyses, ops=("AddComponent",))
 
 
+#: Accepted by GetComponent, not lowered by it: the method stubs (CS8000).
+_RENDERER_LOOKUP_TYPES = frozenset({"MeshFilter", "MeshRenderer", "Renderer"})
+
+
+def _analyze_static_refs(analyses, typename_map):
+    """Scripts no scene places but a packed one calls statically
+    (`SaveAndLoadManager.GetInt(..)`): analyzed in full, so their static
+    methods are emitted (a zero-instance class) and the calls lower.
+    Transitively; a script the pack refuses is left out (the calls stub)."""
+    have = {c["name"] for a in analyses for c in a.get("classes") or []}
+    got, queue = [], list(analyses)
+    while queue:
+        a = queue.pop()
+        refs = set()
+        for c in a.get("classes") or []:
+            refs |= set(re.findall(r"(?<![\w.])([A-Z]\w*)\s*\.\s*[A-Z]\w*",
+                                   cs2cpp._blank(c.get("file_text") or "")))
+        for t in sorted(refs - have):
+            if t not in typename_map:
+                continue
+            have.add(t)
+            try:
+                sa = analyze_script(typename_map[t])
+            except PackError:
+                continue
+            # a `static class` is `_static_helper_methods`' (it skips packed ones)
+            if re.search(r"\bstatic\s+(?:partial\s+)?class\s+%s\b" % re.escape(t),
+                         cs2cpp._blank(_read(typename_map[t]))):
+                continue
+            sa["static_ref"] = True
+            got.append(sa)
+            queue.append(sa)
+    return got
+
+
+def _inherit_base_members(analyses, typename_map):
+    """Copy what a class inherits from its authored bases into it.
+
+    A base is its own packed array, so `GameCamera : CameraScript` had no
+    `DoUpdate` and no `viewRect`: the instance the scene places ran none of
+    what C# runs for it. Each fully analyzed class gets its bases' instance
+    fields and the instance methods it does not override (a generic base's
+    type parameters bound: `SingletonUpdateWhileEnabled<Player>`), and
+    `base.M(` calls a copy of the nearest ancestor's M, `base__B__M`.
+    Statics stay with the class that declares them. Returns the bases no
+    analysis had yet, shallow (no methods), so `mb_bases` reaches the
+    interfaces at the top of a chain (`IUpdatable`).
+    ponytail: an override is matched by name and arity, not parameter types;
+    a bare static name in a copied body resolves in the derived class, so a
+    `new static` there stands in for the base's (same object for singletons)
+    """
+    full = {}
+
+    def cls_of(name):
+        path = typename_map.get(name)
+        if not path:
+            return None
+        if path not in full:
+            try:
+                full[path] = analyze_script(path)
+            except PackError:
+                full[path] = None
+        a = full[path]
+        return next((c for c in (a or {}).get("classes") or ()
+                     if c["name"] == name), None)
+
+    def key(m):
+        return (m["name"], len(cs2cpp.parse_params(m.get("args") or "")))
+
+    def bind(text, targs):
+        for g, t in targs.items():
+            text = cs2cpp.code_sub(r"(?<![\w.])%s(?![\w])" % re.escape(g), t, text)
+        return text
+
+    for a in analyses:
+        if a.get("shallow"):
+            continue
+        for c in a.get("classes") or []:
+            # the chain, nearest first: (class, its type arguments)
+            chain, cur, seen = [], c, {c["name"]}
+            while True:
+                b = next((b for b in cur.get("bases") or ()
+                          if b in typename_map and b not in seen), None)
+                bc = cls_of(b) if b else None
+                if bc is None or bc.get("kind") == "interface":
+                    break
+                hm = re.search(r"\b%s\s*<([^<>{};]*)>" % re.escape(b),
+                               cs2cpp._blank(cur.get("file_text") or ""))
+                pm = re.search(r"\bclass\s+%s\s*<([^<>{};]*)>" % re.escape(b),
+                               cs2cpp._blank(bc.get("file_text") or ""))
+                targs = dict(zip([s.strip() for s in pm.group(1).split(",")],
+                                 [s.strip() for s in hm.group(1).split(",")])
+                             ) if hm and pm else {}
+                # an outer binding reaches the base's own (`T` of the derived)
+                prev = chain[-1][1] if chain else {}
+                targs = {g: prev.get(t, t) for g, t in targs.items()}
+                chain.append((bc, targs))
+                seen.add(b)
+                cur = bc
+            if not chain:
+                continue
+            # what the copied bodies use (string helpers, GetComponent<T>, ..)
+            for bc, _t in chain:
+                ba = full.get(typename_map.get(bc["name"])) or {}
+                for k, v in ba.items():
+                    if isinstance(v, set):
+                        a[k] = set(a.get(k) or ()) | v
+                    elif k in ("spawns", "uses_z", "writes_pos", "writes_rot") and v:
+                        a[k] = True
+                a["literals"] = list(a.get("literals") or []) + [
+                    x for x in ba.get("literals") or [] if x not in (a.get("literals") or [])]
+            levels = [(c, {})] + chain
+
+            def base_ref(level, body):
+                """`base.M(` in a body from levels[level] → the copy's name."""
+                def sub(m):
+                    for j in range(level + 1, len(levels)):
+                        bc, targs = levels[j]
+                        bm = next((x for x in bc["methods"] if x["name"] == m.group(1)
+                                   and not x.get("static")), None)
+                        if bm:
+                            want.append((j, bm))
+                            return "base__%s__%s(" % (bc["name"], bm["name"])
+                    return m.group(0)
+                return cs2cpp.code_sub(r"(?<![\w.])base\s*\.\s*(\w+)\s*\(", sub, body)
+
+            def copy(level, bm, name=None):
+                bc, targs = levels[level]
+                m = dict(bm, name=name or bm["name"], path=bc.get("path"),
+                         file_text=bc.get("file_text"), inherited_from=bc["name"])
+                for k in ("body", "args", "ret", "src"):
+                    if m.get(k):
+                        m[k] = bind(m[k], targs)
+                m["body"] = base_ref(level, m.get("body") or "")
+                return m
+
+            want = []
+            for m in c["methods"]:
+                m["body"] = base_ref(0, m.get("body") or "")
+            have = {key(m) for m in c["methods"]}
+            for j in range(1, len(levels)):
+                for bm in levels[j][0]["methods"]:
+                    if bm.get("static") or bm.get("ctor") or key(bm) in have:
+                        continue
+                    have.add(key(bm))
+                    c["methods"].append(copy(j, bm))
+            done = set()
+            while want:
+                j, bm = want.pop()
+                name = "base__%s__%s" % (levels[j][0]["name"], bm["name"])
+                if name not in done:
+                    done.add(name)
+                    c["methods"].append(copy(j, bm, name))
+            names = {f["name"] for f in c.get("fields") or []}
+            for bc, targs in chain:
+                for f in bc.get("fields") or []:
+                    if f.get("static") or f.get("const") or f["name"] in names:
+                        continue
+                    names.add(f["name"])
+                    c.setdefault("fields", []).append(
+                        dict(f, ty=bind(f.get("ty") or "", targs), inherited_from=bc["name"]))
+    have = {c["name"] for a in analyses for c in a.get("classes") or []}
+    out = []
+    for path, a in sorted((p, a) for p, a in full.items() if a):
+        if not {c["name"] for c in a["classes"]} - have:
+            continue
+        out.append(dict(a, shallow=True, apis=set(), getcomponent_types=set(),
+                        getcomponentsinchildren_types=set(), addcomponent_types=set(),
+                        classes=[dict(c, methods=[]) for c in a["classes"]
+                                 if c["name"] not in have]))
+    return out
+
+
 def _validate_getcomponent_types(types, plan, analyses=None):
     """GetComponent / GetComponentsInChildren<T> for unknown T → CS0246.
 
@@ -4712,13 +4888,16 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     bases_map = plan.get("mb_bases") or _collect_mb_bases(analyses)
     # MeshFilter / MeshRenderer are packed (unity_pack_mesh): a script may
     # ask for one; making a mesh at runtime is what is not packed yet
-    known = (set(plan.get("classes") or {}) | {"MeshFilter", "MeshRenderer", "Renderer"}
+    known = (set(plan.get("classes") or {}) | _RENDERER_LOOKUP_TYPES
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS | _COLLIDER2D_TYPES
              | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
              | _UI_GETCOMPONENT_TYPES
              | _TRANSFORM_GETCOMPONENT_TYPES
-             | _analyzed_mb_typenames(analyses))
+             | _analyzed_mb_typenames(analyses)
+             # ponytail: an interface lookup is accepted, not lowered — the
+             # method stubs (CS8000) until iref locals + dispatch exist
+             | set(_collect_interfaces(analyses)))
     # Base type with at least one packed subclass is known for GCIC.
     for t in types:
         if t in known:
@@ -5975,6 +6154,10 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
     for ch in chains:
         comp = ch.get("component")
+        if (comp in (plan.get("interfaces") or {})
+                or (comp in _RENDERER_LOOKUP_TYPES
+                    and not _known_component(comp))):
+            continue                  # left as C#: the method stubs (CS8000)
         field = ch.get("field")
         axis = ch.get("axis")
         line = _line_at(ch["start"])
@@ -8196,6 +8379,8 @@ def plan_layouts(objects, analyses, two_d=None):
         referenced |= set(a.get("findobject_types") or [])
         referenced |= set(a.get("singleton_instance_types") or [])
         for c in a.get("classes") or []:
+            if a.get("static_ref"):
+                referenced.add(c["name"])
             for f in c.get("fields") or []:
                 ty = f.get("ty") or ""
                 if ty in analyzed:
@@ -13419,9 +13604,10 @@ def _emit_engine_class_groups(
             site = {
                 "class": cname,
                 "method": m["name"],
-                "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
+                "path": _assets_rel_path(m.get("path") or c.get("path")
+                                         or cl.get("path") or ""),
                 "body_abs": int(m.get("body_abs") or 0),
-                "file_text": c.get("file_text") or "",
+                "file_text": m.get("file_text") or c.get("file_text") or "",
                 "args": m.get("args") or "",
             }
             body = _lower_method_body(
@@ -13533,6 +13719,10 @@ def _emit_engine_class_groups(
                 kt = _engine_types_declared(lines)
                 for line in body.split("\n"):
                     s = line.strip()
+                    # nor one on a local the stub no longer declares
+                    if set(re.findall(r"(?<![\w.>])([a-z]\w*)\b(?!\s*\()",
+                                      cs2cpp._blank(s))) - emitted - {"i"}:
+                        continue
                     if "GameObject_SetActive(" in s and \
                             _unlowered_csharp(s, known_types=kt) is None:
                         p("    " + s.rstrip(";").rstrip() + ";")
@@ -16278,6 +16468,22 @@ def _emit_anim_events(anim_players, p, plan):
     """Animation Events: each player's, fired as its time crosses them --
     (tp, t], or past the end and from the start when a looping clip wraps;
     an event at 0 fires on the first frame. Forward play only."""
+    # A component only a prefab names is analyzed without method bodies:
+    # its events have nothing to call.
+    have = {(c, m["name"]) for c, pairs in (plan.get("_methods_by") or {}).items()
+            for _c, m in pairs}
+    for pl in anim_players:
+        keep = []
+        for e in pl.get("events") or []:
+            if (e["cls"], e["function"]) in have:
+                keep.append(e)
+            else:
+                sys.stderr.write(
+                    "unity_pack: warning: Animation Event %s.%s is not packed "
+                    "(no method body: the component is only on a prefab); "
+                    "it does not fire\n" % (e["cls"], e["function"]))
+        if pl.get("events"):
+            pl["events"] = keep
     evs = [(k, e) for k, pl in enumerate(anim_players) for e in pl.get("events") or []]
     if not evs:
         return
@@ -18058,6 +18264,8 @@ def emit_engine(plan, analyses, used_apis):
     # GetComponentInParent<T>: the GO itself, then each ancestor.
     for tname in sorted(a.split("<", 1)[1][:-1] for a in used_apis
                         if a.startswith("GetComponentInParent<")):
+        if tname in (plan.get("interfaces") or {}):
+            continue
         idn = _c_ident(tname)
         p("static int GameObject_GetComponentInParent_%s(int go) {" % idn)
         p("    int ci, guard;")
@@ -25880,6 +26088,7 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
                 continue
             a = analyze_script(sp, shallow=True)
+            a["shallow"] = True
             for c in a.get("classes") or []:
                 c["methods"] = []
             a["apis"] = set()
@@ -25887,7 +26096,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             a["getcomponentsinchildren_types"] = set()
             a["addcomponent_types"] = set()
             analyses.append(a)
+    analyses.extend(_analyze_static_refs(analyses, typename_map))
 
+    analyses.extend(_inherit_base_members(analyses, typename_map))
     analyses.extend(_analyze_base_interfaces(root, guids, analyses))
 
     # Scene stripped MB fileIDs (Button onClick targets) → pack instance mb_ids.
@@ -26963,6 +27174,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     for a in analyses:
         gc_types |= set(a.get("getcomponent_types") or [])
     _validate_getcomponent_types(gc_types, plan, analyses)
+    gc_types -= set(_collect_interfaces(analyses))
     plan["getcomponent_types"] = sorted(gc_types)
     gcic_types = set()
     for a in analyses:
