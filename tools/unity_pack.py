@@ -25994,7 +25994,7 @@ def _expand_unstripped_prefab_instances(scene_text, assets):
     """*scene_text* with the placed objects of every PrefabInstance. A
     stripped stub (kept when scene objects reference a prefab object, e.g.
     children under its Transform) is replaced by the placed doc, which keeps
-    the stub's fileID. Instances with a stripped RectTransform are left to
+    the stub's fileID. Instances with a stripped root RectTransform are left to
     `_append_prefab_instance_ui_objects` (onClick array overrides, components
     added on the stripped GameObject)."""
     extra, drop = [], set()
@@ -26004,8 +26004,11 @@ def _expand_unstripped_prefab_instances(scene_text, assets):
                 or not os.path.isfile(ppath):
             continue
         raw = _read(ppath)
-        if any(cls == "224" and fid in inst["stripped"]
-               for cls, fid, _s, _a, _b in _yaml_docs(raw)):
+        # a UI prefab (root RectTransform stub); a stub on a child Canvas
+        # (Game Camera's) still places the rest of the prefab here
+        if any(cls == "224" and fid in inst["stripped"] and re.search(
+                r"(?m)^  m_Father:\s*\{fileID:\s*0\}", raw[a:b])
+               for cls, fid, _s, a, b in _yaml_docs(raw)):
             continue
         body = _prefab_instance_text(raw, inst)
         first = _YAML_DOC_HEAD_RE.search(body)

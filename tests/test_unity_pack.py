@@ -16753,6 +16753,49 @@ class TestStrippedPrefabInstance(unittest.TestCase):
         pos = {o["name"]: o["pos"][0] for o in objs}
         self.assertEqual(pos, {"Mover": 17.0, "Child": 18.0})
 
+    def test_stub_on_child_canvas_still_places_prefab(self):
+        """Slime Jump's Game Camera: a stripped child RectTransform (scene UI
+        added under its Canvas) still places the prefab; a stripped root
+        RectTransform (a UI Button prefab) is left to the UI path."""
+        d = tempfile.mkdtemp(prefix="upack-stripped-rt-")
+        prefab = os.path.join(d, "Cam.prefab")
+        with open(prefab, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &100\nGameObject:\n  m_Name: Cam\n"
+                    "  m_Component:\n  - component: {fileID: 101}\n"
+                    "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "  m_Father: {fileID: 0}\n"
+                    "--- !u!1 &200\nGameObject:\n  m_Name: Canvas\n"
+                    "  m_Component:\n  - component: {fileID: 201}\n"
+                    "--- !u!224 &201\nRectTransform:\n"
+                    "  m_GameObject: {fileID: 200}\n"
+                    "  m_Father: {fileID: 101}\n")
+
+        def scene(src):
+            return ("%%YAML 1.1\n"
+                    "--- !u!1001 &5\nPrefabInstance:\n  m_Modification:\n"
+                    "    m_TransformParent: {fileID: 0}\n"
+                    "    m_Modifications: []\n"
+                    "  m_SourcePrefab: {fileID: 100100000, guid: aa, type: 3}\n"
+                    "--- !u!224 &6 stripped\nRectTransform:\n"
+                    "  m_CorrespondingSourceObject: {fileID: %d, guid: aa, "
+                    "type: 3}\n  m_PrefabInstance: {fileID: 5}\n" % src)
+
+        text = unity_pack._expand_unstripped_prefab_instances(
+            scene(201), {"aa": prefab})
+        self.assertNotIn("stripped", text)
+        self.assertIn("m_Name: Cam", text)
+        with open(prefab, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &200\nGameObject:\n  m_Name: Button\n"
+                    "  m_Component:\n  - component: {fileID: 201}\n"
+                    "--- !u!224 &201\nRectTransform:\n"
+                    "  m_GameObject: {fileID: 200}\n"
+                    "  m_Father: {fileID: 0}\n")
+        self.assertEqual(unity_pack._expand_unstripped_prefab_instances(
+            scene(201), {"aa": prefab}), scene(201))
+
 
 class TestProjectPhysicsSettings(unittest.TestCase):
     """Physics2D / Physics gravity and Fixed Timestep come from ProjectSettings."""
