@@ -4445,6 +4445,15 @@ def _build_go_active(plan, go_names):
             if "active" not in o:
                 continue
             act[gi] = 1 if int(o.get("active", 1)) else 0
+    # an unplaced prefab's row is dormant; its authored m_IsActive is what an
+    # Instantiate of it gets (`_engine_go_asset_active`)
+    asset = [-1] * len(act)
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            gi = o.get("go_index")
+            if o.get("prefab_asset") and gi is not None and 0 <= gi < len(act):
+                asset[gi], act[gi] = act[gi], 0
+    plan["go_asset_active"] = asset if any(a >= 0 for a in asset) else None
     return act
 
 
@@ -12414,6 +12423,11 @@ def _emit_engine_ui(
     p("    for (i = 0; i < %d; i = i + 1)" % go_n)
     p("        _engine_go_active[i] = _engine_go_active_authored[i];")
     p("}")
+    asset = plan.get("go_asset_active")
+    if asset:
+        p("/* an unplaced prefab's authored m_IsActive (-1: a scene object) */")
+        p("static const signed char _engine_go_asset_active[%d] = { %s };"
+          % (len(asset), ", ".join(map(str, asset))))
     p("static int _engine_go_active_in_hierarchy(int go) {")
     p("    int guard = 0;")
     if multi_scene:
@@ -13027,6 +13041,13 @@ def _emit_engine_instantiate(
                 p("    _engine_go_active_init();")
                 p("    {")
                 p("        int _sgo = _engine_%s_go_of[src];" % idn)
+                asset = plan.get("go_asset_active")
+                if asset:
+                    p("        if (_sgo >= 0 && _sgo < %d && "
+                      "_engine_go_asset_active[_sgo] >= 0)" % len(asset))
+                    p("            _engine_go_active[go] = "
+                      "_engine_go_asset_active[_sgo];")
+                    p("        else")
                 p("        if (_sgo >= 0 && _sgo < %d)" % go_cap_i)
                 p("            _engine_go_active[go] = _engine_go_active[_sgo];")
                 p("        else")
@@ -26103,6 +26124,9 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets,
                 if o.get("class") in type_names:
                     if si is not None:
                         o["scene"] = si
+                    else:
+                        # an asset Instantiate copies, not a live object
+                        o["prefab_asset"] = True
                     out.append(o)
     return out
 
