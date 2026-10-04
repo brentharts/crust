@@ -7693,7 +7693,7 @@ def _inline_static_getters(text, cl, plan):
             for pat in names:
                 text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\b(?!\s*(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=))" % pat,
-                    "(%s)" % expr, text)
+                    "(%s)" % cs2cpp.lower_float_literals(expr), text)
     return text
 
 
@@ -7876,6 +7876,33 @@ def _iface_tick_arrays(plan, analyses):
                 out[iface] = (decl["name"], fields)
                 break
     return out
+
+
+def _drop_iface_tick_loops(text, plan, site):
+    """The authored loop `_iface_tick_arrays` runs from `engine_tick`
+    (`for (..i < updatables.Length..) { IUpdatable u = updatables[i];
+    u.DoUpdate(); }`) leaves the Update body, so the rest of it lowers.
+    ponytail: the dispatch runs after every Update, not at the loop's
+    place in this one; inline the switch if a body depends on that order."""
+    if (site or {}).get("method") not in ("Update", "FixedUpdate",
+                                          "LateUpdate"):
+        return text
+    ifaces = plan.get("interfaces") or {}
+    for _c, f, elem, iface in _any_static_ref_arrays(plan):
+        if not iface:
+            continue
+        void0 = {d["name"] for d in (ifaces.get(elem) or {}).get("methods")
+                 or [] if (d.get("ret") or "void") == "void"
+                 and not (d.get("args") or "").strip()}
+        arr = r"(?:\w+\s*\.\s*)?%s" % re.escape(f)
+        text = cs2cpp.code_sub(
+            r"for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*(%s)\s*\.\s*"
+            r"(?:Length|Count)\s*;\s*\1\s*\+\+\s*\)\s*\{\s*%s\s+(\w+)\s*=\s*"
+            r"%s\s*\[\s*\1\s*\]\s*;\s*\3\s*\.\s*(\w+)\s*\(\s*\)\s*;\s*\}"
+            % (arr, re.escape(elem), arr),
+            lambda m: ("/* %s: engine_tick dispatches */" % m.group(4)
+                       if m.group(4) in void0 else m.group(0)), text)
+    return text
 
 
 def _authored_iface_tick(mname, fields, analyses):
@@ -17488,7 +17515,7 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
             or want_app_open_url or plan.get("player_prefs")
-            or "GodotPrint" in used_apis):
+            or "GodotPrint" in used_apis or not plan.get("strict")):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -17543,7 +17570,7 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
             or want_app_open_url or plan.get("player_prefs")
-            or want_str_plus):
+            or want_str_plus or not plan.get("strict")):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -17560,6 +17587,14 @@ def emit_engine(plan, analyses, used_apis):
         p("#define ENGINE_MKDIR(p) mkdir((p), 0755)")
         p("#endif")
         p("#endif")
+    if not plan.get("strict"):
+        # a statement left unlowered at runtime (`_trap_tmp_writes`)
+        p("static void _engine_unlowered_at(const char *api, const char *path,"
+          " int line) {")
+        p("    fprintf(stderr, \"%s:%d: `%s` is not lowered by crust; \"")
+        p("            \"stopping rather than skipping it\\n\", path, line, api);")
+        p("    exit(70);")
+        p("}")
     p("")
     p("/* Types first, then every global. C forbids `extern T a[N]` while")
     p("   T is incomplete, so the arrays wait until the structs exist;")
@@ -24234,10 +24269,31 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = _own_string_params(body, site)
+    text = _trap_tmp_writes(_drop_shader_params(body, plan, site), plan,
+                            site)
+    text = _own_string_params(text, site)
+    text = _drop_iface_tick_loops(text, plan, site)
     # before `gameObject` is lowered: the terrain calls take it as written
     text = _lower_terrain_boxes(text, cl, plan)
     text = _lower_translate(text)
+    # a device is a pointer, not a packed index: null is 0, not -1
+    text = cs2cpp.code_sub(
+        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\s*([!=])=\s*null\b",
+        r"(Keyboard_current() \1= 0)", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])default\s*\(\s*(?:UnityEngine\s*\.\s*)?(Vector[23])\s*\)",
+        r"\1.zero", text)
+    if not cl.get("vec3_fields"):
+        # C has no Vector3; the sites that keep z (`_parse_vector3_expr`)
+        # read the axis name off either spelling.
+        # ponytail: `Vector3.one` in a Vector2 context loses z = 1
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])Vector3\s*\.\s*(zero|one|up|down|left|right)\b"
+            r"(?!\s*\()", r"Vector2.\1", text)
+    # A cast between Vector2 / Vector3 is a no-op: C's only vector value is
+    # Vector2 (the cast binds tighter than `*`).
+    # ponytail: `(Vector2) v3` written to a z-keeping sink keeps v3's z
+    text = cs2cpp.code_sub(r"\(\s*Vector[23]\s*\)\s*(?=[\w(])", "", text)
     if plan.get("two_d") and _class_has_position(cl):
         text = _lower_position_values(text)
     if plan.get("two_d"):
@@ -24670,6 +24726,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         f["name"]: f for f in (cl.get("class_consts") or [])
     }
     for vf in cl.get("vec2_fields") or []:
+        text = cs2cpp.code_sub(
+            r"(?<![_\w.])(%s)\s*([-+*/])=\s*(.+?)\s*;" % re.escape(vf),
+            r"\1 = \1 \2 (\3);", text)
         # Whole-field write before .x/.y / bare-read rewrites.
         text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=(?!=)\s*(.+?)\s*;" % re.escape(vf),
@@ -24968,7 +25027,124 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             if v == "s"))
     if "_cs_str_Equals(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
-    return text
+    return _late_call_members(text, plan)
+
+
+_TMP_TYPES = {"TMP_Text", "TextMeshProUGUI", "TextMeshPro"}
+
+
+def _trap_tmp_writes(body, plan, site):
+    """`f.text = ..;` / `f.color = ..;` on a TMP field: TMP text is baked at
+    pack time, so the statement stops the player with its C# line when it
+    runs, instead of emptying the whole method around it. A CS8000 warning
+    names it at pack time; under strict it is left for the stub to refuse."""
+    if plan.get("strict") or not site:
+        return body
+    names = {f["name"] for c in (plan.get("classes") or {}).values()
+             for f in c.get("fields") or []
+             if (f.get("ty") or "").strip().split(".")[-1] in _TMP_TYPES}
+    if not names:
+        return body
+    pat = re.compile(r"(?<![\w.])(?:[\w.]+\.)?(?:%s)\s*\.\s*(text|color)"
+                     r"\s*[+]?=(?!=)[^;{}]*;" % "|".join(
+                         re.escape(n) for n in sorted(names)))
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+
+    def trap(m):
+        line = ft.count("\n", 0, at + m.start()) + 1 if ft else 0
+        api = "TMP_Text.%s" % m.group(1)
+        if ft:
+            sys.stderr.write(_cs_diag(
+                path, ft, at + m.start(), "CS8000",
+                "`%s` writes are not lowered (text is baked at pack time);"
+                " the statement stops the player if it runs" % api,
+                kind="warning") + "\n")
+        return "_engine_unlowered_at(%s, %s, %d);" % (
+            _c_string(api), _c_string(path), line)
+    return pat.sub(trap, body)
+
+
+def _drop_shader_params(body, plan, site):
+    """`Material m = new Material(..); m.SetVector(..); r.sharedMaterial =
+    m;` sets a custom shader's parameters, and the pack draws sprites
+    without their shader: the statements go (blanked, so offsets keep their
+    C# lines), each with a CS8000 warning. Kept -- to stub -- under strict,
+    or when `m` is used for anything else."""
+    if plan.get("strict") or not site or "Material" not in body:
+        return body
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    for d in re.finditer(r"(?<![\w.])Material\s+(\w+)\s*=\s*new\s+Material"
+                         r"\s*\([^;]*\);", body):
+        v = re.escape(d.group(1))
+        spans = [d.span()] + [m.span() for m in re.finditer(
+            r"(?<![\w.])%s\s*\.\s*Set(?:Vector|Int|Float|Color)\s*\([^;]*\);"
+            r"|(?<![\w.])[\w.]+\s*\.\s*(?:sharedMaterial|material)\s*=\s*"
+            r"%s\s*;" % (v, v), body)]
+        rest, last = [], 0
+        for s, e in sorted(spans):
+            rest.append(body[last:s])
+            last = e
+        if re.search(r"(?<![\w.])%s\b" % v, "".join(rest) + body[last:]):
+            continue
+        for s, e in spans:
+            if ft:
+                sys.stderr.write(_cs_diag(
+                    path, ft, at + s, "CS8000",
+                    "shader parameters are not drawn by the pack; the"
+                    " statement is dropped", kind="warning") + "\n")
+            body = body[:s] + re.sub(r"[^\n]", " ", body[s:e]) + body[e:]
+    return body
+
+
+def _call_suffix_sub(text, funcs, suffix, build):
+    """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match)."""
+    if not funcs:
+        return text
+    pat = re.compile(r"(?<![\w.])(%s)\s*\(" % "|".join(
+        re.escape(f) for f in sorted(funcs, key=len, reverse=True)))
+    out, pos = [], 0
+    for m in pat.finditer(text):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        after = got[1]
+        mm = re.match(suffix, text[after:])
+        if not mm:
+            continue
+        out += [text[pos:m.start()], build(text[m.start():after], mm)]
+        pos = after + mm.end()
+    return "".join(out) + text[pos:] if out else text
+
+
+def _late_call_members(text, plan):
+    """Members of a lowered call's result the earlier passes could not see:
+    `f(..).x` of a project method returning a Vector2 (`LeftStickInput.x`)
+    is `Vector2_x(f(..))`; `.gameObject` of a component field the pack
+    stores as a GO index (`timerText.gameObject.activeSelf`) is that
+    index."""
+    text = _call_suffix_sub(
+        text, _vector2_methods(plan),
+        r"\s*\.\s*([xy])\b(?!\s*(?:\(|[-+*/]?=(?!=)))",
+        lambda call, mm: "Vector2_%s(%s)" % (mm.group(1), call))
+    gos = {"%s_get_%s" % (_c_ident(cn), f["name"])
+           for cn, c in (plan.get("classes") or {}).items()
+           for f in c.get("fields") or []
+           if f.get("ty") in _GO_HANDLE_FIELD_TYPES
+           and not f.get("static") and not f.get("const")}
+    return _call_suffix_sub(
+        text, gos,
+        r"\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
+        r"(?!\s*\.)",
+        lambda call, mm: (
+            "GameObject_activeSelf(%s)" % call if mm.group(1) == "activeSelf"
+            else "GameObject_SetActive(%s, " % call if mm.group(1)
+            else call))
 
 
 def _vector2_methods(plan):

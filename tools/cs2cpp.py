@@ -1797,6 +1797,10 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
         return (what, seen[-1] if seen else "")
 
     known_types = set(known_types)
+    if rec(r"(?<![\w])foreach\s*\("):
+        return found("`foreach` over a collection nothing lowered.")
+    if rec(r"(?<![\w.])default\s*\(|(?<![\w.])null\b"):
+        return found("C# `null` / `default(T)` nothing lowered.")
     if rec(r"[(,]\s*(?:ref|out|in)\s+[A-Za-z_]"):
         return found("`ref` / `out` / `in` argument (not in the C# subset).")
     if rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+"):
@@ -1846,7 +1850,9 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
                     break
             j -= 1
         if at_suffix and re.search(r"(?<![\w])[A-Za-z_]\w*%s\s*$"
-                                   % re.escape(at_suffix), body[:max(j, 0)]):
+                                   % re.escape(at_suffix), body[:max(j, 0)]
+                                   ) and not re.match(r"\)\s*\.\s*\w+\s*\(",
+                                                      body[cm.start():]):
             continue
         # a component of a Vector2 value -- a Vector2 helper's result, or a
         # parenthesized vector expression: C, the struct's member

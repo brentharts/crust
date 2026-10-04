@@ -831,6 +831,102 @@ public class Mgr : MonoBehaviour {
         self.assertIn("follow False", out)
 
 
+class TestPlayerUpdateForms(unittest.TestCase):
+    """Slime Jump's `Player.DoUpdate` forms: a compound write keeps its
+    value whole (`x -= 3 - 1` is 8, not 6), a Vector2 field's `*=`, `.x` of
+    a Vector2 property, per-frame shader-parameter statements dropped, and
+    a TMP text write that stops the player only if it runs."""
+
+    MGR = """using UnityEngine;
+using TMPro;
+public class Mgr : MonoBehaviour {
+    public TMP_Text label;
+    public SpriteRenderer sr;
+    public float x = 10f;
+    public Vector2 v = new Vector2(1f, 2f);
+    public static Vector2 Stick { get { return new Vector2(0.5f, 0f); } }
+    void Update() {
+        x -= 3f - 1f;
+        v *= 2f;
+        if (x < 0f) label.text = "never";
+        Material mat = new Material(sr.sharedMaterial);
+        mat.SetInt("_g", 1);
+        sr.sharedMaterial = mat;
+        Debug.Log("x " + (int)x + " v " + (int)v.y + " s " + (int)(Stick.x * 10f));
+    }
+}
+"""
+
+    @needs_cc
+    def test_forms(self):
+        root = project(self, {"Mgr": self.MGR}, [("Mgr",)])
+        # not strict: strict refuses the shader and TMP statements instead
+        out = pack(self, root, strict=False)
+        self.assertIn("x 8 v 4 s 5", run_frames(self, out, 1))
+        # frame 6: x < 0 runs the TMP write
+        with self.assertRaises(AssertionError) as cm:
+            run_frames(self, out, 6)
+        self.assertIn("Mgr.cs:12: `TMP_Text.text` is not lowered",
+                      str(cm.exception))
+
+
+class TestInheritedUpdatables(unittest.TestCase):
+    """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
+    `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class
+    inherited what it ran (`GCam : Cam : Single<Cam> : UWE`): a base was
+    its own packed array, so GCam had no OnEnable / DoUpdate, `base.M()`
+    was dropped, and a generic base's header named no base at all."""
+
+    SCRIPTS = {
+        "IUpdatable": "public interface IUpdatable { void DoUpdate(); }\n",
+        "GM": """using UnityEngine;
+public class GM : MonoBehaviour {
+    public static IUpdatable[] updatables = new IUpdatable[0];
+    void Update() {
+        for (int i = 0; i < updatables.Length; i++) { IUpdatable u = updatables[i]; u.DoUpdate(); }
+        Debug.Log("gm");
+    }
+}
+""",
+        "UWE": """using UnityEngine;
+public class UWE : MonoBehaviour, IUpdatable {
+    public virtual void OnEnable() { GM.updatables = GM.updatables.Add(this); }
+    public virtual void DoUpdate() { }
+}
+""",
+        "Single": """using UnityEngine;
+public class Single<T> : UWE where T : UWE {
+    public bool persistant;
+    public virtual void Awake() { Debug.Log("single " + persistant); }
+}
+""",
+        "Cam": """using UnityEngine;
+public class Cam : Single<Cam> {
+    public override void DoUpdate() { HandlePosition(); }
+    public virtual void HandlePosition() { Debug.Log("cam pos"); }
+}
+""",
+        "GCam": """using UnityEngine;
+public class GCam : Cam {
+    public override void Awake() { base.Awake(); Debug.Log("gcam awake"); }
+    public override void HandlePosition() { Debug.Log("gcam pos"); base.HandlePosition(); }
+}
+""",
+    }
+
+    @needs_cc
+    def test_inherited_members_run(self):
+        root = project(self, self.SCRIPTS,
+                       [("GM",), ("GCam", None, "  persistant: 1\n")])
+        # GM.Update's loop leaves its body: engine_tick runs that dispatch
+        lines = run_frames(self, pack(self, root), frames=2)
+        self.assertEqual(lines[:2], ["single True", "gcam awake"])
+        self.assertEqual(lines.count("gm"), 2)
+        self.assertEqual(lines.count("gcam pos"), 2)
+        self.assertEqual(lines.count("cam pos"), 2)
+
+
+
 class TestOtherPosition(unittest.TestCase):
     """`target.position` through a Transform field, read as a vector value:
     it stopped at a member of the field's read and emptied the method
