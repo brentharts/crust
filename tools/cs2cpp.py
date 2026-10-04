@@ -1426,16 +1426,26 @@ def lower_map_members_named(text, names, key_types):
     return text
 
 
-def lower_map_string_index(text, target_pattern, model):
+def map_at_string_helper(model, value):
+    """The model's string-key map helper for a map of *value* (a C type):
+    one per value type, as the C++ subset has no overloading."""
+    if value in (None, "int"):
+        return model.map_at_string
+    return "%s_%s" % (model.map_at_string, re.sub(r"\W+", "_", value))
+
+
+def lower_map_string_index(text, target_pattern, model, value=None):
     """`map[key]` for a string-keyed map, through the model's helper.
 
     `target_pattern` matches the map expression (a name, or unity_pack's
-    `Class_field[recv]`); the key is whatever the brackets hold."""
+    `Class_field[recv]`); the key is whatever the brackets hold; `value`
+    is the map's value C type."""
     if model.map_at_string is None:
         return text
+    helper = map_at_string_helper(model, value)
     return _sub_orig(
         r"(%s)\s*\[(.*?)\]" % target_pattern,
-        lambda g: "(*%s(%s, %s))" % (model.map_at_string, g(1), g(2)), text)
+        lambda g: "(*%s(%s, %s))" % (helper, g(1), g(2)), text)
 
 
 def _assignment_end(text, i):
@@ -1515,9 +1525,10 @@ def lower_packed_fields(text, owner, members, statics, handle_fields, model,
                 set_(nm, "%s %s 1" % (get(nm), sg)), text)
         # Compound and plain assignment: the value runs to the end of the
         # assigned expression, found on the text as it stands.
-        for pat, op in ((r"(?<![_\w.])%s\s*\+=" % n, "+"),
-                        (r"(?<![_\w.])%s\s*-=" % n, "-"),
-                        (r"(?<![_\w.])%s\s*=(?!=)" % n, None)):
+        for pat, op in [(r"(?<![_\w.])%s\s*%s=" % (n, re.escape(o)), o)
+                        for o in ("<<", ">>", "+", "-", "*", "/", "%",
+                                  "&", "|", "^")] + [
+                            (r"(?<![_\w.])%s\s*=(?!=)" % n, None)]:
             while True:
                 scan = _blank(text)
                 m = re.search(pat, scan)
@@ -1528,7 +1539,7 @@ def lower_packed_fields(text, owner, members, statics, handle_fields, model,
                 lead = len(value) - len(value.lstrip())
                 value = value.strip()
                 if op is not None:
-                    value = "%s %s %s" % (get(name), op, value)
+                    value = "%s %s (%s)" % (get(name), op, value)
                 text = (text[:m.start()] + set_(name, value)
                         + text[end:])
     for name in sorted(members, key=len, reverse=True):
@@ -1611,15 +1622,17 @@ def lower_packed_collections(text, owner, others, model, receiver="i"):
                 r"(?<![_\w])(\w+)\.%s\b" % re.escape(fname), other_map, text)
     map_names |= set(re.findall(r"\bstd::map<(?:[^<>]|<[^>]*>)+>\s+(\w+)\b",
                                 _blank(text)))
-    key_types = {}
-    for fname, k, _v in owner.static_maps + owner.inst_maps:
-        key_types[fname] = elem(k)
+    key_types, val_types = {}, {}
+    for fname, k, v in owner.static_maps + owner.inst_maps:
+        key_types[fname], val_types[fname] = elem(k), elem(v)
     for o in [owner] + others:
-        for fname, k, _v in o.inst_maps:
+        for fname, k, v in o.inst_maps:
             key_types["%s_%s" % (o.ident, fname)] = elem(k)
-    for m in re.finditer(r"\bstd::map<\s*([^,>]+)\s*,[^>]+>\s+(\w+)\b",
+            val_types["%s_%s" % (o.ident, fname)] = elem(v)
+    for m in re.finditer(r"\bstd::map<\s*([^,>]+)\s*,\s*([^>]+?)\s*>\s+(\w+)\b",
                          _blank(text)):
-        key_types[m.group(2)] = m.group(1).strip()
+        key_types[m.group(3)] = m.group(1).strip()
+        val_types[m.group(3)] = m.group(2).strip()
     aliases = []
     for fname, k, v in sorted(owner.inst_maps):
         if _code_mentions(text, fname):
@@ -1630,16 +1643,18 @@ def lower_packed_collections(text, owner, others, model, receiver="i"):
         text = "\n".join(aliases) + "\n" + text
     text = lower_map_members_named(text, map_names, key_types)
     for o in [owner] + others:
-        for fname, k, _v in o.inst_maps:
+        for fname, k, v in o.inst_maps:
             if elem(k) == "std::string":
                 text = lower_map_string_index(
                     text, r"%s_%s\s*\[[^\]]+\]" % (re.escape(o.ident),
-                                                   re.escape(fname)), model)
+                                                   re.escape(fname)), model,
+                    elem(v))
     for name in sorted([n for n in map_names
                         if key_types.get(n) == "std::string"],
                        key=len, reverse=True):
         text = lower_map_string_index(
-            text, r"(?<![.\w])%s" % re.escape(name), model)
+            text, r"(?<![.\w])%s" % re.escape(name), model,
+            val_types.get(name))
     # ---- lists
     list_names = set(f for f, _e in owner.static_lists + owner.inst_lists)
     text, declared = lower_list_types(text, model)
@@ -1782,6 +1797,10 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
         return (what, seen[-1] if seen else "")
 
     known_types = set(known_types)
+    if rec(r"(?<![\w])foreach\s*\("):
+        return found("`foreach` over a collection nothing lowered.")
+    if rec(r"(?<![\w.])default\s*\(|(?<![\w.])null\b"):
+        return found("C# `null` / `default(T)` nothing lowered.")
     if rec(r"[(,]\s*(?:ref|out|in)\s+[A-Za-z_]"):
         return found("`ref` / `out` / `in` argument (not in the C# subset).")
     if rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+"):
@@ -1831,7 +1850,9 @@ def residual_csharp(text, model, known_types=(), value_ctors=()):
                     break
             j -= 1
         if at_suffix and re.search(r"(?<![\w])[A-Za-z_]\w*%s\s*$"
-                                   % re.escape(at_suffix), body[:max(j, 0)]):
+                                   % re.escape(at_suffix), body[:max(j, 0)]
+                                   ) and not re.match(r"\)\s*\.\s*\w+\s*\(",
+                                                      body[cm.start():]):
             continue
         # a component of a Vector2 value -- a Vector2 helper's result, or a
         # parenthesized vector expression: C, the struct's member
@@ -5610,7 +5631,7 @@ def blank_method_bodies(bscan):
     head = re.compile(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
-            r"[\w.<>]+[ \t]+\w+[ \t]*\(")
+            r"[\w.]+(?:<[^<>;{}()\n]*>)?(?:\[[ \t,]*\])*[ \t]+\w+[ \t]*\(")
     for m in head.finditer(bscan):
         args_start = m.end()
         depth = 1
@@ -5634,6 +5655,12 @@ def blank_method_bodies(bscan):
         if close is None:
             continue
         for i in range(open_i + 1, close):
+            if out[i] not in "\n\r":
+                out[i] = " "
+    # and a property's accessors, whose locals are no fields either
+    for m in re.finditer(r"(?<![\w.])(?:get|set)\s*\{", bscan):
+        close = cpprust._match_brace(bscan, m.end() - 1)
+        for i in range(m.end(), close or m.end()):
             if out[i] not in "\n\r":
                 out[i] = " "
     return "".join(out)
@@ -5752,9 +5779,10 @@ def property_names(bscan):
 
 
 def properties_as_methods(body, bscan, body_abs=0):
-    """C# properties → ``get_Name`` / ``set_Name`` (UnityEvent wiring).
+    """C# properties → ``get_Name`` / ``set_Name`` methods.
 
-    PersistentListenerMode targets property setters as ``set_Volume`` etc.
+    PersistentListenerMode targets property setters as ``set_Volume`` etc.;
+    a body's reads of the property call the getter.
     """
     import tools.cpprust as cpprust
     out = []
@@ -5781,10 +5809,31 @@ def properties_as_methods(body, bscan, body_abs=0):
         prop_scan = bscan[open_i + 1:close]
         decl = bscan[m.start():open_i + 1]
         is_public = bool(re.search(r"\bpublic\b", decl))
+        # get { ... } / get => expr; — a read lowers to a ``get_Name()`` call.
+        gm = re.search(r"(?<![\w.])get\s*(\{|=>)", prop_scan)
+        if gm:
+            gopen = gm.end() - (1 if gm.group(1) == "{" else 2)
+            if gm.group(1) == "{":
+                gclose = cpprust._match_brace(prop_scan, gopen)
+                gbody = (prop_body[gopen + 1:gclose]
+                         if gclose is not None else None)
+            else:
+                semi = prop_scan.find(";", gopen)
+                gbody = ("return %s;" % prop_body[gopen + 2:semi].strip()
+                         if semi >= 0 else None)
+            if gbody is not None:
+                out.append({
+                    "ret": ret,
+                    "name": "get_" + name,
+                    "args": "",
+                    "body": gbody,
+                    "body_abs": int(body_abs) + int(open_i + 1) + gopen + 1,
+                    "src": "",
+                    "public": is_public,
+                    "static": is_static,
+                })
         # set { ... } — implicit ``value`` parameter.
-        # Only setters are extracted (UnityEvent wires ``set_Name``); getters
-        # returning non-void would break the void method emitter.
-        sm = re.search(r"(?m)^\s*set\s*[ \t\r\n]*\{", prop_scan)
+        sm = re.search(r"(?<![\w.])set\s*\{", prop_scan)
         if sm:
             sopen = sm.end() - 1
             sclose = cpprust._match_brace(prop_scan, sopen)
@@ -5880,13 +5929,16 @@ def static_setter_stmts(body, bscan, member_names=()):
     return _static_property_accessors(body, bscan, member_names)[1]
 
 
-def static_method_exprs(body, bscan, member_names=()):
+def static_method_exprs(body, bscan, member_names=(), prefer_first=None):
     """``{Name: (params, text, is_void)}`` for static methods declared once
     whose body is one ``return expr;`` / ``=> expr`` (or, for ``void``, one
     statement), naming none of *member_names* nor another static method of
     the type, so a call can be replaced by the body with its parameters
     bound: ``static bool GetBool(string key, bool d = false) { return
-    PlayerPrefs.GetInt(key, d.GetHashCode()) == 1; }``."""
+    PlayerPrefs.GetInt(key, d.GetHashCode()) == 1; }``.
+
+    An overloaded name is kept when exactly one overload's first parameter
+    is of type *prefer_first* -- that overload stands for all of them."""
     import tools.cpprust as cpprust
     head = re.compile(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal)[ \t]+)?static"
@@ -5915,9 +5967,16 @@ def static_method_exprs(body, bscan, member_names=()):
     names = [d[1] for d in decls]
     own = set(member_names) | set(names)
     out = {}
+    def first_ty(params):
+        prms = parse_params(params)
+        return prms[0].type if prms else None
+
     for ret, name, params, at, kind in decls:
         if names.count(name) != 1:
-            continue
+            if prefer_first is None or first_ty(params) != prefer_first or [
+                    first_ty(d[2]) for d in decls
+                    if d[1] == name].count(prefer_first) != 1:
+                continue
         if kind == "=>":
             end = bscan.find(";", at)
             text = body[at + 2:end].strip() if end >= 0 else ""

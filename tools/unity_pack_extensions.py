@@ -369,11 +369,23 @@ def _receiver_start(scan, dot):
         return k + 1
 
 
+def _arity(params):
+    """(min, max) arguments a C# parameter list takes (`params`: any)."""
+    ps = [p for p in cs2cpp._split_top_level(params, angle=True) if p]
+    if any(re.match(r"params\b", p) for p in ps):
+        return (len(ps) - 1, 1 << 30)
+    return (sum("=" not in p for p in ps), len(ps))
+
+
 def rewrite_extension_calls(text, exts, props, skip_names=()):
     """`x.M(a)` -> `Cls.M(x, a)`, `x.M<T>(a)` -> `Cls.M<T>(x, a)`, `x.P` ->
     `Cls.get_P(x)`. `exts` / `props`: name -> class. A name that is also a
-    method of one of the project's own classes (`skip_names`) is left."""
-    names = {n: c for n, c in exts.items() if n not in skip_names}
+    method of one of the project's own classes (`skip_names`) is left --
+    a call only when one of its {name: [(min, max)]} arities could bind it:
+    receiver types are not known, but a 2-parameter `SetZ` cannot take one."""
+    arities = skip_names if isinstance(skip_names, dict) else {
+        n: [(0, 1 << 30)] for n in skip_names}
+    names = dict(exts)
     if names:
         pat = re.compile(r"\.\s*(%s)\s*(<[^<>()]*>)?\s*\(" % "|".join(
             re.escape(n) for n in sorted(names, key=len, reverse=True)))
@@ -393,6 +405,9 @@ def rewrite_extension_calls(text, exts, props, skip_names=()):
                 if cp is None:
                     continue
                 args = text[op + 1:cp].strip()
+                n = len(cs2cpp._split_top_level(args)) if args else 0
+                if any(lo <= n <= hi for lo, hi in arities.get(m.group(1), ())):
+                    continue
                 cls = names[m.group(1)]
                 rep = "%s.%s%s(%s%s)" % (cls, m.group(1), m.group(2) or "",
                                          recv, (", " + args) if args else "")
@@ -401,7 +416,7 @@ def rewrite_extension_calls(text, exts, props, skip_names=()):
                 break
             if not done:
                 break
-    pnames = {n: c for n, c in props.items() if n not in skip_names}
+    pnames = {n: c for n, c in props.items() if n not in arities}
     if pnames:
         pat = re.compile(r"\.\s*(%s)\b(?!\s*[(<=])" % "|".join(
             re.escape(n) for n in sorted(pnames, key=len, reverse=True)))
@@ -457,13 +472,18 @@ def desugar_project(files):
                     else:
                         exts[mname] = cname
     # Methods of the project's own (non-static) classes shadow extensions.
-    own = set()
+    own = {}
     for p, t in texts.items():
+        scan = cs2cpp._blank(t)
         for mm in re.finditer(r"(?m)^[ \t]*(?:(?:public|private|protected|"
                               r"internal|override|virtual)\s+)*"
-                              r"(?!static\b)[\w.<>\[\]]+\s+(\w+)\s*\(",
-                              cs2cpp._blank(t)):
-            own.add(mm.group(1))
+                              r"(?!static\b)[\w.<>\[\]]+\s+(\w+)\s*\(", scan):
+            cp = _match(scan, mm.end() - 1, "(", ")")
+            own.setdefault(mm.group(1), []).append(
+                _arity(t[mm.end():cp]) if cp is not None else (0, 1 << 30))
+    # every receiver has System.Object's (a number's `ToString("F1")` too)
+    for n in ("ToString", "Equals", "GetHashCode", "GetType", "CompareTo"):
+        own[n] = [(0, 1 << 30)]
     static_spans = {(info["path"], info["span"]) for info in classes.values()}
 
     def copyable(cls, name, targs):

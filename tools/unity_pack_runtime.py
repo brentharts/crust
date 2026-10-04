@@ -1032,13 +1032,12 @@ def lower_runtime_apis(text, used, blank, split_args, operand_kind,
                                       statement, as C# scopes it there)
         Time.realtimeSinceStartup ->  Time.time
     """
-    # Time: the packed engine has no time scale and reads no wall clock.
-    # ponytail: timeSinceLevelLoad is not reset by a scene load
+    # Time: the packed engine reads no wall clock.
+    # ponytail: timeSinceLevelLoad is not reset by a scene load, and
+    # unscaledTime is scaled by Time.timeScale
     text = _sub(text, blank, r"(?<![\w.])" + _QUAL +
                 r"Time\s*\.\s*(?:realtimeSinceStartup|unscaledTime|"
                 r"timeSinceLevelLoad)(?:AsDouble)?\b", lambda m: "Time.time")
-    text = _sub(text, blank, r"(?<![\w.])" + _QUAL +
-                r"Time\s*\.\s*unscaledDeltaTime\b", lambda m: "Time.deltaTime")
     # Mathf constants
     for name, val in MATHF_CONSTANTS.items():
         def rep(m, v=val):

@@ -46,8 +46,9 @@ def setUpModule():
     _saved_validate.append(saved)
 
     def validate(text, *a, **k):
-        # a C# string is a coost fastring, C++ only cpprust lowers to C
-        if "fastring" in text:
+        # a C# string is a coost fastring, a List a std::vector: C++ only
+        # cpprust lowers to C
+        if "fastring" in text or "std::vector" in text:
             return saved(text, *a, **k)
         return None
     unity_pack.validate_emitted_c = validate
@@ -491,11 +492,15 @@ public class Drawer : MonoBehaviour {
         fixed = dict(g, mode=1)                # the first key at or after t
         self.assertEqual(ul.gradient_eval(fixed, 0.25), (1.0, 0.0, 0.0, 0.0))
 
-    def test_local_space_on_a_rotated_object_is_refused(self):
-        with self.assertRaises(unity_pack.PackError) as cm:
-            unity_pack.pack(self._project(self.SCRIPT, world=0, rot_z=0.3),
-                            tempfile.mkdtemp(prefix="upack-lr-out-"), force=True)
-        self.assertIn("local space", cm.exception.message)
+    @needs_cc
+    def test_local_space_on_a_rotated_object_turns_with_it(self):
+        import math
+        lines = self._run_lines(self._project(
+            self.SCRIPT, world=0, rot_z=math.sqrt(0.5)))
+        q = [list(map(float, l.split()[1:])) for l in lines if l.startswith("Q ")][0]
+        # 90 degrees: the first segment (0,0)-(2,0) is drawn (0,0)-(0,2)
+        for got, want in zip(q[:6], (0, 1, 1, q[3], 0, 1)):
+            self.assertAlmostEqual(got, want, places=4)
 
 
 class TestTransformTranslate(unittest.TestCase):
@@ -715,6 +720,267 @@ public class User : MonoBehaviour {
         self.assertEqual([l for l in lines if l.startswith("first")], ["first GM0"])
         self.assertEqual([l for l in lines if l.startswith("dup")], ["dup GM1"])
         self.assertIn("score 2", lines)
+
+
+
+class TestStaticStateAndForeach(unittest.TestCase):
+    """Slime Jump forms: a static property over a static backing field
+    (`P += x`, `P++`), a `static Bag b = new Bag();` handle made at the
+    first tick, and `foreach` over a List<int>. Each emptied its method."""
+
+    BAG = "public class Bag { public int n; }\n"
+    P = """using UnityEngine;
+using System.Collections.Generic;
+public class P : MonoBehaviour {
+    static int _pts;
+    public static int Points { get { return _pts; } set { _pts = value; } }
+    static Bag bag = new Bag();
+    List<int> xs = new List<int>();
+    int _f;
+    void Update() {
+        _f++; if (_f > 1) return;
+        Points += 3; Points++;
+        bag.n = 5;
+        xs.Add(2); xs.Add(4);
+        int s = 0;
+        foreach (int x in xs) s += x;
+        Debug.Log("pts " + Points + " bag " + bag.n + " sum " + s);
+    }
+}
+"""
+
+    @needs_cc
+    def test_values_follow_csharp(self):
+        root = project(self, {"P": self.P, "Bag": self.BAG}, [("P",)])
+        self.assertIn("pts 4 bag 5 sum 6", run_frames(self, pack(self, root)))
+
+
+class TestStaticReference(unittest.TestCase):
+    """`static Ach current;` -- a static reference to a packed object, set
+    bare in its class and read as `Ach.current` elsewhere (Slime Jump's
+    `SpeedAchievement.current` emptied `GameManager.Update`)."""
+
+    ACH = """using UnityEngine;
+public class Ach : MonoBehaviour {
+    public static Ach current;
+    public float left = 3f;
+    public float TimeLeft { get { return left; } set { left = value; } }
+    void Start() { current = this; }
+}
+"""
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    int _f;
+    void Update() {
+        _f++;
+        if (Ach.current == null) { Debug.Log("none " + _f); return; }
+        Ach.current.TimeLeft -= 1f;
+        if (Ach.current.TimeLeft <= 0) { Ach.current = null; return; }
+        Debug.Log("left " + (int)Ach.current.TimeLeft);
+    }
+}
+"""
+
+    @needs_cc
+    def test_set_read_and_cleared(self):
+        root = project(self, {"Ach": self.ACH, "Mgr": self.MGR},
+                       [("Ach",), ("Mgr",)])
+        out = run_frames(self, pack(self, root), 5)
+        self.assertIn("left 2", out)
+        self.assertIn("left 1", out)
+        self.assertIn("none 4", out)
+
+
+class TestSingletonFieldCompare(unittest.TestCase):
+    """`Lasso.instance.changeLengthInput == 0` is a read: Slime Jump's
+    `Player.DoUpdate` had it lowered as a setter of `= 0) { ... }`."""
+
+    LASSO = """using UnityEngine;
+public class Lasso : MonoBehaviour {
+    public static Lasso instance;
+    public int changeLengthInput;
+    public bool isAttached = true;
+    void Awake() { instance = this; }
+}
+"""
+    CAM = """using UnityEngine;
+public class Cam : MonoBehaviour {
+    public static Cam instance;
+    public bool followPlayer = true;
+    void Awake() { instance = this; }
+}
+"""
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    void Update() {
+        if (Lasso.instance.isAttached && Lasso.instance.changeLengthInput == 0)
+        {
+            Cam.instance.followPlayer = false;
+        }
+        if (!Cam.instance.followPlayer) Debug.Log("follow False");
+    }
+}
+"""
+
+    @needs_cc
+    def test_compare_is_a_read(self):
+        root = project(self, {"Lasso": self.LASSO, "Cam": self.CAM,
+                              "Mgr": self.MGR},
+                       [("Lasso",), ("Cam",), ("Mgr",)])
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("follow False", out)
+
+
+class TestPlayerUpdateForms(unittest.TestCase):
+    """Slime Jump's `Player.DoUpdate` forms: a compound write keeps its
+    value whole (`x -= 3 - 1` is 8, not 6), a Vector2 field's `*=`, `.x` of
+    a Vector2 property, per-frame shader-parameter statements dropped, and
+    a TMP text write that stops the player only if it runs."""
+
+    MGR = """using UnityEngine;
+using TMPro;
+public class Mgr : MonoBehaviour {
+    public TMP_Text label;
+    public SpriteRenderer sr;
+    public float x = 10f;
+    public Vector2 v = new Vector2(1f, 2f);
+    public static Vector2 Stick { get { return new Vector2(0.5f, 0f); } }
+    void Update() {
+        x -= 3f - 1f;
+        v *= 2f;
+        if (x < 0f) label.text = "never";
+        Material mat = new Material(sr.sharedMaterial);
+        mat.SetInt("_g", 1);
+        sr.sharedMaterial = mat;
+        Debug.Log("x " + (int)x + " v " + (int)v.y + " s " + (int)(Stick.x * 10f));
+    }
+}
+"""
+
+    @needs_cc
+    def test_forms(self):
+        root = project(self, {"Mgr": self.MGR}, [("Mgr",)])
+        # not strict: strict refuses the shader and TMP statements instead
+        out = pack(self, root, strict=False)
+        self.assertIn("x 8 v 4 s 5", run_frames(self, out, 1))
+        # frame 6: x < 0 runs the TMP write
+        with self.assertRaises(AssertionError) as cm:
+            run_frames(self, out, 6)
+        self.assertIn("Mgr.cs:12: `TMP_Text.text` is not lowered",
+                      str(cm.exception))
+
+
+class TestEmbeddedStruct(unittest.TestCase):
+    """A [Serializable] struct a component embeds (Slime Jump's
+    `AnimationEntry jumpAnimationEntry`) is authored as a nested mapping:
+    each value is a row of the struct's class, the field its index. The
+    rows are shared by copies, so a write to one is refused."""
+
+    ENTRY = """using System;
+[Serializable]
+public struct Entry {
+    public string stateName;
+    public int layer;
+    public float length;
+    public bool Is(string s) { return stateName == s; }
+    public float Twice() { return length * 2f; }
+}
+"""
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    public Entry jump;
+    public Entry land;
+    void Update() {
+        if (jump.Is("Jump")) Debug.Log("jump " + jump.layer + " " + (int)land.Twice());
+        else Debug.Log("other " + land.layer);
+    }
+}
+"""
+    FIELDS = ("  jump:\n    stateName: %s\n    layer: %d\n    length: 0.5\n"
+              "  land:\n    stateName: Land\n    layer: %d\n    length: %s\n")
+
+    @needs_cc
+    def test_values_per_object(self):
+        root = project(self, {"Entry": self.ENTRY, "Mgr": self.MGR}, [
+            ("Mgr", None, self.FIELDS % ("Jump", 1, 2, "3.5")),
+            ("Mgr", None, self.FIELDS % ("Idle", 4, 5, "1"))])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("jump 1 7", out)
+        self.assertIn("other 5", out)
+
+    def test_prefab_override_reaches_nested_value(self):
+        doc = ("MonoBehaviour:\n  jump:\n    stateName: Jump\n    layer: 1\n"
+               "  land:\n    layer: 2\n")
+        got = unity_pack._set_yaml_property(doc, "land.layer", "7")
+        self.assertIn("  land:\n    layer: 7\n", got)
+        self.assertIn("    layer: 1\n", got)
+        self.assertEqual(unity_pack._embedded_values(got)["land"]["fields"],
+                         {"layer": 7})
+
+    def test_write_is_refused(self):
+        mgr = self.MGR.replace("void Update() {",
+                               "void Update() {\n        jump.layer = 3;")
+        root = project(self, {"Entry": self.ENTRY, "Mgr": mgr}, [
+            ("Mgr", None, self.FIELDS % ("Jump", 1, 2, "3.5"))])
+        with self.assertRaises(unity_pack.PackError) as cm:
+            pack(self, root)
+        self.assertIn("embedded struct", str(cm.exception))
+
+
+class TestInheritedUpdatables(unittest.TestCase):
+    """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
+    `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class
+    inherited what it ran (`GCam : Cam : Single<Cam> : UWE`): a base was
+    its own packed array, so GCam had no OnEnable / DoUpdate, `base.M()`
+    was dropped, and a generic base's header named no base at all."""
+
+    SCRIPTS = {
+        "IUpdatable": "public interface IUpdatable { void DoUpdate(); }\n",
+        "GM": """using UnityEngine;
+public class GM : MonoBehaviour {
+    public static IUpdatable[] updatables = new IUpdatable[0];
+    void Update() {
+        for (int i = 0; i < updatables.Length; i++) { IUpdatable u = updatables[i]; u.DoUpdate(); }
+        Debug.Log("gm");
+    }
+}
+""",
+        "UWE": """using UnityEngine;
+public class UWE : MonoBehaviour, IUpdatable {
+    public virtual void OnEnable() { GM.updatables = GM.updatables.Add(this); }
+    public virtual void DoUpdate() { }
+}
+""",
+        "Single": """using UnityEngine;
+public class Single<T> : UWE where T : UWE {
+    public bool persistant;
+    public virtual void Awake() { Debug.Log("single " + persistant); }
+}
+""",
+        "Cam": """using UnityEngine;
+public class Cam : Single<Cam> {
+    public override void DoUpdate() { HandlePosition(); }
+    public virtual void HandlePosition() { Debug.Log("cam pos"); }
+}
+""",
+        "GCam": """using UnityEngine;
+public class GCam : Cam {
+    public override void Awake() { base.Awake(); Debug.Log("gcam awake"); }
+    public override void HandlePosition() { Debug.Log("gcam pos"); base.HandlePosition(); }
+}
+""",
+    }
+
+    @needs_cc
+    def test_inherited_members_run(self):
+        root = project(self, self.SCRIPTS,
+                       [("GM",), ("GCam", None, "  persistant: 1\n")])
+        # GM.Update's loop leaves its body: engine_tick runs that dispatch
+        lines = run_frames(self, pack(self, root), frames=2)
+        self.assertEqual(lines[:2], ["single True", "gcam awake"])
+        self.assertEqual(lines.count("gm"), 2)
+        self.assertEqual(lines.count("gcam pos"), 2)
+        self.assertEqual(lines.count("cam pos"), 2)
 
 
 

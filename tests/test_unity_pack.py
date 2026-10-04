@@ -910,6 +910,128 @@ public class Player : MonoBehaviour {
         self.assertEqual(col["tris"][0], (6.0, -2.0, 4.0, -3.0, 6.0, -3.0))
         self.assertEqual(len(col["tris"]), 2)
 
+    def test_overloaded_helper_inlines_vector2(self):
+        body = ("\n public static Vector3 SetX (Vector3 v, float x)"
+                " { return new Vector3(x, v.y, v.z); }"
+                "\n public static Vector2 SetX (Vector2 v, float x)"
+                " { return new Vector2(x, v.y); }\n")
+        scan = cs2cpp._blank(body)
+        self.assertEqual(cs2cpp.static_method_exprs(body, scan), {})
+        got = cs2cpp.static_method_exprs(body, scan, prefer_first="Vector2")
+        self.assertEqual(got["SetX"][1], "new Vector2(x, v.y)")
+
+    def test_property_getters_are_methods(self):
+        body = ("\n public int Hits\n {\n  get\n  {\n   return hits * 2;\n  }\n"
+                "  set\n  {\n   hits = value;\n  }\n }\n bool Ready\n {\n"
+                "  get => hits > 0;\n }\n")
+        ms = {m["name"]: m for m in cs2cpp.properties_as_methods(
+            body, cs2cpp._blank(body))}
+        self.assertEqual(sorted(ms), ["get_Hits", "get_Ready", "set_Hits"])
+        self.assertEqual(ms["get_Ready"]["body"], "return hits > 0;")
+        self.assertEqual(ms["get_Hits"]["ret"], "int")
+        # a private property's getter is reached through its name
+        reach = unity_pack._reachable_emit_methods([
+            {"name": "Update", "body": "if (Ready) f();"},
+            {"name": "get_Ready", "body": "return 1;"}])
+        self.assertIn("get_Ready", reach)
+
+    def test_local_line_on_turned_object_bakes_its_matrix(self):
+        from tools import unity_pack_lines as lines
+        s = math.sqrt(0.5)
+        plan = {"classes": {"Saw": {"instances": [{
+            "name": "Saw", "rot": (0.0, 0.0, s, s), "local_scale": (2, 1, 1),
+            "line_renderer": {"world": False, "width": [], "file_id": 7}}]}}}
+        lines.build_table(plan)
+        m = plan["lines"][0]["m"]
+        # 90 degrees: x (scaled 2) goes to +y, y goes to -x
+        for got, want in zip(m, (0.0, -1.0, 2.0, 0.0)):
+            self.assertAlmostEqual(got, want)
+
+    def test_other_transform_field_position_reads(self):
+        plan = {"classes": {"Player": {"fields": [
+            {"name": "trs", "ty": "Transform"}]}}}
+        out = unity_pack._getter_transform_positions(
+            "a = Player_get_trs(Player_Instance()).position.y; "
+            "b = Player_get_trs(p).position; "
+            "Player_get_trs(p).position.x = 1;", plan, None)
+        self.assertEqual(out, (
+            "a = Vector2_y(Transform_get_position2(Player_get_trs("
+            "Player_Instance()))); "
+            "b = Transform_get_position2(Player_get_trs(p)); "
+            "Player_get_trs(p).position.x = 1;"))
+
+    def test_properties_time_scale_and_vector_helpers_run(self):
+        root = self._mini({"VecX.cs": """using UnityEngine;
+
+public static class VecX {
+    public static Vector3 SetX (this Vector3 v, float x) { return new Vector3(x, v.y, v.z); }
+    public static Vector2 SetX (this Vector2 v, float x) { return new Vector2(x, v.y); }
+}
+""", "Player.cs": """using UnityEngine;
+
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private int _f;
+    public int Hp2 { get { return hp * 2; } set { hp = value; } }
+
+    public void Update() {
+        _f = _f + 1;
+        if (_f == 1) {
+            Vector2 v = new Vector2(1, 2);
+            v = v.SetX(7);
+            Hp2 = 4;
+            Time.timeScale = 0.5f;
+            Debug.Log("v " + v.x + " " + v.y + " hp " + Hp2);
+        }
+        if (_f == 2)
+            Debug.Log("dt " + (Time.deltaTime * 2 == Time.unscaledDeltaTime));
+    }
+}
+"""})
+        self.assertEqual(self._run(root, log=True), ["v 7 2 hp 8", "dt True"])
+
+    def test_inverse_lerp_with_rect_normalize_defined_once(self):
+        root = self._mini({"Player.cs": """using UnityEngine;
+
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private bool _done;
+
+    public void Update() {
+        if (_done) return;
+        _done = true;
+        Rect r = new Rect(0, 0, 4, 2);
+        Debug.Log("il " + Mathf.InverseLerp(0, 10, 5) + " " + Rect.PointToNormalized(r, new Vector2(1, 1)).x);
+    }
+}
+"""})
+        self.assertEqual(self._run(root, log=True), ["il 0.5 0.25"])
+
+    def test_list_searches_per_element_type(self):
+        root = self._mini({"Player.cs": """using UnityEngine;
+using System.Collections.Generic;
+
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private bool _done;
+
+    public void Update() {
+        if (_done) return;
+        _done = true;
+        List<int> ints = new List<int>();
+        ints.Add(4);
+        List<Vector2Int> cells = new List<Vector2Int>();
+        Vector2Int c = new Vector2Int(1, 2);
+        cells.Add(c);
+        Debug.Log("ix " + ints.IndexOf(4) + " " + cells.IndexOf(c));
+    }
+}
+"""})
+        self.assertEqual(self._run(root, log=True), ["ix 0 0"])
+
     def _mini(self, scripts, scene_edit=None):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -16630,6 +16752,49 @@ class TestStrippedPrefabInstance(unittest.TestCase):
         objs, _l, _c, _h = unity_pack.parse_unity_yaml(text)
         pos = {o["name"]: o["pos"][0] for o in objs}
         self.assertEqual(pos, {"Mover": 17.0, "Child": 18.0})
+
+    def test_stub_on_child_canvas_still_places_prefab(self):
+        """Slime Jump's Game Camera: a stripped child RectTransform (scene UI
+        added under its Canvas) still places the prefab; a stripped root
+        RectTransform (a UI Button prefab) is left to the UI path."""
+        d = tempfile.mkdtemp(prefix="upack-stripped-rt-")
+        prefab = os.path.join(d, "Cam.prefab")
+        with open(prefab, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &100\nGameObject:\n  m_Name: Cam\n"
+                    "  m_Component:\n  - component: {fileID: 101}\n"
+                    "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "  m_Father: {fileID: 0}\n"
+                    "--- !u!1 &200\nGameObject:\n  m_Name: Canvas\n"
+                    "  m_Component:\n  - component: {fileID: 201}\n"
+                    "--- !u!224 &201\nRectTransform:\n"
+                    "  m_GameObject: {fileID: 200}\n"
+                    "  m_Father: {fileID: 101}\n")
+
+        def scene(src):
+            return ("%%YAML 1.1\n"
+                    "--- !u!1001 &5\nPrefabInstance:\n  m_Modification:\n"
+                    "    m_TransformParent: {fileID: 0}\n"
+                    "    m_Modifications: []\n"
+                    "  m_SourcePrefab: {fileID: 100100000, guid: aa, type: 3}\n"
+                    "--- !u!224 &6 stripped\nRectTransform:\n"
+                    "  m_CorrespondingSourceObject: {fileID: %d, guid: aa, "
+                    "type: 3}\n  m_PrefabInstance: {fileID: 5}\n" % src)
+
+        text = unity_pack._expand_unstripped_prefab_instances(
+            scene(201), {"aa": prefab})
+        self.assertNotIn("stripped", text)
+        self.assertIn("m_Name: Cam", text)
+        with open(prefab, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &200\nGameObject:\n  m_Name: Button\n"
+                    "  m_Component:\n  - component: {fileID: 201}\n"
+                    "--- !u!224 &201\nRectTransform:\n"
+                    "  m_GameObject: {fileID: 200}\n"
+                    "  m_Father: {fileID: 0}\n")
+        self.assertEqual(unity_pack._expand_unstripped_prefab_instances(
+            scene(201), {"aa": prefab}), scene(201))
 
 
 class TestProjectPhysicsSettings(unittest.TestCase):

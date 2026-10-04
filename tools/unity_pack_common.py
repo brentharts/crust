@@ -31,6 +31,7 @@ __all__ = [
     '_UE',
     '_UNITY_BUILTIN_GUID',
     '_authored_camera_view_size',
+    '_mark_hierarchy_live',
     '_c_ident',
     '_class_name_from_cs',
     '_fit_preserve_aspect',
@@ -162,13 +163,34 @@ def player_screen(root):
     return width, height
 
 
-def _authored_camera_view_size(objects):
-    """GameCamera / CameraScript ``viewSize`` (world units), or None."""
+def _mark_hierarchy_live(objects, hierarchy):
+    """Each object's ``hier_live`` (no inactive GameObject on its parent
+    chain) and ``go_tag``, from the scene *hierarchy*."""
+    by_go = {str(h.get("go_id")): h for h in hierarchy or ()}
+    by_xf = {str(h.get("xf_id")): h for h in hierarchy or ()}
     for o in objects or []:
-        fields = o.get("fields") or {}
-        if "viewSize_x" in fields and "viewSize_y" in fields:
-            return float(fields["viewSize_x"]), float(fields["viewSize_y"])
-    return None
+        h = by_go.get(str(o.get("go_id")))
+        o["go_tag"] = (h or {}).get("tag") or "Untagged"
+        live, seen = True, set()
+        while h is not None and id(h) not in seen:
+            seen.add(id(h))
+            if not int(h.get("active", 1)):
+                live = False
+                break
+            h = by_xf.get(str(h.get("father_id")))
+        o["hier_live"] = live
+
+
+def _authored_camera_view_size(objects):
+    """GameCamera / CameraScript ``viewSize`` (world units), or None. A
+    script under an inactive parent never runs (Slime Jump's stray Camera
+    under Merge Sprites); the MainCamera-tagged one wins."""
+    found = [(o.get("go_tag") != "MainCamera",
+              float(o["fields"]["viewSize_x"]), float(o["fields"]["viewSize_y"]))
+             for o in objects or []
+             if "viewSize_x" in (o.get("fields") or {})
+             and "viewSize_y" in o["fields"] and o.get("hier_live", True)]
+    return min(found, key=lambda f: f[0])[1:] if found else None
 
 
 def player_display(root):

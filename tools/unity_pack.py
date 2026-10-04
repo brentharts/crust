@@ -28,6 +28,7 @@ scene / sprite reload). ``--force`` always rebuilds.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import pickle
@@ -173,7 +174,10 @@ def _raise_unknown_component_type(t, analyses, ops=("AddComponent", "GetComponen
 
 def _mb_bases_from_header(scan, name_end, brace):
     """C# ``class Foo : Bar, IBaz`` → ``[\"Bar\", \"IBaz\"]`` (simple names)."""
-    header = scan[name_end:brace]
+    # `class S<T> : Base where T : Base`: neither the type parameters nor
+    # the constraint clause name a base
+    header = re.sub(r"^\s*<[^:{]*?>", "", scan[name_end:brace])
+    header = re.split(r"\bwhere\b", header, maxsplit=1)[0]
     if ":" not in header:
         return []
     clause = header.split(":", 1)[1]
@@ -2558,6 +2562,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if not fm.group(1).startswith("m_"):
                 rec.setdefault("object_ref_arrays", {})[fm.group(1)] = \
                     re.findall(r"fileID:\s*(-?\d+)", fm.group(2))
+        sv = _embedded_values(block)
+        if sv:
+            rec["struct_values"] = sv
         if kind == "Light":
             inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
             col = re.search(
@@ -2734,6 +2741,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if not far:
                 far = re.search(
                     r"(?m)^\s+m_FarClipPlane:\s*([0-9.eE+-]+)", block)
+            cull = re.search(
+                r"m_CullingMask:\s*\n\s+serializedVersion:\s*\d+\s*\n"
+                r"\s+m_Bits:\s*(-?\d+)", block)
             rec["camera"] = {
                 "orthographic": int(ortho.group(1)) if ortho else 1,
                 "orthographic_size": (
@@ -2744,6 +2754,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 # Unity defaults when YAML omits clip planes.
                 "near_clip": float(near.group(1)) if near else 0.3,
                 "far_clip": float(far.group(1)) if far else 1000.0,
+                "culling_mask": int(cull.group(1)) & 0xFFFFFFFF
+                if cull else 0xFFFFFFFF,
             }
         if kind in _JOINT2D_KINDS:
             rec["joint2d"] = _parse_joint2d(kind, block)
@@ -3055,6 +3067,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         vec2_fields = {}
         vec3_fields = {}
         anim_curves = {}
+        struct_values = {}
         sprite = None
         ui_image = None
         ui_button = None
@@ -3107,6 +3120,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 object_ref_arrays.update(k.get("object_ref_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
+                struct_values.update(k.get("struct_values") or {})
                 # AnimationCurve fields: keys and wrap modes, serialized
                 # inline (tools/unity_pack_curves.py).
                 try:
@@ -3374,6 +3388,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_b": cam["bg_b"],
                 "near_clip": cam["near_clip"],
                 "far_clip": cam["far_clip"],
+                "culling_mask": cam.get("culling_mask", 0xFFFFFFFF),
             })
         # Camera-only GOs are not packed as scripted instances.
         if (cam is not None and script is None and sprite is None
@@ -3541,6 +3556,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "anim_curves": anim_curves,
             "object_refs": object_refs,
             "object_ref_arrays": object_ref_arrays,
+            "struct_values": struct_values,
             "mb_ids": mb_ids,
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
@@ -4436,6 +4452,15 @@ def _build_go_active(plan, go_names):
             if "active" not in o:
                 continue
             act[gi] = 1 if int(o.get("active", 1)) else 0
+    # an unplaced prefab's row is dormant; its authored m_IsActive is what an
+    # Instantiate of it gets (`_engine_go_asset_active`)
+    asset = [-1] * len(act)
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            gi = o.get("go_index")
+            if o.get("prefab_asset") and gi is not None and 0 <= gi < len(act):
+                asset[gi], act[gi] = act[gi], 0
+    plan["go_asset_active"] = asset if any(a >= 0 for a in asset) else None
     return act
 
 
@@ -4628,7 +4653,18 @@ def _new_budget(analyses, plan):
                 if t not in classes or t in _ADDABLE_BUILTINS:
                     continue
                 budget[t] = budget.get(t, 0) + n
+            # `static T f = new T();`: one object, made at the first tick
+            for t in _static_new_fields(c.get("fields"), classes).values():
+                budget[t] = budget.get(t, 0) + 1
     return budget
+
+
+def _static_new_fields(fields, classes):
+    """{name: class} of the `static T f = new T();` fields of a packed T."""
+    return {f["name"]: f["ty"].split(".")[-1] for f in fields or ()
+            if f.get("static") and f.get("new_init")
+            and f["ty"].split(".")[-1] in classes
+            and f["ty"].split(".")[-1] not in _ADDABLE_BUILTINS}
 
 
 def _class_index_width(cname, n, spawn, annotated=None):
@@ -4699,6 +4735,179 @@ def _validate_addcomponent_types(types, plan, analyses=None):
                 t, analyses, ops=("AddComponent",))
 
 
+#: Accepted by GetComponent, not lowered by it: the method stubs (CS8000).
+_RENDERER_LOOKUP_TYPES = frozenset({"MeshFilter", "MeshRenderer", "Renderer"})
+
+
+def _analyze_static_refs(analyses, typename_map):
+    """Scripts no scene places but a packed one calls statically
+    (`SaveAndLoadManager.GetInt(..)`): analyzed in full, so their static
+    methods are emitted (a zero-instance class) and the calls lower.
+    Transitively; a script the pack refuses is left out (the calls stub)."""
+    have = {c["name"] for a in analyses for c in a.get("classes") or []}
+    got, queue = [], list(analyses)
+    while queue:
+        a = queue.pop()
+        refs = set()
+        for c in a.get("classes") or []:
+            refs |= set(re.findall(r"(?<![\w.])([A-Z]\w*)\s*\.\s*[A-Z]\w*",
+                                   cs2cpp._blank(c.get("file_text") or "")))
+        for t in sorted(refs - have):
+            if t not in typename_map:
+                continue
+            have.add(t)
+            try:
+                sa = analyze_script(typename_map[t])
+            except PackError:
+                continue
+            # a `static class` is `_static_helper_methods`' (it skips packed ones)
+            if re.search(r"\bstatic\s+(?:partial\s+)?class\s+%s\b" % re.escape(t),
+                         cs2cpp._blank(_read(typename_map[t]))):
+                continue
+            sa["static_ref"] = True
+            got.append(sa)
+            queue.append(sa)
+    return got
+
+
+def _inherit_base_members(analyses, typename_map):
+    """Copy what a class inherits from its authored bases into it.
+
+    A base is its own packed array, so `GameCamera : CameraScript` had no
+    `DoUpdate` and no `viewRect`: the instance the scene places ran none of
+    what C# runs for it. Each fully analyzed class gets its bases' instance
+    fields and the instance methods it does not override (a generic base's
+    type parameters bound: `SingletonUpdateWhileEnabled<Player>`), and
+    `base.M(` calls a copy of the nearest ancestor's M, `base__B__M`.
+    Statics stay with the class that declares them. Returns the bases no
+    analysis had yet, shallow (no methods), so `mb_bases` reaches the
+    interfaces at the top of a chain (`IUpdatable`).
+    ponytail: an override is matched by name and arity, not parameter types;
+    a bare static name in a copied body resolves in the derived class, so a
+    `new static` there stands in for the base's (same object for singletons)
+    """
+    full = {}
+
+    def cls_of(name):
+        path = typename_map.get(name)
+        if not path:
+            return None
+        if path not in full:
+            try:
+                full[path] = analyze_script(path)
+            except PackError:
+                full[path] = None
+        a = full[path]
+        return next((c for c in (a or {}).get("classes") or ()
+                     if c["name"] == name), None)
+
+    def key(m):
+        return (m["name"], len(cs2cpp.parse_params(m.get("args") or "")))
+
+    def bind(text, targs):
+        for g, t in targs.items():
+            text = cs2cpp.code_sub(r"(?<![\w.])%s(?![\w])" % re.escape(g), t, text)
+        return text
+
+    for a in analyses:
+        if a.get("shallow"):
+            continue
+        for c in a.get("classes") or []:
+            # the chain, nearest first: (class, its type arguments)
+            chain, cur, seen = [], c, {c["name"]}
+            while True:
+                b = next((b for b in cur.get("bases") or ()
+                          if b in typename_map and b not in seen), None)
+                bc = cls_of(b) if b else None
+                if bc is None or bc.get("kind") == "interface":
+                    break
+                hm = re.search(r"\b%s\s*<([^<>{};]*)>" % re.escape(b),
+                               cs2cpp._blank(cur.get("file_text") or ""))
+                pm = re.search(r"\bclass\s+%s\s*<([^<>{};]*)>" % re.escape(b),
+                               cs2cpp._blank(bc.get("file_text") or ""))
+                targs = dict(zip([s.strip() for s in pm.group(1).split(",")],
+                                 [s.strip() for s in hm.group(1).split(",")])
+                             ) if hm and pm else {}
+                # an outer binding reaches the base's own (`T` of the derived)
+                prev = chain[-1][1] if chain else {}
+                targs = {g: prev.get(t, t) for g, t in targs.items()}
+                chain.append((bc, targs))
+                seen.add(b)
+                cur = bc
+            if not chain:
+                continue
+            # what the copied bodies use (string helpers, GetComponent<T>, ..)
+            for bc, _t in chain:
+                ba = full.get(typename_map.get(bc["name"])) or {}
+                for k, v in ba.items():
+                    if isinstance(v, set):
+                        a[k] = set(a.get(k) or ()) | v
+                    elif k in ("spawns", "uses_z", "writes_pos", "writes_rot") and v:
+                        a[k] = True
+                a["literals"] = list(a.get("literals") or []) + [
+                    x for x in ba.get("literals") or [] if x not in (a.get("literals") or [])]
+            levels = [(c, {})] + chain
+
+            def base_ref(level, body):
+                """`base.M(` in a body from levels[level] → the copy's name."""
+                def sub(m):
+                    for j in range(level + 1, len(levels)):
+                        bc, targs = levels[j]
+                        bm = next((x for x in bc["methods"] if x["name"] == m.group(1)
+                                   and not x.get("static")), None)
+                        if bm:
+                            want.append((j, bm))
+                            return "base__%s__%s(" % (bc["name"], bm["name"])
+                    return m.group(0)
+                return cs2cpp.code_sub(r"(?<![\w.])base\s*\.\s*(\w+)\s*\(", sub, body)
+
+            def copy(level, bm, name=None):
+                bc, targs = levels[level]
+                m = dict(bm, name=name or bm["name"], path=bc.get("path"),
+                         file_text=bc.get("file_text"), inherited_from=bc["name"])
+                for k in ("body", "args", "ret", "src"):
+                    if m.get(k):
+                        m[k] = bind(m[k], targs)
+                m["body"] = base_ref(level, m.get("body") or "")
+                return m
+
+            want = []
+            for m in c["methods"]:
+                m["body"] = base_ref(0, m.get("body") or "")
+            have = {key(m) for m in c["methods"]}
+            for j in range(1, len(levels)):
+                for bm in levels[j][0]["methods"]:
+                    if bm.get("static") or bm.get("ctor") or key(bm) in have:
+                        continue
+                    have.add(key(bm))
+                    c["methods"].append(copy(j, bm))
+            done = set()
+            while want:
+                j, bm = want.pop()
+                name = "base__%s__%s" % (levels[j][0]["name"], bm["name"])
+                if name not in done:
+                    done.add(name)
+                    c["methods"].append(copy(j, bm, name))
+            names = {f["name"] for f in c.get("fields") or []}
+            for bc, targs in chain:
+                for f in bc.get("fields") or []:
+                    if f.get("static") or f.get("const") or f["name"] in names:
+                        continue
+                    names.add(f["name"])
+                    c.setdefault("fields", []).append(
+                        dict(f, ty=bind(f.get("ty") or "", targs), inherited_from=bc["name"]))
+    have = {c["name"] for a in analyses for c in a.get("classes") or []}
+    out = []
+    for path, a in sorted((p, a) for p, a in full.items() if a):
+        if not {c["name"] for c in a["classes"]} - have:
+            continue
+        out.append(dict(a, shallow=True, apis=set(), getcomponent_types=set(),
+                        getcomponentsinchildren_types=set(), addcomponent_types=set(),
+                        classes=[dict(c, methods=[]) for c in a["classes"]
+                                 if c["name"] not in have]))
+    return out
+
+
 def _validate_getcomponent_types(types, plan, analyses=None):
     """GetComponent / GetComponentsInChildren<T> for unknown T → CS0246.
 
@@ -4712,13 +4921,16 @@ def _validate_getcomponent_types(types, plan, analyses=None):
     bases_map = plan.get("mb_bases") or _collect_mb_bases(analyses)
     # MeshFilter / MeshRenderer are packed (unity_pack_mesh): a script may
     # ask for one; making a mesh at runtime is what is not packed yet
-    known = (set(plan.get("classes") or {}) | {"MeshFilter", "MeshRenderer", "Renderer"}
+    known = (set(plan.get("classes") or {}) | _RENDERER_LOOKUP_TYPES
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS | _COLLIDER2D_TYPES
              | (_JOINT2D_COMPONENTS | _PARTICLE_COMPONENTS)
              | _UI_GETCOMPONENT_TYPES
              | _TRANSFORM_GETCOMPONENT_TYPES
-             | _analyzed_mb_typenames(analyses))
+             | _analyzed_mb_typenames(analyses)
+             # ponytail: an interface lookup is accepted, not lowered — the
+             # method stubs (CS8000) until iref locals + dispatch exist
+             | set(_collect_interfaces(analyses)))
     # Base type with at least one packed subclass is known for GCIC.
     for t in types:
         if t in known:
@@ -4849,10 +5061,37 @@ def _rewrite_new_packed_class(text, plan):
             continue
         if not int(budget.get(cname) or 0):
             continue
-        text = cs2cpp.code_sub(
-            r"(?<![\w.])new\s+(?:[\w.]+\s*\.\s*)?%s\s*\(" % re.escape(cname),
-            "Object_New_%s(" % _c_ident(cname), text)
+        idn = _c_ident(cname)
+        call = r"(?<![\w.])new\s+(?:[\w.]+\s*\.\s*)?%s\s*\(" % re.escape(cname)
+        ctors = [m for _c, m in (plan.get("_methods_by") or {}).get(cname, [])
+                 if m.get("ctor") and m.get("name") == cname]
+        if len(ctors) < 2:
+            text = cs2cpp.code_sub(call, "Object_New_%s(" % idn, text)
+            continue
+        # overloads by argument type; a call none or several fit is left
+        out, pos = [], 0
+        for m in list(re.finditer(call, cs2cpp._blank(text))):
+            if m.start() < pos:
+                continue
+            got = _match_call_args(text, m.end() - 1)
+            meth = got and _pick_overload(ctors, got[0], ())
+            if not meth:
+                continue
+            args, end = got
+            margs = meth.get("args") or ""
+            out += [text[pos:m.start()], "%s(%s)" % (
+                _object_new_symbol(idn, margs, True),
+                _call_with_defaults(args, cs2cpp.parse_params(margs)).strip())]
+            pos = end
+        text = "".join(out) + text[pos:]
     return text
+
+
+def _object_new_symbol(idn, args_str, overloaded):
+    """`new T(..)`'s C function: one per constructor overload."""
+    if not overloaded:
+        return "Object_New_%s" % idn
+    return "Object_New_%s_%s" % (idn, cs2cpp.method_arg_type_suffix(args_str))
 
 
 def _rewrite_getcomponentsinchildren(text, plan, this_class):
@@ -5464,10 +5703,27 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
                     idn, fname, idn, fname, parts[0], parts[1],
                     parts[2] if len(parts) > 2 else "1.f"))
 
-    return cs2cpp.code_sub(
+    alt = "|".join(re.escape(f) for f in transform_fields)
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(%s)\s*\.\s*localScale\s*=\s*new\s+Vector[23]\s*"
-        r"\((.*?)\)\s*;" % "|".join(re.escape(f) for f in transform_fields),
-        _local_scale, text, flags=re.DOTALL)
+        r"\((.*?)\)\s*;" % alt, _local_scale, text, flags=re.DOTALL)
+
+    def target(fname):
+        return ("_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i]"
+                % (idn, fname, idn, fname))
+    # any other Vector2 value (`trs.localScale.SetX(..)` once inlined)
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])(%s)\s*\.\s*localScale\s*=(?!=)\s*([^;]+);" % alt,
+        lambda m: "{ Vector2 _up_ls = %s; _engine_set_world_scale(%s, "
+                  "_up_ls.x, _up_ls.y, 1.f); }" % (m.group(2).strip(),
+                                                   target(m.group(1))),
+        text)
+    return cs2cpp.code_sub(
+        r"(?:\(\s*(%s)\s*\.\s*localScale\s*\)|(?<![.\w])(%s)\s*\.\s*"
+        r"localScale)\s*\.\s*([xyz])\b(?!\s*[-+*/]?=(?!=))" % (alt, alt),
+        lambda m: "1.f" if m.group(3) == "z" else
+        "_engine_get_local_scale(%s, %d)" % (
+            target(m.group(1) or m.group(2)), m.group(3) == "y"), text)
 
 
 def _uses_collision2d_contacts(analyses):
@@ -5648,6 +5904,35 @@ def _rewrite_transform_field_position(text, cl, plan, site=None):
         fname = f.get("name")
         if f.get("ty") != "Transform" or (cl["name"], fname) not in targets:
             continue
+        tgt = ("_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i]"
+               % (idn, fname, idn, fname))
+        if plan.get("has_transform_parents"):
+            # a whole Vector2 written (or added): the world setter, z kept;
+            # a `new Vector3(x, y, z)`: its z (`t.position.z` reads the kept one)
+            def world_set(m, t=tgt):
+                rhs, add = m.group(2).strip(), m.group(1)
+                z = "_up_wz"
+                inner = rhs
+                while inner.startswith("(") and (cs2cpp.match_call_args(
+                        inner, 0) or (0, 0))[1] == len(inner):
+                    inner = inner[1:-1].strip()
+                v3 = re.match(r"new\s+Vector3\s*(?=\()", inner)
+                got = cs2cpp.match_call_args(inner, v3.end()) if v3 else None
+                xyz = cs2cpp._split_top_level(got[0]) if got and got[1] == len(
+                    inner) else []
+                if len(xyz) == 3:
+                    rhs = "Vector2_make(%s, %s)" % (xyz[0], xyz[1])
+                    z = "%s(%s)" % ("_up_wz + " if add else "", xyz[2].strip())
+                return ("{ Vector2 _up_tp = %s; float _up_wx, _up_wy, _up_wz; "
+                        "_engine_world_pos(%s, &_up_wx, &_up_wy, &_up_wz, 0); "
+                        "_engine_set_world(%s, %s_up_tp.x, %s_up_tp.y, %s); }"
+                        % (rhs, t, t, "_up_wx + " if add else "",
+                           "_up_wy + " if add else "", z))
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*position\s*(\+?)=(?!=)"
+                r"\s*([^;]+);" % re.escape(fname), world_set, text)
+            if site is not None and "_up_tp" in text:
+                site.setdefault("protos", set()).add(_WORLD_POS_PROTO)
         pat = (r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*position\s*\.\s*([xyz])\b"
                r"(?!\s*(?:=[^=]|\+=|-=|\*=|/=|\+\+|--))" % re.escape(fname))
         if not re.search(pat, text):
@@ -5845,6 +6130,13 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                         "? (%s, 0.f) "
                         ": _Rigidbody2D_vel_%s[_up_rb]; })"
                         % (get, nre, axis))
+            if fl in ("velocity", "linearvelocity") and not axis:
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 "
+                        "? (%s, Vector2_make(0.f, 0.f)) "
+                        ": Vector2_make(_Rigidbody2D_vel_x[_up_rb], "
+                        "_Rigidbody2D_vel_y[_up_rb]); })"
+                        % (get, nre))
             if fl in ("mass",):
                 return ("({ int _up_rb = %s; "
                         "_up_rb < 0 "
@@ -5922,6 +6214,10 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
     for ch in chains:
         comp = ch.get("component")
+        if (comp in (plan.get("interfaces") or {})
+                or (comp in _RENDERER_LOOKUP_TYPES
+                    and not _known_component(comp))):
+            continue                  # left as C#: the method stubs (CS8000)
         field = ch.get("field")
         axis = ch.get("axis")
         line = _line_at(ch["start"])
@@ -6700,6 +6996,7 @@ def _fields_in(body, bscan, body_abs=0):
             # line (method bodies are blanked, so no `for (..; ..)`).
             r"(?m)(?:^|(?<=;))[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:const[ \t]+)?(?:readonly[ \t]+)?"
+            r"(?:event[ \t]+)?"
             # Types may be generics: Dictionary<int, int> / List<Foo>, or T[].
             r"([\w.]+(?:\s*<[^>;{\n]+>)?(?:\s*\[\s*\])?)[ \t]+(\w+)[ \t]*(=|;)",
             bscan):
@@ -6721,6 +7018,9 @@ def _fields_in(body, bscan, body_abs=0):
             "name": name,
             "static": bool(re.search(r"\bstatic\b", decl)),
             "const": bool(re.search(r"\bconst\b", decl)),
+            "delegate": bool(re.search(r"\bevent\b", decl)) or bool(
+                re.match(r"(?:System\.)?(?:Action|Func|Predicate|UnityAction)"
+                         r"\b", ty)),
             "decl_abs": int(body_abs) + int(m.start()),
             "serialized": ((bool(re.match(r"\s*public\b", decl))
                             or "SerializeField" in attrs)
@@ -6745,6 +7045,9 @@ def _fields_in(body, bscan, body_abs=0):
                 default = _parse_csharp_field_init(ty, init_src)
                 if default is not None:
                     entry["default"] = default
+                if re.match(r"\s*new\s+(?:[\w.]+\.)?%s\s*\(\s*\)\s*$"
+                            % re.escape(ty.split(".")[-1]), init_src):
+                    entry["new_init"] = True
         out.append(entry)
     return out
 
@@ -7150,6 +7453,13 @@ def _rewrite_singleton_method_calls(text, plan, cl, site, string_idents):
     return text
 
 
+#: `T[]` elements that are values, not references to objects.
+_VALUE_ELEM_TYPES = frozenset((
+    "string", "bool", "byte", "sbyte", "char", "short", "ushort", "int",
+    "uint", "long", "ulong", "float", "double", "Vector2", "Vector3",
+    "Vector2Int", "Vector3Int", "Color", "Color32", "Rect", "Quaternion"))
+
+
 def _array_elem_name(ty):
     """Element type from ``T[]``, or None."""
     if not ty:
@@ -7218,7 +7528,10 @@ def _static_helper_methods():
                 body, bs = text[open_i + 1:close], bscan[open_i + 1:close]
                 cname = m.group(1)
                 seen[cname] = seen.get(cname, 0) + 1
-                meths = cs2cpp.static_method_exprs(body, bs, field.findall(bs))
+                # ponytail: C has only Vector2, so `SetX(Vector2)` stands in
+                # for its Vector3 overloads; a Vector3Int receiver is not told apart
+                meths = cs2cpp.static_method_exprs(body, bs, field.findall(bs),
+                                                   prefer_first="Vector2")
                 if meths:
                     got.setdefault(cname, {}).update(meths)
     for cname, n in seen.items():
@@ -7387,7 +7700,7 @@ def _inline_static_getters(text, cl, plan):
             for pat in names:
                 text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\b(?!\s*(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=))" % pat,
-                    "(%s)" % expr, text)
+                    "(%s)" % cs2cpp.lower_float_literals(expr), text)
     return text
 
 
@@ -7572,6 +7885,33 @@ def _iface_tick_arrays(plan, analyses):
     return out
 
 
+def _drop_iface_tick_loops(text, plan, site):
+    """The authored loop `_iface_tick_arrays` runs from `engine_tick`
+    (`for (..i < updatables.Length..) { IUpdatable u = updatables[i];
+    u.DoUpdate(); }`) leaves the Update body, so the rest of it lowers.
+    ponytail: the dispatch runs after every Update, not at the loop's
+    place in this one; inline the switch if a body depends on that order."""
+    if (site or {}).get("method") not in ("Update", "FixedUpdate",
+                                          "LateUpdate"):
+        return text
+    ifaces = plan.get("interfaces") or {}
+    for _c, f, elem, iface in _any_static_ref_arrays(plan):
+        if not iface:
+            continue
+        void0 = {d["name"] for d in (ifaces.get(elem) or {}).get("methods")
+                 or [] if (d.get("ret") or "void") == "void"
+                 and not (d.get("args") or "").strip()}
+        arr = r"(?:\w+\s*\.\s*)?%s" % re.escape(f)
+        text = cs2cpp.code_sub(
+            r"for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*(%s)\s*\.\s*"
+            r"(?:Length|Count)\s*;\s*\1\s*\+\+\s*\)\s*\{\s*%s\s+(\w+)\s*=\s*"
+            r"%s\s*\[\s*\1\s*\]\s*;\s*\3\s*\.\s*(\w+)\s*\(\s*\)\s*;\s*\}"
+            % (arr, re.escape(elem), arr),
+            lambda m: ("/* %s: engine_tick dispatches */" % m.group(4)
+                       if m.group(4) in void0 else m.group(0)), text)
+    return text
+
+
 def _authored_iface_tick(mname, fields, analyses):
     """True if an authored Update-family body loops a field calling *mname*."""
     names = {f for _c, f in fields}
@@ -7613,7 +7953,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         # `Class_get_f(Class_Instance()) = v` (not an lvalue → CS0000).
         for vf in ocl.get("vec2_fields") or []:
             text = cs2cpp.code_sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=(?!=)\s*"
                 r"([^;]+);"
                 % (re.escape(ocname), re.escape(vf)),
                 lambda m, o=oidn, f=vf, ix=inst: (
@@ -7629,11 +7969,27 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 text)
         for f in sorted((ocl.get("class_consts") or []),
                         key=lambda f: -len(f["name"])):
-            if _is_scalar_static(f):
+            if _is_scalar_static(f) or _is_ref_static(f, plan, ocname):
                 text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\s*\.\s*%s\b(?!\s*\()"
                     % (re.escape(ocname), re.escape(f["name"])),
                     "%s_%s" % (oidn, f["name"]), text)
+            if not _is_ref_static(f, plan, ocname):
+                continue
+            sym = "%s_%s" % (oidn, f["name"])
+            if ocname == this:
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])(?:this\s*\.\s*)?%s\b(?!\s*\()"
+                    % re.escape(f["name"]), sym, text)
+            # an index: null is -1. ponytail: a destroyed object still reads
+            # non-null (Unity's == null is true); clear it in OnDestroy if
+            # that matters
+            text = cs2cpp.code_sub(r"(?<![\w.])%s\s*==\s*null\b" % sym,
+                                   "%s < 0" % sym, text)
+            text = cs2cpp.code_sub(r"(?<![\w.])%s\s*!=\s*null\b" % sym,
+                                   "%s >= 0" % sym, text)
+            text = cs2cpp.code_sub(r"(?<![\w.])%s\s*=\s*null\b" % sym,
+                                   "%s = -1" % sym, text)
         member_names = {n for n, _t, _b, _k in (ocl.get("members") or [])}
         for mem in sorted(member_names, key=len, reverse=True):
             if mem.endswith("_x") or mem.endswith("_y") or mem.endswith("_z"):
@@ -7641,7 +7997,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             if mem.startswith("pos_"):
                 continue
             text = cs2cpp.code_sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=(?!=)\s*"
                 r"([^;]+);"
                 % (re.escape(ocname), re.escape(mem)),
                 "%s_set_%s(%s, (\\1));" % (oidn, mem, inst),
@@ -7676,6 +8032,10 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
         if use_inst or ocname in (plan.get("classes") or {}):
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*enabled\b"
+                r"(?!\s*=(?!=))" % re.escape(ocname),
+                "%s_get_enabled(%s)" % (oidn, inst), text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b"
                 % re.escape(ocname),
@@ -7738,6 +8098,49 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                     "%s(" % sym, text)
             text = _fill_defaults_after(
                 text, sym, cs2cpp.parse_params(m.get("args") or ""))
+        text = _lower_static_properties(text, plan, ocname, pairs, overloaded,
+                                        ocname == this)
+    return text
+
+
+def _lower_static_properties(text, plan, ocname, pairs, overloaded, own):
+    """A static property of *ocname* used by name -- `Type.Name`, or bare
+    `Name` inside the type -- as the `get_Name` / `set_Name` functions
+    `properties_as_methods` made: `Name = x;` the setter, `Name += x;` /
+    `Name++;` the setter of the getter's value, a read the getter (when its
+    type has a C value)."""
+    oidn = _c_ident(ocname)
+    acc = {m["name"]: m for _c, m in pairs
+           if m.get("static") and m["name"][:4] in ("get_", "set_")
+           and m["name"] not in overloaded
+           and m["name"][4:] not in ("Instance", "instance")}
+    for prop in sorted({n[4:] for n in acc}, key=len, reverse=True):
+        get, put = acc.get("get_" + prop), acc.get("set_" + prop)
+        if get is not None and _ret_c_ty(get.get("ret"), plan) in (None, "void"):
+            get = None
+        recv = r"(?<![\w.])(?:%s\s*\.\s*%s%s)" % (
+            re.escape(ocname), re.escape(prop),
+            r"|(?<![\w.])%s" % re.escape(prop) if own else "")
+        gsym = "%s_get_%s()" % (oidn, prop)
+        if put is not None:
+            ssym = "%s_set_%s" % (oidn, prop)
+            if get is not None:
+                text = cs2cpp.code_sub(
+                    r"(?:%s)\s*([-+*/])=\s*([^;]+);" % recv,
+                    lambda m, s=ssym, g=gsym: "%s(%s %s (%s));" % (
+                        s, g, m.group(1), m.group(2).strip()), text)
+                text = cs2cpp.code_sub(
+                    r"(?:(?:%s)\s*(\+\+|--)|(\+\+|--)\s*(?:%s))\s*;"
+                    % (recv, recv),
+                    lambda m, s=ssym, g=gsym: "%s(%s %s 1);" % (
+                        s, g, (m.group(1) or m.group(2))[0]), text)
+            text = cs2cpp.code_sub(
+                r"(?:%s)\s*=(?!=)\s*([^;]+);" % recv,
+                lambda m, s=ssym: "%s(%s);" % (s, m.group(1).strip()), text)
+        if get is not None:
+            text = cs2cpp.code_sub(
+                r"(?:%s)\b(?!\s*(?:\(|[-+*/]?=(?!=)|\+\+|--))" % recv,
+                gsym, text)
     return text
 
 
@@ -7777,6 +8180,19 @@ def _unstored_field_names(cl, plan):
     return out
 
 
+def _writes_embedded_struct(body, plan):
+    """The first write to a field of an embedded [Serializable] struct's row
+    in lowered *body*, else None (see `_embedded_struct_rows`)."""
+    for s in sorted(plan.get("embedded_structs") or ()):
+        sid = re.escape(_c_ident(s))
+        m = re.search(r"(?<![\w])%s_set_\w+\s*\(|(?<![\w])%s_AT\s*\([^;]*?\)"
+                      r"\s*\.\s*\w+\s*(?:[-+*/%%&|^]?=(?!=)|\+\+|--)"
+                      % (sid, sid), body)
+        if m:
+            return m.group(0)
+    return None
+
+
 def _writes_unstored_field(body, cl, plan):
     """The `this.f = v` of a field the pack keeps no storage for, or None.
 
@@ -7792,6 +8208,13 @@ def _writes_unstored_field(body, cl, plan):
     for m in re.finditer(r"(?<![\w.])this\s*\.\s*(\w+)\s*=(?!=)", scan):
         if m.group(1) in unstored:
             return (body or "")[m.start():m.end()]
+    # a delegate field (an event, an Action) used at all: no C name either
+    for f in cl.get("fields") or []:
+        if f.get("delegate") and f["name"] in unstored:
+            m = re.search(r"(?<![\w.])(?:this\s*\.\s*)?%s\b" % re.escape(
+                f["name"]), scan)
+            if m:
+                return (body or "")[m.start():m.end()]
     return None
 
 
@@ -7875,7 +8298,11 @@ def _reachable_emit_methods(methods, extra_roots=()):
             for other in by_name:
                 if other in reach:
                     continue
-                if re.search(r"(?<![\w.])%s\s*\(" % re.escape(other), body):
+                # a property's accessor: by the property's own name
+                pat = (r"(?<![\w.])%s\b" % re.escape(other[4:])
+                       if other[:4] in ("get_", "set_")
+                       else r"(?<![\w.])%s\s*\(" % re.escape(other))
+                if re.search(pat, body):
                     reach.add(other)
                     queue.append(other)
     return reach
@@ -7935,7 +8362,11 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
             (r"\w+\.gameObject\b",
              "Unity component handle still using `recv.gameObject`."),
             (r"\w+\.activeSelf\b",
-             "Unity `activeSelf` on a receiver nothing lowered.")):
+             "Unity `activeSelf` on a receiver nothing lowered."),
+            # ponytail: cpprust copies a string through a pointer shallowly
+            (r"_engine_map_at_si_std_string\s*\(",
+             "A string-valued Dictionary element (`d[key]`) is not lowered "
+             "yet.")):
         hit = unity(pattern, what)
         if hit:
             return hit
@@ -8093,6 +8524,47 @@ def _assigned_int_seeds(fname, methods, fields):
     return seeds
 
 
+def _embedded_struct_rows(by_class, analyses):
+    """Rows for the [Serializable] values objects embed (`public
+    AnimationEntry jump;`, authored as a nested mapping): each becomes a row
+    of its type's packed class, and the owner's field its index, as a
+    reference to another packed object is. Two copies of a value then share
+    a row, so the rows are read-only (`_writes_embedded_struct` refuses a
+    write): sharing a value nobody changes is a copy.
+    ponytail: an owner the scene does not author (AddComponent) holds null,
+    not default(T); a shared default row if that matters."""
+    info = {c["name"]: c for a in analyses for c in a.get("classes") or []}
+    embedded, serial = set(), itertools.count()
+    queue = [(cn, o) for cn in sorted(by_class) for o in by_class[cn]]
+    while queue:
+        cname, o = queue.pop(0)
+        sv = o.get("struct_values") or {}
+        if not sv or cname not in info:
+            continue
+        for f in info[cname].get("fields") or []:
+            ty = (f.get("ty") or "").split(".")[-1]
+            t = info.get(ty)
+            if (f["name"] not in sv or f.get("static") or not t
+                    or t.get("bases")):
+                continue
+            v = sv[f["name"]]
+            rid = "embedded:%d" % next(serial)
+            row = {"name": "%s.%s" % (o.get("name") or cname, f["name"]),
+                   "class": ty, "pos": (0.0, 0.0, 0.0),
+                   "rot": (0.0, 0.0, 0.0, 1.0), "active": 1,
+                   "fields": dict(v["fields"]),
+                   "str_fields": dict(v["str_fields"]),
+                   "object_refs": dict(v["object_refs"]),
+                   "vec2_fields": dict(v["vec2_fields"]),
+                   "struct_values": v.get("struct_values") or {},
+                   "mb_ids": [rid], "embedded": True}
+            o.setdefault("object_refs", {})[f["name"]] = rid
+            by_class.setdefault(ty, []).append(row)
+            embedded.add(ty)
+            queue.append((ty, row))
+    return embedded
+
+
 def plan_layouts(objects, analyses, two_d=None):
     """Per-class packed field list + index width."""
     by_class = {}
@@ -8114,6 +8586,8 @@ def plan_layouts(objects, analyses, two_d=None):
         referenced |= set(a.get("findobject_types") or [])
         referenced |= set(a.get("singleton_instance_types") or [])
         for c in a.get("classes") or []:
+            if a.get("static_ref"):
+                referenced.add(c["name"])
             for f in c.get("fields") or []:
                 ty = f.get("ty") or ""
                 if ty in analyzed:
@@ -8128,6 +8602,7 @@ def plan_layouts(objects, analyses, two_d=None):
         if t in analyzed and t not in skip:
             by_class.setdefault(t, [])
 
+    embedded = _embedded_struct_rows(by_class, analyses)
     spawn = any(a["spawns"] for a in analyses)
     uses_z = any(a["uses_z"] for a in analyses)
     if two_d is None:
@@ -8249,9 +8724,13 @@ def plan_layouts(objects, analyses, two_d=None):
             members.append(("pos_y", "float", 32, "f32"))
             members.append(("pos_z", "float", 32, "f32"))
 
+        delegates = {f["name"] for f in script_fields if f.get("delegate")}
         for fname, ty in field_tys.items():
             if ty == "string":
                 # Instance strings are not packed yet (static strings are).
+                continue
+            if fname in delegates:
+                # an event / Action: no storage; a body using it stubs
                 continue
             if ty in ("StreamWriter", "StreamReader"):
                 # Text streams are FILE* class/static fields, not instance slots.
@@ -8363,10 +8842,12 @@ def plan_layouts(objects, analyses, two_d=None):
             if not f.get("static") and not f.get("const")
             and _list_elem_name(f.get("ty") or "")
         ]
+        # a vector of indices: an array of values (`string[]`) has no slot
         ref_array_fields = [
             f for f in script_fields
             if not f.get("static") and not f.get("const")
             and _array_elem_name(f.get("ty") or "")
+            and _array_elem_name(f.get("ty") or "") not in _VALUE_ELEM_TYPES
         ]
         # Instance `string` fields: a fastring table each, seeded per
         # instance from the scene's value, else the field's initializer.
@@ -8430,6 +8911,7 @@ def plan_layouts(objects, analyses, two_d=None):
         "transform_point_classes": sorted(tp_classes),
         "transform_matrix_classes": sorted(matrix_classes),
         "local_position_classes": sorted(local_pos_classes),
+        "embedded_structs": sorted(embedded),
     }
 
 
@@ -12031,6 +12513,11 @@ def _emit_engine_ui(
     p("    for (i = 0; i < %d; i = i + 1)" % go_n)
     p("        _engine_go_active[i] = _engine_go_active_authored[i];")
     p("}")
+    asset = plan.get("go_asset_active")
+    if asset:
+        p("/* an unplaced prefab's authored m_IsActive (-1: a scene object) */")
+        p("static const signed char _engine_go_asset_active[%d] = { %s };"
+          % (len(asset), ", ".join(map(str, asset))))
     p("static int _engine_go_active_in_hierarchy(int go) {")
     p("    int guard = 0;")
     if multi_scene:
@@ -12644,6 +13131,13 @@ def _emit_engine_instantiate(
                 p("    _engine_go_active_init();")
                 p("    {")
                 p("        int _sgo = _engine_%s_go_of[src];" % idn)
+                asset = plan.get("go_asset_active")
+                if asset:
+                    p("        if (_sgo >= 0 && _sgo < %d && "
+                      "_engine_go_asset_active[_sgo] >= 0)" % len(asset))
+                    p("            _engine_go_active[go] = "
+                      "_engine_go_asset_active[_sgo];")
+                    p("        else")
                 p("        if (_sgo >= 0 && _sgo < %d)" % go_cap_i)
                 p("            _engine_go_active[go] = _engine_go_active[_sgo];")
                 p("        else")
@@ -13182,9 +13676,25 @@ def _emit_class_scalar_statics(p, plan, cl, idn):
                     qual, idn, fname, int(val)))
         elif f.get("ty") in ("StreamWriter", "StreamReader"):
             p("static FILE *%s_%s;" % (idn, fname))
+        elif fname in _static_new_fields([f], plan.get("classes") or {}):
+            p("static int %s_%s = -1; /* made at the first tick */"
+              % (idn, fname))
+        elif _is_ref_static(f, plan, cl.get("name")):
+            p("static int %s_%s = -1;" % (idn, fname))
         # List / Dictionary / SortedList / ref arrays: preamble above.
     if any(_is_scalar_static(f) for f in (cl.get("class_consts") or [])):
         p("")
+
+
+def _is_ref_static(f, plan, cname):
+    """`static Other current;`: a packed object's index, -1 for null. A
+    singleton's own `instance` is `Cls_instance` already, a `= new T()` a
+    made-at-first-tick handle."""
+    classes = plan.get("classes") or {}
+    return (f.get("static") and not f.get("const") and f.get("ty") in classes
+            and not (f["name"] in ("instance", "Instance") and cname in (
+                plan.get("singleton_instance_types") or ()))
+            and not _static_new_fields([f], classes))
 
 
 def _is_scalar_static(f):
@@ -13331,9 +13841,10 @@ def _emit_engine_class_groups(
             site = {
                 "class": cname,
                 "method": m["name"],
-                "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
+                "path": _assets_rel_path(m.get("path") or c.get("path")
+                                         or cl.get("path") or ""),
                 "body_abs": int(m.get("body_abs") or 0),
-                "file_text": c.get("file_text") or "",
+                "file_text": m.get("file_text") or c.get("file_text") or "",
                 "args": m.get("args") or "",
             }
             body = _lower_method_body(
@@ -13418,15 +13929,20 @@ def _emit_engine_class_groups(
                         "valued return in void method emit",
                         "return …;",
                     )
-                else:
-                    hit = _writes_unstored_field(m.get("body") or "", cl, plan)
-                    if hit:
-                        why = (
-                            "field the pack keeps no storage for (a "
-                            "Transform / component reference, or one "
-                            "declared on a base class)",
-                            hit,
-                        )
+            if why is None:
+                hit = _writes_unstored_field(m.get("body") or "", cl, plan)
+                if hit:
+                    why = (
+                        "field the pack keeps no storage for (a "
+                        "Transform / component reference, a delegate, or "
+                        "one declared on a base class)",
+                        hit,
+                    )
+            if why is None:
+                hit = _writes_embedded_struct(body, plan)
+                if hit:
+                    why = ("field of an embedded struct written (its rows are"
+                           " shared by copies, so they stay read-only)", hit)
             if why is not None:
                 _report_stub(plan, site, cl, m, why)
                 if not m.get("static"):
@@ -13445,6 +13961,10 @@ def _emit_engine_class_groups(
                 kt = _engine_types_declared(lines)
                 for line in body.split("\n"):
                     s = line.strip()
+                    # nor one on a local the stub no longer declares
+                    if set(re.findall(r"(?<![\w.>])([a-z]\w*)\b(?!\s*\()",
+                                      cs2cpp._blank(s))) - emitted - {"i"}:
+                        continue
                     if "GameObject_SetActive(" in s and \
                             _unlowered_csharp(s, known_types=kt) is None:
                         p("    " + s.rstrip(";").rstrip() + ";")
@@ -13544,6 +14064,10 @@ def _emit_engine_class_groups(
             _has("OnEnable"), _has("OnDisable"), _has("OnDestroy"))
         p("/* awoken (1), started (2), enabled (4): per instance */")
         p("static unsigned char _%s_life[%d];" % (idn, cap))
+        # ponytail: `enabled` reads "enabled and active" (Unity's stays true
+        # on an inactive GameObject); a per-row enabled bit if that matters
+        p("static int %s_get_enabled(unsigned i) { return (_%s_life[i] & 4)"
+          " != 0; }" % (idn, idn))
         # Unity's messages as a GameObject becomes active (Awake the first
         # time, then OnEnable), inactive (OnDisable), or is destroyed
         # (OnDisable if enabled, then OnDestroy). Called directly: a
@@ -14540,9 +15064,9 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
         p("    return Vector2_make(x, y);")
         p("}")
-        p("/* position = Vector2: z is 0 (Vector2 → Vector3); local = the parent's")
-        p("   world rotation and scale undone on the offset from its position. */")
-        p("static void Transform_set_position2(int go, Vector2 v) {")
+        p("/* world position (v, wz); local = the parent's world rotation and")
+        p("   scale undone on the offset from its position. */")
+        p("static void Transform_set_position2_z(int go, Vector2 v, float wz) {")
         p("    int c = -1;")
         p("    unsigned n = 0u;")
         p("    float px = 0.f, py = 0.f, pz = 0.f;")
@@ -14551,11 +15075,23 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("        && _engine_go_xf(_engine_go_parent[go], &c, &n))")
         p("        _engine_world_pos(c, n, &px, &py, &pz, 0);")
         if _godot_bases(plan):
-            p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, 0.f - pz);")
+            p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, wz - pz);")
         else:
             p("    { float lx = v.x - px, ly = v.y - py;")
             p("      if (c >= 0) _engine_world_to_local(c, n, v.x - px, v.y - py, &lx, &ly);")
-            p("      _engine_set_local_pos_go(go, lx, ly, 0.f - pz); }")
+            p("      _engine_set_local_pos_go(go, lx, ly, wz - pz); }")
+        p("}")
+        p("/* position = Vector2: z is 0 (Vector2 → Vector3) */")
+        p("static void Transform_set_position2(int go, Vector2 v) {")
+        p("    Transform_set_position2_z(go, v, 0.f);")
+        p("}")
+        p("/* position = new Vector3(x, y, position.z) */")
+        p("static void Transform_set_position2_keepz(int go, Vector2 v) {")
+        p("    int c = -1;")
+        p("    unsigned n = 0u;")
+        p("    float x = 0.f, y = 0.f, z = 0.f;")
+        p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
+        p("    Transform_set_position2_z(go, v, z);")
         p("}")
     if not (want_live_rot and plan.get("handle_rot")):
         p("")
@@ -16178,6 +16714,22 @@ def _emit_anim_events(anim_players, p, plan):
     """Animation Events: each player's, fired as its time crosses them --
     (tp, t], or past the end and from the start when a looping clip wraps;
     an event at 0 fires on the first frame. Forward play only."""
+    # A component only a prefab names is analyzed without method bodies:
+    # its events have nothing to call.
+    have = {(c, m["name"]) for c, pairs in (plan.get("_methods_by") or {}).items()
+            for _c, m in pairs}
+    for pl in anim_players:
+        keep = []
+        for e in pl.get("events") or []:
+            if (e["cls"], e["function"]) in have:
+                keep.append(e)
+            else:
+                sys.stderr.write(
+                    "unity_pack: warning: Animation Event %s.%s is not packed "
+                    "(no method body: the component is only on a prefab); "
+                    "it does not fire\n" % (e["cls"], e["function"]))
+        if pl.get("events"):
+            pl["events"] = keep
     evs = [(k, e) for k, pl in enumerate(anim_players) for e in pl.get("events") or []]
     if not evs:
         return
@@ -17031,7 +17583,7 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
             or want_app_open_url or plan.get("player_prefs")
-            or "GodotPrint" in used_apis):
+            or "GodotPrint" in used_apis or not plan.get("strict")):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -17086,7 +17638,7 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
             or want_app_open_url or plan.get("player_prefs")
-            or want_str_plus):
+            or want_str_plus or not plan.get("strict")):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -17103,6 +17655,14 @@ def emit_engine(plan, analyses, used_apis):
         p("#define ENGINE_MKDIR(p) mkdir((p), 0755)")
         p("#endif")
         p("#endif")
+    if not plan.get("strict"):
+        # a statement left unlowered at runtime (`_trap_tmp_writes`)
+        p("static void _engine_unlowered_at(const char *api, const char *path,"
+          " int line) {")
+        p("    fprintf(stderr, \"%s:%d: `%s` is not lowered by crust; \"")
+        p("            \"stopping rather than skipping it\\n\", path, line, api);")
+        p("    exit(70);")
+        p("}")
     p("")
     p("/* Types first, then every global. C forbids `extern T a[N]` while")
     p("   T is incomplete, so the arrays wait until the structs exist;")
@@ -17211,11 +17771,19 @@ def emit_engine(plan, analyses, used_apis):
         _emit_ref_vector_helpers(p, want_iref)
     if want_map_string:
         p("/* SortedList/Dictionary string keys — literals need an address. */")
-        p("static int *_engine_map_at_si(std::map<std::string, int> &m,")
-        p("                             const char *k) {")
-        p("    std::string s = k;")
-        p("    return &m[s];")
-        p("}")
+        vals = {"int"} | {
+            _collection_elem_c_ty(kv[1], plan)
+            for cl in plan["classes"].values()
+            for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or [])
+            for kv in [_dict_kv_names(f.get("ty") or "")]
+            if kv and kv[0].split(".")[-1] == "string"} - {"std::string"}
+        model = _packed_model(plan)
+        for v in sorted(vals):
+            p("static %s *%s(std::map<std::string, %s> &m, const char *k) {"
+              % (v, cs2cpp.map_at_string_helper(model, v), v))
+            p("    std::string s = k;")
+            p("    return &m[s];")
+            p("}")
         p("")
     if want_transform_matrix:
         p("/* Unity Matrix4x4 — column-major; TRS from live Transform. */")
@@ -17230,6 +17798,8 @@ def emit_engine(plan, analyses, used_apis):
         idn = _c_ident(cname)
         p("typedef struct %s %s;" % (idn, idn))
     p("extern float Time_deltaTime;")
+    p("extern float Time_unscaledDeltaTime;")
+    p("extern float Time_timeScale;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
     if "Cursor.visible" in used_apis:
@@ -17948,6 +18518,8 @@ def emit_engine(plan, analyses, used_apis):
     # GetComponentInParent<T>: the GO itself, then each ancestor.
     for tname in sorted(a.split("<", 1)[1][:-1] for a in used_apis
                         if a.startswith("GetComponentInParent<")):
+        if tname in (plan.get("interfaces") or {}):
+            continue
         idn = _c_ident(tname)
         p("static int GameObject_GetComponentInParent_%s(int go) {" % idn)
         p("    int ci, guard;")
@@ -18045,6 +18617,21 @@ def emit_engine(plan, analyses, used_apis):
             p("        break;")
         p("    default: break;")
         p("    }")
+        p("}")
+        p("static float _engine_get_local_scale(int tc, unsigned ti, int y) {")
+        p("    switch (tc) {")
+        for cname in sorted(live):
+            if cname not in class_ids:
+                continue
+            idn = _c_ident(cname)
+            p("    case %d:" % class_ids[cname])
+            p("        if (ti < (unsigned)_%s_inst_count)" % idn)
+            p("            return y ? _%s_scale_y[ti] : _%s_scale_x[ti];"
+              % (idn, idn))
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    return 1.f;")
         p("}")
         p("")
 
@@ -18190,25 +18777,29 @@ def emit_engine(plan, analyses, used_apis):
         cap = max(1, int(cl["n"]) + _mb_pool_extra(plan, cname))
         ctors = [m for _c, m in methods_by.get(cname, [])
                  if m.get("ctor") and m.get("name") == cname]
-        ctor = ctors[0] if len(ctors) == 1 else None
-        plist = _method_c_params(ctor.get("args") or "") if ctor else ""
-        if ctor:
-            p("static void %s_%s(unsigned i%s);" % (
-                idn, cname, (", " + plist) if plist else ""))
-        p("/* new %s(..) — next free pool slot, then the constructor. */"
-          % cname)
-        p("static int Object_New_%s(%s) {" % (idn, plist or "void"))
-        p("    int ex;")
-        p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
-        p("    ex = _%s_inst_count;" % idn)
-        p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
-        if ctor:
-            names = _method_c_arg_names(ctor.get("args") or "")
-            p("    %s_%s((unsigned)ex%s);" % (
-                idn, cname, "".join(", " + n for n in names)))
-        p("    return ex;")
-        p("}")
-        p("")
+        ov = len(ctors) > 1
+        for ctor in ctors or [None]:
+            args = (ctor or {}).get("args") or ""
+            plist = _method_c_params(args)
+            csym = _method_c_symbol(idn, cname, args, ov)
+            if ctor:
+                p("static void %s(unsigned i%s);" % (
+                    csym, (", " + plist) if plist else ""))
+            p("/* new %s(..) — next free pool slot, then the constructor. */"
+              % cname)
+            p("static int %s(%s) {" % (_object_new_symbol(idn, args, ov),
+                                       plist or "void"))
+            p("    int ex;")
+            p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+            p("    ex = _%s_inst_count;" % idn)
+            p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+            if ctor:
+                names = _method_c_arg_names(args)
+                p("    %s((unsigned)ex%s);" % (
+                    csym, "".join(", " + n for n in names)))
+            p("    return ex;")
+            p("}")
+            p("")
 
     # A class reached through another's handle field (`other.hp` ->
     # `Other_AT(..).hp`) is read from that class's group, which may come
@@ -18457,7 +19048,10 @@ def emit_engine(plan, analyses, used_apis):
     p("void engine_tick(void) {")
     p("    /* Unity fixed clock: accumulate frame dt, step at fixedDeltaTime. */")
     p("    static float _engine_fixed_accum = 0.f;")
-    p("    float _dt = Time_deltaTime;")
+    p("    float _dt;")
+    p("    Time_unscaledDeltaTime = Time_deltaTime;")
+    p("    Time_deltaTime = Time_deltaTime * Time_timeScale;")
+    p("    _dt = Time_deltaTime;")
     p("    float _fixed_dt;")
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
@@ -18476,6 +19070,27 @@ def emit_engine(plan, analyses, used_apis):
             p("            for (_k = 0u; _k < %du; _k = _k + 1u) "
               "_%s_seed_strings(_k);"
               % (max(1, int(plan["classes"][cname]["n"])), idn))
+        p("        }")
+        p("    }")
+    made = []
+    for cname, cl in sorted(plan["classes"].items()):
+        for fname, t in sorted(_static_new_fields(
+                cl.get("class_consts"), plan["classes"]).items()):
+            ctors = [m for _c, m in methods_by.get(t, [])
+                     if m.get("ctor") and m.get("name") == t]
+            if ctors and not any(not (m.get("args") or "").strip()
+                                 for m in ctors):
+                continue
+            made.append("%s_%s = %s();" % (
+                _c_ident(cname), fname,
+                _object_new_symbol(_c_ident(t), "", len(ctors) > 1)))
+    if made:
+        p("    {")
+        p("        static int _engine_statics_made = 0;")
+        p("        if (!_engine_statics_made) {")
+        p("            _engine_statics_made = 1;")
+        for s in made:
+            p("            " + s)
         p("        }")
         p("    }")
     seeded = sorted(plan.get("ref_array_seeds") or {})
@@ -18543,6 +19158,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_update(Time_deltaTime); /* after LateUpdate, as Unity's */")
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
+    p("    Time_deltaTime = Time_unscaledDeltaTime; /* the host's dt again */")
     p("}")
     p("")
     p("int engine_class_count(void) { return %d; }" % len(plan["classes"]))
@@ -18631,6 +19247,25 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_collect(out, &n, max);")
     if plan.get("lines"):
         p("    _lr_collect(out, &n, max);")
+    # The main camera's culling mask (Slime Jump hides its World Map layer).
+    # ponytail: authored GOs' layers only -- a spawned object or a runtime
+    # `gameObject.layer =` is always drawn; a live layer table if needed
+    mask = int((plan.get("camera") or {}).get("culling_mask", 0xFFFFFFFF))
+    gl = plan.get("go_layers") or []
+    culled = [0 if mask >> (int(l) & 31) & 1 else 1 for l in gl]
+    if any(culled):
+        p("    {")
+        p("        static const unsigned char culled[%d] = { %s };"
+          % (len(culled), ", ".join(map(str, culled))))
+        p("        int r, w = 0;")
+        p("        for (r = 0; r < n; r = r + 1)")
+        p("            if (out[r].go < 0 || out[r].go >= %d || !culled[out[r].go]) {"
+          % len(culled))
+        p("                out[w] = out[r];")
+        p("                w = w + 1;")
+        p("            }")
+        p("        n = w;")
+        p("    }")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
@@ -18808,7 +19443,7 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
             r"transform\.%s\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
             repl_eq, text, flags=flags)
         text = cs2cpp.code_sub(
-            r"transform\.%s\s*=\s*Vector3\.zero\s*;" % prop,
+            r"transform\.%s\s*=\s*Vector[23]\.zero\s*;" % prop,
             repl_zero, text)
         text = cs2cpp.code_sub(
             r"transform\.%s\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
@@ -18910,7 +19545,7 @@ def _parse_vector3_expr(a):
             return vargs[0], vargs[1], vargs[2]
         return None
     am = re.match(
-        r"Vector3\.(right|left|up|down|forward|back|zero|one)\s*$", a)
+        r"Vector[23]\.(right|left|up|down|forward|back|zero|one)\s*$", a)
     if am:
         name = am.group(1)
         if name == "zero":
@@ -18922,7 +19557,7 @@ def _parse_vector3_expr(a):
                 "%sf" % repr(float(ay)),
                 "%sf" % repr(float(az)))
     am = re.match(
-        r"Vector3\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
+        r"Vector[23]\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
         a, flags=re.S)
     if am:
         ax, ay, az = _VECTOR3_AXIS[am.group(1)]
@@ -19071,8 +19706,17 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
                 pat + r"\s*\.\s*value\b",
                 lambda m, t=ty, e=expr: "%s_get_value(%s)" % (t, e), text)
         text = cs2cpp.code_sub(
-            pat + r"\s*\.\s*parent\b",
+            pat + r"(\s*\.\s*parent)?\s*\.\s*gameObject\s*\.\s*SetActive\s*"
+            r"\(\s*([^)]+)\s*\)",
+            lambda m, e=expr: "GameObject_SetActive(%s, (%s))" % (
+                "Transform_get_parent(%s)" % e if m.group(1) else e,
+                m.group(2)), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*parent(?:\s*\.\s*(?:gameObject|transform)\b)?",
             lambda m, e=expr: "Transform_get_parent(%s)" % e, text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*(?:gameObject|transform)\b",
+            lambda m, e=expr: e, text)
     trs = [(pat, expr) for pat, expr, ty in recvs if ty == "Transform"]
     if trs:
         text = _rewrite_transform_handle_trs(text, trs, site)
@@ -19083,6 +19727,8 @@ _TRANSFORM_HANDLE_PROTOS = {
     "Transform_get_position2": "static Vector2 Transform_get_position2(int go);",
     "Transform_set_position2":
         "static void Transform_set_position2(int go, Vector2 v);",
+    "Transform_set_position2_keepz":
+        "static void Transform_set_position2_keepz(int go, Vector2 v);",
     "Transform_DetachChildren": "static void Transform_DetachChildren(int go);",
     "Transform_get_rotation": "static Quaternion Transform_get_rotation(int go);",
     "Transform_set_rotation":
@@ -19124,10 +19770,35 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
                lambda m: "Transform_get_rotation(%s)" % e(m.group(1)), text)
     text = sub(r"(?<![\w.])Quaternion\s*\.\s*(Slerp|Angle)\s*\(",
                r"Quaternion_\1(", text)
+    # `t.position = new Vector3(x, y, t.position.z);` keeps t's z
+    out, pos = [], 0
+    for m in re.finditer(r"(%s)\s*\.\s*position\s*=(?!=)\s*(\(\s*)?new\s+Vector3\s*\("
+                         % alt, cs2cpp._blank(text)):
+        got = _match_call_args(text, m.end() - 1) if m.start() >= pos else None
+        if not got:
+            continue
+        args, after = got
+        tail = re.match(r"\s*\)\s*;" if m.group(2) else r"\s*;", text[after:])
+        xyz = cs2cpp._split_top_level(args)
+        if not tail or len(xyz) != 3 or not re.fullmatch(
+                r"\(?\s*%s\s*\.\s*position\s*\.\s*z\s*\)?" % re.escape(m.group(1)),
+                xyz[2].strip()):
+            continue
+        out += [text[pos:m.start()], "Transform_set_position2_keepz(%s, Vector2_make(%s, %s));"
+                % (e(m.group(1)), xyz[0].strip(), xyz[1].strip())]
+        pos = after + tail.end()
+    text = "".join(out) + text[pos:]
     text = sub(r"(%s)\s*\.\s*position\s*=(?!=)\s*([^;]+);" % alt,
                lambda m: "Transform_set_position2(%s, %s);" % (
                    e(m.group(1)), m.group(2).strip()), text)
     text = sub(r"\(\s*Vector2\s*\)\s*(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
+               lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
+    # a read of one axis, or of the whole -- as the Vector2 C has (z is 0)
+    text = sub(r"(%s)\s*\.\s*position\s*\.\s*([xyz])\b(?!\s*[-+*/]?=(?!=))"
+               % alt, lambda m: "0.f" if m.group(2) == "z" else
+               "Vector2_%s(Transform_get_position2(%s))" % (
+                   m.group(2), e(m.group(1))), text)
+    text = sub(r"(%s)\s*\.\s*position\b(?!\s*(?:\.|[-+*/]?=(?!=)))" % alt,
                lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
     # Implicit Vector3 → Vector2 inside calls whose result is a Vector2.
     # ponytail: Vector3.Distance as the 2D distance; a packed position's z is 0
@@ -19804,7 +20475,7 @@ def _rewrite_transform_look_at(text, cl):
                     tx, ty, tz = vargs[0], vargs[1], vargs[2]
             else:
                 am = re.match(
-                    r"Vector3\.(zero|one|right|left|up|down|forward|back)\s*$",
+                    r"Vector[23]\.(zero|one|right|left|up|down|forward|back)\s*$",
                     a0)
                 if am:
                     name = am.group(1)
@@ -20369,19 +21040,24 @@ _VEC_PB = [0]
 
 
 def _vec_helper_suffix(cty):
-    return {"std::string": "str", "fastring": "fstr",
-            "float": "float"}.get(cty, "int")
+    return {"std::string": "str", "fastring": "fstr"}.get(
+        cty, re.sub(r"\W+", "_", cty.strip()))
 
 
 def _vec_helpers_c(ctys):
     """The search helpers for each vector element type used: index of an
     element (`==`, a string by its text) and remove-first-match."""
-    out = []
+    out, seen = [], set()
     for cty in sorted(ctys):
         suf = _vec_helper_suffix(cty)
+        if suf in seen:
+            continue
+        seen.add(suf)
         texty = cty in ("std::string", "fastring")
         arg = "const char *" if texty else cty
-        eq = "strcmp(v[k].c_str(), x) == 0" if texty else "v[k] == x"
+        # ponytail: a struct element compares bytewise (-0.f != 0.f, NaN == NaN)
+        eq = "strcmp(v[k].c_str(), x) == 0" if texty else "v[k] == x" \
+            if cty in ("int", "float") else "memcmp(&v[k], &x, sizeof x) == 0"
         out.append(
             "static int _cs_vec_index_%s(std::vector<%s> &v, %s x) {\n"
             "    int k;\n"
@@ -20992,6 +21668,8 @@ _UNITY_API_CORE = [
     _B("Time.deltaTime", "Time_deltaTime", "value"),
     _B("Time.fixedDeltaTime", "Time_fixedDeltaTime", "value"),
     _B("Time.time", "Time_time", "value"),
+    _B("Time.timeScale", "Time_timeScale", "value"),
+    _B("Time.unscaledDeltaTime", "Time_unscaledDeltaTime", "value"),
     _B("Cursor.visible", "Cursor_visible", "value", _UE),
     _B("Physics2D.queriesStartInColliders",
        "engine_box2d_queries_start_in_colliders", "value", _UE),
@@ -22092,6 +22770,23 @@ def _handle_method_calls(text, plan, holds):
             pat, lambda m, o=_c_ident(other): "%s_%s(%s%s" % (
                 o, m.group(2), m.group(1), ")" if m.group(3) else ", "),
             text)
+        # `other.P` an instance property: its get_P / set_P methods
+        o = _c_ident(other)
+        for prop in sorted({n[4:] for n in names if n.startswith("get_")}
+                           & {n[4:] for n in names if n.startswith("set_")},
+                           key=len, reverse=True):
+            head = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*%s\b" % (
+                re.escape(recv), re.escape(prop))
+            text = cs2cpp.code_sub(
+                head + r"\s*([-+*/]?)=(?!=)\s*([^;]*);",
+                lambda m, r=recv, p=prop: (
+                    "%s_set_%s(%s, %s);" % (o, p, r, m.group(2))
+                    if not m.group(1) else
+                    "%s_set_%s(%s, %s_get_%s(%s) %s (%s));" % (
+                        o, p, r, o, p, r, m.group(1), m.group(2))), text)
+            text = cs2cpp.code_sub(
+                head + r"(?!\s*(?:\(|\+\+|--))",
+                "%s_get_%s(%s)" % (o, prop, recv), text)
     return text
 
 
@@ -22106,6 +22801,10 @@ def _reference_holds(text, cl, plan, site):
             "idx:") else None
         if other in classes:
             holds[name] = other
+    for oname, ocl in classes.items():
+        for f in ocl.get("class_consts") or []:
+            if f.get("static") and f.get("ty") in classes:
+                holds["%s_%s" % (_c_ident(oname), f["name"])] = f["ty"]
     for prm in cs2cpp.parse_params((site or {}).get("args") or ""):
         if prm.type in classes:
             holds[prm.name] = prm.type
@@ -22114,6 +22813,97 @@ def _reference_holds(text, cl, plan, site):
         if m.group(1) in classes:
             holds[m.group(2)] = m.group(1)
     return holds
+
+
+def _getter_transform_positions(text, plan, site):
+    """`Other_get_trs(Other_Instance()).position[.x]` -- another object's
+    Transform field (a GO index), reached through any expression -- read as
+    its world position, the Vector2 C has (z is 0)."""
+    getters = {"%s_get_%s" % (_c_ident(c), f["name"])
+               for c, ocl in (plan.get("classes") or {}).items()
+               for f in ocl.get("fields") or [] if f.get("ty") == "Transform"}
+    if not getters:
+        return text
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])(%s)\s*\(" % "|".join(
+            re.escape(g) for g in sorted(getters)), text):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        _args, after = got
+        mm = re.match(r"\s*\.\s*position\b(?:\s*\.\s*([xyz])\b)?"
+                      r"(?!\s*(?:\.|[-+*/]?=(?!=)))", text[after:])
+        if not mm:
+            continue
+        expr = "Transform_get_position2(%s)" % text[m.start():after]
+        if mm.group(1):
+            expr = ("0.f" if mm.group(1) == "z"
+                    else "Vector2_%s(%s)" % (mm.group(1), expr))
+        out += [text[pos:m.start()], expr]
+        pos = after + mm.end()
+    if not out:
+        return text
+    if site is not None:
+        site.setdefault("protos", set()).add(
+            _TRANSFORM_HANDLE_PROTOS["Transform_get_position2"])
+    return "".join(out) + text[pos:]
+
+
+def _lower_own_properties(text, cl, plan, site):
+    """An instance property of this class used by name: a read calls its
+    getter, `Name = x;` its setter -- the `get_Name` / `set_Name` methods
+    `properties_as_methods` made. A getter whose type has no C value is
+    left (the method stubs)."""
+    meths = {m["name"]: m for _c, m in
+             (plan.get("_methods_by") or {}).get(cl["name"], [])
+             if not m.get("static")}
+    me = (site or {}).get("method")
+    for name, m in sorted(meths.items()):
+        if not name.startswith("set_") or me == name:
+            continue
+        prop = name[4:]
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*=(?!=)\s*([^;]+);"
+            % re.escape(prop), r"%s(\1);" % name, text)
+    for name, m in sorted(meths.items()):
+        if not name.startswith("get_") or me == name:
+            continue
+        rty = _ret_c_ty(m.get("ret"), plan)
+        if not rty or rty == "void":
+            continue
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\b(?!\s*(?:\(|[-+*/]?=(?!=)|\+\+|--))"
+            % re.escape(name[4:]), "%s()" % name, text)
+    return text
+
+
+def _lower_reference_game_objects(text, cl, plan, site):
+    """`ref.gameObject` through a reference to another packed object is its
+    GO index: `ref.gameObject.SetActive(x)`, `Destroy(ref.gameObject)`."""
+    if not plan.get("go_names"):
+        return text
+    holds = _reference_holds(text, cl, plan, site)
+    # a static of a packed class's type, already `Cls_f` (`GameCamera_instance`)
+    classes = plan.get("classes") or {}
+    for oname, ocl in classes.items():
+        for f in ocl.get("class_consts") or []:
+            if f.get("static") and f.get("ty") in classes:
+                for r in ("%s_%s" % (_c_ident(oname), f["name"]),
+                          "%s.%s" % (oname, f["name"]))[:None] + (
+                              (f["name"],) if oname == cl["name"] else ()):
+                    holds.setdefault(r, f["ty"])
+    for recv, other in sorted(holds.items()):
+        go = "_engine_go_of_%s(%s)" % (_c_ident(other), recv)
+        q = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*gameObject" % re.escape(recv)
+        text = cs2cpp.code_sub(q + r"\s*\.\s*SetActive\s*\(",
+                               "GameObject_SetActive(%s, " % go, text)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:Object\s*\.\s*)?Destroy\s*\(\s*" + q[len(
+                r"(?<![\w.])"):] + r"\s*\)", "Object_Destroy(%s)" % go, text)
+        text = cs2cpp.code_sub(q + r"\b(?!\s*\.)", go, text)
+    return text
 
 
 def _lower_godot_tree(text, cl, plan, site):
@@ -22173,7 +22963,12 @@ def _handle_field_access(text, plan, holds):
         ocl = classes.get(other)
         if not ocl:
             continue
-        names = [m[0] for m in ocl.get("members") or ()]
+        # an `idx:` member of no packed class (a collection type the planner
+        # did not parse) has no faithful accessor: left, the method stubs
+        names = [m[0] for m in ocl.get("members") or ()
+                 if not str(m[3]).startswith("idx:")
+                 or str(m[3])[4:] in classes or str(m[3])[4:] in (
+                     "LineRenderer", "AnimationCurve")]
         if not names:
             continue
         o = _c_ident(other)
@@ -22274,6 +23069,10 @@ def _local_handle_fields(text, cl, plan, site):
                          cs2cpp._blank(text)):
         if m.group(1) in classes:
             holds[m.group(2)] = m.group(1)
+    # a `static T f = new T();` handle: bare in its class, `Cls.f` elsewhere
+    for oname, ocl in classes.items():
+        for f, t in _static_new_fields(ocl.get("class_consts"), classes).items():
+            holds[f if oname == cl.get("name") else "%s.%s" % (oname, f)] = t
     text = _handle_method_calls(text, plan, holds)
     text = _handle_field_access(text, plan, holds)
     text = _handle_positions(text, plan, holds)
@@ -23565,10 +24364,31 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = _own_string_params(body, site)
+    text = _trap_tmp_writes(_drop_shader_params(body, plan, site), plan,
+                            site)
+    text = _own_string_params(text, site)
+    text = _drop_iface_tick_loops(text, plan, site)
     # before `gameObject` is lowered: the terrain calls take it as written
     text = _lower_terrain_boxes(text, cl, plan)
     text = _lower_translate(text)
+    # a device is a pointer, not a packed index: null is 0, not -1
+    text = cs2cpp.code_sub(
+        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\s*([!=])=\s*null\b",
+        r"(Keyboard_current() \1= 0)", text)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])default\s*\(\s*(?:UnityEngine\s*\.\s*)?(Vector[23])\s*\)",
+        r"\1.zero", text)
+    if not cl.get("vec3_fields"):
+        # C has no Vector3; the sites that keep z (`_parse_vector3_expr`)
+        # read the axis name off either spelling.
+        # ponytail: `Vector3.one` in a Vector2 context loses z = 1
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])Vector3\s*\.\s*(zero|one|up|down|left|right)\b"
+            r"(?!\s*\()", r"Vector2.\1", text)
+    # A cast between Vector2 / Vector3 is a no-op: C's only vector value is
+    # Vector2 (the cast binds tighter than `*`).
+    # ponytail: `(Vector2) v3` written to a z-keeping sink keeps v3's z
+    text = cs2cpp.code_sub(r"\(\s*Vector[23]\s*\)\s*(?=[\w(])", "", text)
     if plan.get("two_d") and _class_has_position(cl):
         text = _lower_position_values(text)
     if plan.get("two_d"):
@@ -23579,6 +24399,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # own `transform.position` is lowered (which would take its receiver).
     text = _handle_positions(text, plan, _reference_holds(text, cl, plan,
                                                           site))
+    text = _lower_reference_game_objects(text, cl, plan, site)
+    text = _lower_own_properties(text, cl, plan, site)
     if plan.get("godot_spawn") and "GodotTree." in text:
         text = _lower_godot_tree(text, cl, plan, site)
     text = _lower_mouse_scroll(text)
@@ -23883,6 +24705,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
         "Keyboard_current()", text)
+    # a null compare lowered first (an inlined static getter's), as above
+    text = cs2cpp.code_sub(r"Keyboard_current\(\)\s*([!=])=\s*-1\b",
+                           r"Keyboard_current() \1= 0", text)
     # Debug.Log / print → Debug_Log. Drop optional context object arg.
     text = cs2cpp.lower_bindings(text, _UNITY_API_LOG)
     text = _strip_debug_log_context_arg(text)
@@ -23998,9 +24823,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         f["name"]: f for f in (cl.get("class_consts") or [])
     }
     for vf in cl.get("vec2_fields") or []:
+        text = cs2cpp.code_sub(
+            r"(?<![_\w.])(%s)\s*([-+*/])=\s*(.+?)\s*;" % re.escape(vf),
+            r"\1 = \1 \2 (\3);", text)
         # Whole-field write before .x/.y / bare-read rewrites.
         text = cs2cpp.code_sub(
-            r"(?<![_\w])%s\s*=\s*(.+?)\s*;" % re.escape(vf),
+            r"(?<![_\w])%s\s*=(?!=)\s*(.+?)\s*;" % re.escape(vf),
             lambda m, name=vf: (
                 "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
                 % (idn, name, m.group(1), idn, name, m.group(1))),
@@ -24197,12 +25025,17 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if str(kind).startswith("idx:")
         and _c_ident(kind.split(":", 1)[1]) in handle_fields.values()
         and n in handle_fields}
+    for oname, ocl in plan["classes"].items():
+        for f in ocl.get("class_consts") or []:
+            if _is_ref_static(f, plan, oname):
+                field_holds["%s_%s" % (_c_ident(oname), f["name"])] = f["ty"]
     text = _handle_method_calls(text, plan, field_holds)
     text = _handle_field_access(text, plan, field_holds)
     text = _handle_positions(text, plan, field_holds)
     text = cs2cpp.lower_packed_fields(
         text, idn, members, class_const_names, handle_fields,
         _packed_model(plan))
+    text = _getter_transform_positions(text, plan, site)
     # Same-class instance calls: Do() / Do(a) → Class_Do(i) / Class_Do(i, a).
     # Unity messages and private helpers share the packed instance index.
     this_methods = set()
@@ -24270,6 +25103,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(r"std::vector<\s*std::string\s*>",
                            "std::vector<fastring>", text)
     text = _lower_list_searches(text, cl, plan)
+    scan = cs2cpp._blank(text)
+    vecs = set(re.findall(r"std::vector<[^;{}]*?>\s*&?\s*(\w+)\s*[;=]", scan))
+    heads = re.findall(r"(?<![\w])foreach\s*\([^;{}]*?\bin\s+(\w+)\s*\)", scan)
+    if heads and len(heads) == scan.count("foreach") and set(heads) <= vecs:
+        text = cs2cpp._lower_foreach(text)
     _sl = set(re.findall(r"std::vector<fastring>\s*&?\s*(\w+)\s*[;=]",
                          cs2cpp._blank(text)))
     text = _own_string_locals(text, string_idents, int_idents,
@@ -24286,7 +25124,124 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             if v == "s"))
     if "_cs_str_Equals(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
-    return text
+    return _late_call_members(text, plan)
+
+
+_TMP_TYPES = {"TMP_Text", "TextMeshProUGUI", "TextMeshPro"}
+
+
+def _trap_tmp_writes(body, plan, site):
+    """`f.text = ..;` / `f.color = ..;` on a TMP field: TMP text is baked at
+    pack time, so the statement stops the player with its C# line when it
+    runs, instead of emptying the whole method around it. A CS8000 warning
+    names it at pack time; under strict it is left for the stub to refuse."""
+    if plan.get("strict") or not site:
+        return body
+    names = {f["name"] for c in (plan.get("classes") or {}).values()
+             for f in c.get("fields") or []
+             if (f.get("ty") or "").strip().split(".")[-1] in _TMP_TYPES}
+    if not names:
+        return body
+    pat = re.compile(r"(?<![\w.])(?:[\w.]+\.)?(?:%s)\s*\.\s*(text|color)"
+                     r"\s*[+]?=(?!=)[^;{}]*;" % "|".join(
+                         re.escape(n) for n in sorted(names)))
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+
+    def trap(m):
+        line = ft.count("\n", 0, at + m.start()) + 1 if ft else 0
+        api = "TMP_Text.%s" % m.group(1)
+        if ft:
+            sys.stderr.write(_cs_diag(
+                path, ft, at + m.start(), "CS8000",
+                "`%s` writes are not lowered (text is baked at pack time);"
+                " the statement stops the player if it runs" % api,
+                kind="warning") + "\n")
+        return "_engine_unlowered_at(%s, %s, %d);" % (
+            _c_string(api), _c_string(path), line)
+    return pat.sub(trap, body)
+
+
+def _drop_shader_params(body, plan, site):
+    """`Material m = new Material(..); m.SetVector(..); r.sharedMaterial =
+    m;` sets a custom shader's parameters, and the pack draws sprites
+    without their shader: the statements go (blanked, so offsets keep their
+    C# lines), each with a CS8000 warning. Kept -- to stub -- under strict,
+    or when `m` is used for anything else."""
+    if plan.get("strict") or not site or "Material" not in body:
+        return body
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    for d in re.finditer(r"(?<![\w.])Material\s+(\w+)\s*=\s*new\s+Material"
+                         r"\s*\([^;]*\);", body):
+        v = re.escape(d.group(1))
+        spans = [d.span()] + [m.span() for m in re.finditer(
+            r"(?<![\w.])%s\s*\.\s*Set(?:Vector|Int|Float|Color)\s*\([^;]*\);"
+            r"|(?<![\w.])[\w.]+\s*\.\s*(?:sharedMaterial|material)\s*=\s*"
+            r"%s\s*;" % (v, v), body)]
+        rest, last = [], 0
+        for s, e in sorted(spans):
+            rest.append(body[last:s])
+            last = e
+        if re.search(r"(?<![\w.])%s\b" % v, "".join(rest) + body[last:]):
+            continue
+        for s, e in spans:
+            if ft:
+                sys.stderr.write(_cs_diag(
+                    path, ft, at + s, "CS8000",
+                    "shader parameters are not drawn by the pack; the"
+                    " statement is dropped", kind="warning") + "\n")
+            body = body[:s] + re.sub(r"[^\n]", " ", body[s:e]) + body[e:]
+    return body
+
+
+def _call_suffix_sub(text, funcs, suffix, build):
+    """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match)."""
+    if not funcs:
+        return text
+    pat = re.compile(r"(?<![\w.])(%s)\s*\(" % "|".join(
+        re.escape(f) for f in sorted(funcs, key=len, reverse=True)))
+    out, pos = [], 0
+    for m in pat.finditer(text):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        after = got[1]
+        mm = re.match(suffix, text[after:])
+        if not mm:
+            continue
+        out += [text[pos:m.start()], build(text[m.start():after], mm)]
+        pos = after + mm.end()
+    return "".join(out) + text[pos:] if out else text
+
+
+def _late_call_members(text, plan):
+    """Members of a lowered call's result the earlier passes could not see:
+    `f(..).x` of a project method returning a Vector2 (`LeftStickInput.x`)
+    is `Vector2_x(f(..))`; `.gameObject` of a component field the pack
+    stores as a GO index (`timerText.gameObject.activeSelf`) is that
+    index."""
+    text = _call_suffix_sub(
+        text, _vector2_methods(plan),
+        r"\s*\.\s*([xy])\b(?!\s*(?:\(|[-+*/]?=(?!=)))",
+        lambda call, mm: "Vector2_%s(%s)" % (mm.group(1), call))
+    gos = {"%s_get_%s" % (_c_ident(cn), f["name"])
+           for cn, c in (plan.get("classes") or {}).items()
+           for f in c.get("fields") or []
+           if f.get("ty") in _GO_HANDLE_FIELD_TYPES
+           and not f.get("static") and not f.get("const")}
+    return _call_suffix_sub(
+        text, gos,
+        r"\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
+        r"(?!\s*\.)",
+        lambda call, mm: (
+            "GameObject_activeSelf(%s)" % call if mm.group(1) == "activeSelf"
+            else "GameObject_SetActive(%s, " % call if mm.group(1)
+            else call))
 
 
 def _vector2_methods(plan):
@@ -24364,6 +25319,8 @@ def emit_data(plan, used_apis=None):
         p("")
 
     p("float Time_deltaTime = 0.0166667f;")
+    p("float Time_unscaledDeltaTime = 0.0166667f;")
+    p("float Time_timeScale = 1.f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
     if "Cursor.visible" in used_apis:
@@ -25281,6 +26238,41 @@ def _scene_prefab_instances(scene_text):
     return list(insts.values())
 
 
+def _embedded_values(block):
+    """``{field: {"fields", "str_fields", "object_refs", "vec2_fields",
+    "struct_values"}}`` of the embedded [Serializable] values in a
+    component's YAML *block* -- a field written as a nested mapping
+    (``entry:\\n    layer: 1``), read like the component's own fields."""
+    out = {}
+    for fm in re.finditer(r"(?m)^  (\w+):[ \t]*\n((?:    [^\n]*(?:\n|$))+)",
+                          block):
+        if fm.group(1).startswith("m_"):
+            continue
+        sub = re.sub(r"(?m)^  ", "", fm.group(2))
+        v = {"fields": {}, "str_fields": {}, "object_refs": {},
+             "vec2_fields": {}}
+        for m in re.finditer(r"(?m)^  (\w+):[ \t]*(.*?)[ \t]*$", sub):
+            key, raw = m.group(1), m.group(2)
+            if re.fullmatch(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", raw):
+                v["fields"][key] = (float(raw) if re.search(r"[.eE]", raw)
+                                    else int(raw))
+            ref = re.fullmatch(r"\{fileID:\s*(-?\d+)\}", raw)
+            if ref and ref.group(1) != "0":
+                v["object_refs"][key] = ref.group(1)
+            vec = re.fullmatch(r"\{x:\s*([^,}]+),\s*y:\s*([^,}]+)\}", raw)
+            if vec:
+                v["vec2_fields"][key] = (float(vec.group(1)),
+                                         float(vec.group(2)))
+            st = _yaml_scalar_text(raw)
+            if st is not None:
+                v["str_fields"][key] = st
+        inner = _embedded_values(sub)
+        if inner:
+            v["struct_values"] = inner
+        out[fm.group(1)] = v
+    return out
+
+
 def _set_yaml_property(doc, path, value):
     """*doc* with the serialized property *path* (``name`` or ``a.b`` into
     a flow mapping) set to *value*; unchanged for paths this does not model
@@ -25295,7 +26287,14 @@ def _set_yaml_property(doc, path, value):
         body = doc.rstrip("\n")
         return body + "\n  %s: %s" % (top, value) + doc[len(body):]
     if not line.group(1).strip():
-        return doc
+        # `a.b` into an embedded value's block (`a:\n    b: v`)
+        blk = re.match(r"(?:\n    [^\n]*)+", doc[line.end():])
+        sl = sub and blk and re.search(r"(?m)^    %s:[ \t]*(.*)$"
+                                       % re.escape(sub), blk.group(0))
+        if not sl:
+            return doc
+        at = line.end()
+        return doc[:at + sl.start(1)] + value + doc[at + sl.end(1):]
     if not sub:
         return doc[:line.start(1)] + value + doc[line.end(1):]
     flow = line.group(1)
@@ -25356,7 +26355,7 @@ def _expand_unstripped_prefab_instances(scene_text, assets):
     """*scene_text* with the placed objects of every PrefabInstance. A
     stripped stub (kept when scene objects reference a prefab object, e.g.
     children under its Transform) is replaced by the placed doc, which keeps
-    the stub's fileID. Instances with a stripped RectTransform are left to
+    the stub's fileID. Instances with a stripped root RectTransform are left to
     `_append_prefab_instance_ui_objects` (onClick array overrides, components
     added on the stripped GameObject)."""
     extra, drop = [], set()
@@ -25366,8 +26365,11 @@ def _expand_unstripped_prefab_instances(scene_text, assets):
                 or not os.path.isfile(ppath):
             continue
         raw = _read(ppath)
-        if any(cls == "224" and fid in inst["stripped"]
-               for cls, fid, _s, _a, _b in _yaml_docs(raw)):
+        # a UI prefab (root RectTransform stub); a stub on a child Canvas
+        # (Game Camera's) still places the rest of the prefab here
+        if any(cls == "224" and fid in inst["stripped"] and re.search(
+                r"(?m)^  m_Father:\s*\{fileID:\s*0\}", raw[a:b])
+               for cls, fid, _s, a, b in _yaml_docs(raw)):
             continue
         body = _prefab_instance_text(raw, inst)
         first = _YAML_DOC_HEAD_RE.search(body)
@@ -25437,6 +26439,9 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets,
                 if o.get("class") in type_names:
                     if si is not None:
                         o["scene"] = si
+                    else:
+                        # an asset Instantiate copies, not a live object
+                        o["prefab_asset"] = True
                     out.append(o)
     return out
 
@@ -25495,6 +26500,7 @@ def _load_scenes_lights_cameras(root, assets):
             "(looked for .unity / blender_pack.json, or a Godot project.godot / .tscn)" % root)
     _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
         len(objects), len(lights), len(cameras), len(hierarchy)))
+    _mark_hierarchy_live(objects, hierarchy)
     _apply_camera_script_view_to_cameras(cameras, objects)
     sw, sh = _ui_layout_screen(root, objects)
     _apply_layout_groups(objects, sw, sh)
@@ -25623,7 +26629,14 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             sp = typename_map[t]
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
                 continue
+            a = analyze_script(sp)
+            if all(not c.get("bases") for c in a.get("classes") or []):
+                # a plain [Serializable] value (no component): its methods
+                # are what the objects embedding it call
+                analyses.append(a)
+                continue
             a = analyze_script(sp, shallow=True)
+            a["shallow"] = True
             for c in a.get("classes") or []:
                 c["methods"] = []
             a["apis"] = set()
@@ -25631,7 +26644,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             a["getcomponentsinchildren_types"] = set()
             a["addcomponent_types"] = set()
             analyses.append(a)
+    analyses.extend(_analyze_static_refs(analyses, typename_map))
 
+    analyses.extend(_inherit_base_members(analyses, typename_map))
     analyses.extend(_analyze_base_interfaces(root, guids, analyses))
 
     # Scene stripped MB fileIDs (Button onClick targets) → pack instance mb_ids.
@@ -26160,7 +27175,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 4
+_SCENE_CACHE_VERSION = 6
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -26707,6 +27722,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     for a in analyses:
         gc_types |= set(a.get("getcomponent_types") or [])
     _validate_getcomponent_types(gc_types, plan, analyses)
+    gc_types -= set(_collect_interfaces(analyses))
     plan["getcomponent_types"] = sorted(gc_types)
     gcic_types = set()
     for a in analyses:
@@ -26972,6 +27988,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         _gpu.build_lights(plan, _load_sorting_layers(root))
     engine = emit_engine(plan, analyses, used_apis)
     _used_helpers = plan.pop("_cs_str_used", None) or set()
+    _used_helpers = {h for h in _used_helpers if not re.search(
+        r"^static [\w\s*]+\b%s\(" % re.escape(h), engine, re.M)}
     helpers_c = _string_helpers_c(_used_helpers)
     if (runtime.needs_math(runtime.closure(
             {h for h in _used_helpers if runtime.is_runtime_helper(h)}))
