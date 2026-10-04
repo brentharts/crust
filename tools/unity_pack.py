@@ -7935,7 +7935,11 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
             (r"\w+\.gameObject\b",
              "Unity component handle still using `recv.gameObject`."),
             (r"\w+\.activeSelf\b",
-             "Unity `activeSelf` on a receiver nothing lowered.")):
+             "Unity `activeSelf` on a receiver nothing lowered."),
+            # ponytail: cpprust copies a string through a pointer shallowly
+            (r"_engine_map_at_si_std_string\s*\(",
+             "A string-valued Dictionary element (`d[key]`) is not lowered "
+             "yet.")):
         hit = unity(pattern, what)
         if hit:
             return hit
@@ -17211,11 +17215,19 @@ def emit_engine(plan, analyses, used_apis):
         _emit_ref_vector_helpers(p, want_iref)
     if want_map_string:
         p("/* SortedList/Dictionary string keys — literals need an address. */")
-        p("static int *_engine_map_at_si(std::map<std::string, int> &m,")
-        p("                             const char *k) {")
-        p("    std::string s = k;")
-        p("    return &m[s];")
-        p("}")
+        vals = {"int"} | {
+            _collection_elem_c_ty(kv[1], plan)
+            for cl in plan["classes"].values()
+            for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or [])
+            for kv in [_dict_kv_names(f.get("ty") or "")]
+            if kv and kv[0].split(".")[-1] == "string"} - {"std::string"}
+        model = _packed_model(plan)
+        for v in sorted(vals):
+            p("static %s *%s(std::map<std::string, %s> &m, const char *k) {"
+              % (v, cs2cpp.map_at_string_helper(model, v), v))
+            p("    std::string s = k;")
+            p("    return &m[s];")
+            p("}")
         p("")
     if want_transform_matrix:
         p("/* Unity Matrix4x4 — column-major; TRS from live Transform. */")

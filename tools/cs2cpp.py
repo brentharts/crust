@@ -1426,16 +1426,26 @@ def lower_map_members_named(text, names, key_types):
     return text
 
 
-def lower_map_string_index(text, target_pattern, model):
+def map_at_string_helper(model, value):
+    """The model's string-key map helper for a map of *value* (a C type):
+    one per value type, as the C++ subset has no overloading."""
+    if value in (None, "int"):
+        return model.map_at_string
+    return "%s_%s" % (model.map_at_string, re.sub(r"\W+", "_", value))
+
+
+def lower_map_string_index(text, target_pattern, model, value=None):
     """`map[key]` for a string-keyed map, through the model's helper.
 
     `target_pattern` matches the map expression (a name, or unity_pack's
-    `Class_field[recv]`); the key is whatever the brackets hold."""
+    `Class_field[recv]`); the key is whatever the brackets hold; `value`
+    is the map's value C type."""
     if model.map_at_string is None:
         return text
+    helper = map_at_string_helper(model, value)
     return _sub_orig(
         r"(%s)\s*\[(.*?)\]" % target_pattern,
-        lambda g: "(*%s(%s, %s))" % (model.map_at_string, g(1), g(2)), text)
+        lambda g: "(*%s(%s, %s))" % (helper, g(1), g(2)), text)
 
 
 def _assignment_end(text, i):
@@ -1612,15 +1622,17 @@ def lower_packed_collections(text, owner, others, model, receiver="i"):
                 r"(?<![_\w])(\w+)\.%s\b" % re.escape(fname), other_map, text)
     map_names |= set(re.findall(r"\bstd::map<(?:[^<>]|<[^>]*>)+>\s+(\w+)\b",
                                 _blank(text)))
-    key_types = {}
-    for fname, k, _v in owner.static_maps + owner.inst_maps:
-        key_types[fname] = elem(k)
+    key_types, val_types = {}, {}
+    for fname, k, v in owner.static_maps + owner.inst_maps:
+        key_types[fname], val_types[fname] = elem(k), elem(v)
     for o in [owner] + others:
-        for fname, k, _v in o.inst_maps:
+        for fname, k, v in o.inst_maps:
             key_types["%s_%s" % (o.ident, fname)] = elem(k)
-    for m in re.finditer(r"\bstd::map<\s*([^,>]+)\s*,[^>]+>\s+(\w+)\b",
+            val_types["%s_%s" % (o.ident, fname)] = elem(v)
+    for m in re.finditer(r"\bstd::map<\s*([^,>]+)\s*,\s*([^>]+?)\s*>\s+(\w+)\b",
                          _blank(text)):
-        key_types[m.group(2)] = m.group(1).strip()
+        key_types[m.group(3)] = m.group(1).strip()
+        val_types[m.group(3)] = m.group(2).strip()
     aliases = []
     for fname, k, v in sorted(owner.inst_maps):
         if _code_mentions(text, fname):
@@ -1631,16 +1643,18 @@ def lower_packed_collections(text, owner, others, model, receiver="i"):
         text = "\n".join(aliases) + "\n" + text
     text = lower_map_members_named(text, map_names, key_types)
     for o in [owner] + others:
-        for fname, k, _v in o.inst_maps:
+        for fname, k, v in o.inst_maps:
             if elem(k) == "std::string":
                 text = lower_map_string_index(
                     text, r"%s_%s\s*\[[^\]]+\]" % (re.escape(o.ident),
-                                                   re.escape(fname)), model)
+                                                   re.escape(fname)), model,
+                    elem(v))
     for name in sorted([n for n in map_names
                         if key_types.get(n) == "std::string"],
                        key=len, reverse=True):
         text = lower_map_string_index(
-            text, r"(?<![.\w])%s" % re.escape(name), model)
+            text, r"(?<![.\w])%s" % re.escape(name), model,
+            val_types.get(name))
     # ---- lists
     list_names = set(f for f, _e in owner.static_lists + owner.inst_lists)
     text, declared = lower_list_types(text, model)

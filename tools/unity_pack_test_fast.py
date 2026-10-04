@@ -46,8 +46,9 @@ def setUpModule():
     _saved_validate.append(saved)
 
     def validate(text, *a, **k):
-        # a C# string is a coost fastring, C++ only cpprust lowers to C
-        if "fastring" in text:
+        # a C# string is a coost fastring, a List a std::vector: C++ only
+        # cpprust lowers to C
+        if "fastring" in text or "std::vector" in text:
             return saved(text, *a, **k)
         return None
     unity_pack.validate_emitted_c = validate
