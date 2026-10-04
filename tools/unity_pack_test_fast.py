@@ -492,11 +492,15 @@ public class Drawer : MonoBehaviour {
         fixed = dict(g, mode=1)                # the first key at or after t
         self.assertEqual(ul.gradient_eval(fixed, 0.25), (1.0, 0.0, 0.0, 0.0))
 
-    def test_local_space_on_a_rotated_object_is_refused(self):
-        with self.assertRaises(unity_pack.PackError) as cm:
-            unity_pack.pack(self._project(self.SCRIPT, world=0, rot_z=0.3),
-                            tempfile.mkdtemp(prefix="upack-lr-out-"), force=True)
-        self.assertIn("local space", cm.exception.message)
+    @needs_cc
+    def test_local_space_on_a_rotated_object_turns_with_it(self):
+        import math
+        lines = self._run_lines(self._project(
+            self.SCRIPT, world=0, rot_z=math.sqrt(0.5)))
+        q = [list(map(float, l.split()[1:])) for l in lines if l.startswith("Q ")][0]
+        # 90 degrees: the first segment (0,0)-(2,0) is drawn (0,0)-(0,2)
+        for got, want in zip(q[:6], (0, 1, 1, q[3], 0, 1)):
+            self.assertAlmostEqual(got, want, places=4)
 
 
 class TestTransformTranslate(unittest.TestCase):

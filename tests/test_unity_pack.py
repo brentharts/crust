@@ -935,6 +935,18 @@ public class Player : MonoBehaviour {
             {"name": "get_Ready", "body": "return 1;"}])
         self.assertIn("get_Ready", reach)
 
+    def test_local_line_on_turned_object_bakes_its_matrix(self):
+        from tools import unity_pack_lines as lines
+        s = math.sqrt(0.5)
+        plan = {"classes": {"Saw": {"instances": [{
+            "name": "Saw", "rot": (0.0, 0.0, s, s), "local_scale": (2, 1, 1),
+            "line_renderer": {"world": False, "width": [], "file_id": 7}}]}}}
+        lines.build_table(plan)
+        m = plan["lines"][0]["m"]
+        # 90 degrees: x (scaled 2) goes to +y, y goes to -x
+        for got, want in zip(m, (0.0, -1.0, 2.0, 0.0)):
+            self.assertAlmostEqual(got, want)
+
     def test_other_transform_field_position_reads(self):
         plan = {"classes": {"Player": {"fields": [
             {"name": "trs", "ty": "Transform"}]}}}

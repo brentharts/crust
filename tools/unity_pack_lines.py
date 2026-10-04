@@ -159,24 +159,24 @@ def build_table(plan):
             lr = o.get("line_renderer")
             if not lr:
                 continue
+            m = (1.0, 0.0, 0.0, 1.0)
             if not lr["world"] and not lr.get("baked_xform"):
+                # ponytail: the authored z rotation and local scale, baked;
+                # a script turning or scaling the object (or a parent's
+                # scale) does not reach the line
                 q = o.get("rot") or (0.0, 0.0, 0.0, 1.0)
                 sc = o.get("local_scale") or (1.0, 1.0, 1.0)
-                if any(abs(a - b) > 1e-6 for a, b in zip(list(q) + [1.0] * 4,
-                                                         (0.0, 0.0, 0.0, 1.0))) \
-                        or any(abs(float(v) - 1.0) > 1e-6 for v in sc):
-                    raise LineError(
-                        "GameObject `%s`: a LineRenderer in local space on a "
-                        "rotated or scaled object -- its points are drawn "
-                        "offset by the object's position only, so this is not "
-                        "packed yet; use world space" % o.get("name"))
+                z, w = float(q[2]), float(q[3])
+                c, s_ = w * w - z * z, 2.0 * z * w
+                sx, sy = float(sc[0]), float(sc[1])
+                m = (c * sx, -s_ * sy, s_ * sx, c * sy)
             if lr.get("file_id") is not None:
                 by_fid[str(lr["file_id"])] = len(lines)
             row = len(curves)
             curves.append(lr["width"])
             pos = o.get("pos") or (0.0, 0.0, 0.0)
             lines.append(dict(lr, owner_class=cname, owner_inst=i,
-                              go_index=o.get("go_index"), wcurve=row,
+                              go_index=o.get("go_index"), wcurve=row, m=m,
                               pos=(float(pos[0]), float(pos[1]))))
     # AddComponent<LineRenderer>(): spare rows, Unity's new line (two points
     # at the origin, width 1, white, world space). ponytail: a removed line's
@@ -349,6 +349,16 @@ def emit_owner_pos(p, plan, c_ident, class_has_position):
     p("    default: *x = 0.f; *y = 0.f; return;")
     p("    }")
     p("}")
+    p("static const float _lr_m[%d][4] = { %s };" % (len(lines), ", ".join(
+        "{ %s }" % ", ".join(_f(v) for v in l.get("m") or (1, 0, 0, 1))
+        for l in lines)))
+    p("/* point k of line s in the world: a local line's through its object */")
+    p("static void _lr_pt(int s, int k, float ox, float oy, float *x, float *y) {")
+    p("    float lx = _lr_x[k], ly = _lr_y[k];")
+    p("    if (_lr_world[s]) { *x = lx; *y = ly; return; }")
+    p("    *x = ox + _lr_m[s][0] * lx + _lr_m[s][1] * ly;")
+    p("    *y = oy + _lr_m[s][2] * lx + _lr_m[s][3] * ly;")
+    p("}")
     p("")
 
 
@@ -367,22 +377,26 @@ def emit_collect(p, plan):
     p("        if (!_lr_world[s]) _lr_owner_pos(s, &ox, &oy);")
     p("        segs = _lr_loop[s] ? c : c - 1;")
     p("        for (k = 0; k < segs; k = k + 1) {")
-    p("            int a = %d * s + k, b = %d * s + (k + 1) %% c;" % (cap, cap))
-    p("            float dx = _lr_x[b] - _lr_x[a], dy = _lr_y[b] - _lr_y[a];")
+    p("            float ax, ay, bx, by, dx, dy;")
+    p("            _lr_pt(s, %d * s + k, ox, oy, &ax, &ay);" % cap)
+    p("            _lr_pt(s, %d * s + (k + 1) %% c, ox, oy, &bx, &by);" % cap)
+    p("            dx = bx - ax; dy = by - ay;")
     p("            total += sqrtf(dx * dx + dy * dy);")
     p("        }")
     p("        for (k = 0; k < segs && *n < max; k = k + 1) {")
-    p("            int a = %d * s + k, b = %d * s + (k + 1) %% c;" % (cap, cap))
-    p("            float dx = _lr_x[b] - _lr_x[a], dy = _lr_y[b] - _lr_y[a];")
-    p("            float len = sqrtf(dx * dx + dy * dy), u, w, cs, sn;")
+    p("            float ax, ay, bx, by, dx, dy, len, u, w, cs, sn;")
     p("            EngineDraw *d = &out[*n];")
+    p("            _lr_pt(s, %d * s + k, ox, oy, &ax, &ay);" % cap)
+    p("            _lr_pt(s, %d * s + (k + 1) %% c, ox, oy, &bx, &by);" % cap)
+    p("            dx = bx - ax; dy = by - ay;")
+    p("            len = sqrtf(dx * dx + dy * dy);")
     p("            u = total > 0.f ? (run + 0.5f * len) / total : 0.f;")
     p("            run += len;")
     p("            if (len <= 0.f) continue;")
     p("            w = _lr_width(s, u);")
     p("            cs = dx / len; sn = dy / len;")
-    p("            d->x = ox + 0.5f * (_lr_x[a] + _lr_x[b]);")
-    p("            d->y = oy + 0.5f * (_lr_y[a] + _lr_y[b]);")
+    p("            d->x = 0.5f * (ax + bx);")
+    p("            d->y = 0.5f * (ay + by);")
     p("            d->half_w = 0.5f * len;")
     p("            d->half_h = 0.5f * w;")
     p("            d->m00 = cs; d->m01 = -sn; d->m10 = sn; d->m11 = cs;")
