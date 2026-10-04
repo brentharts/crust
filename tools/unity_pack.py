@@ -17273,6 +17273,8 @@ def emit_engine(plan, analyses, used_apis):
         idn = _c_ident(cname)
         p("typedef struct %s %s;" % (idn, idn))
     p("extern float Time_deltaTime;")
+    p("extern float Time_unscaledDeltaTime;")
+    p("extern float Time_timeScale;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
     if "Cursor.visible" in used_apis:
@@ -18500,7 +18502,10 @@ def emit_engine(plan, analyses, used_apis):
     p("void engine_tick(void) {")
     p("    /* Unity fixed clock: accumulate frame dt, step at fixedDeltaTime. */")
     p("    static float _engine_fixed_accum = 0.f;")
-    p("    float _dt = Time_deltaTime;")
+    p("    float _dt;")
+    p("    Time_unscaledDeltaTime = Time_deltaTime;")
+    p("    Time_deltaTime = Time_deltaTime * Time_timeScale;")
+    p("    _dt = Time_deltaTime;")
     p("    float _fixed_dt;")
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
@@ -18586,6 +18591,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_update(Time_deltaTime); /* after LateUpdate, as Unity's */")
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
+    p("    Time_deltaTime = Time_unscaledDeltaTime; /* the host's dt again */")
     p("}")
     p("")
     p("int engine_class_count(void) { return %d; }" % len(plan["classes"]))
@@ -21040,6 +21046,8 @@ _UNITY_API_CORE = [
     _B("Time.deltaTime", "Time_deltaTime", "value"),
     _B("Time.fixedDeltaTime", "Time_fixedDeltaTime", "value"),
     _B("Time.time", "Time_time", "value"),
+    _B("Time.timeScale", "Time_timeScale", "value"),
+    _B("Time.unscaledDeltaTime", "Time_unscaledDeltaTime", "value"),
     _B("Cursor.visible", "Cursor_visible", "value", _UE),
     _B("Physics2D.queriesStartInColliders",
        "engine_box2d_queries_start_in_colliders", "value", _UE),
@@ -24457,6 +24465,8 @@ def emit_data(plan, used_apis=None):
         p("")
 
     p("float Time_deltaTime = 0.0166667f;")
+    p("float Time_unscaledDeltaTime = 0.0166667f;")
+    p("float Time_timeScale = 1.f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
     if "Cursor.visible" in used_apis:

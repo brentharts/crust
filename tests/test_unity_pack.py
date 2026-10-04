@@ -935,6 +935,37 @@ public class Player : MonoBehaviour {
             {"name": "get_Ready", "body": "return 1;"}])
         self.assertIn("get_Ready", reach)
 
+    def test_properties_time_scale_and_vector_helpers_run(self):
+        root = self._mini({"VecX.cs": """using UnityEngine;
+
+public static class VecX {
+    public static Vector3 SetX (this Vector3 v, float x) { return new Vector3(x, v.y, v.z); }
+    public static Vector2 SetX (this Vector2 v, float x) { return new Vector2(x, v.y); }
+}
+""", "Player.cs": """using UnityEngine;
+
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private int _f;
+    public int Hp2 { get { return hp * 2; } set { hp = value; } }
+
+    public void Update() {
+        _f = _f + 1;
+        if (_f == 1) {
+            Vector2 v = new Vector2(1, 2);
+            v = v.SetX(7);
+            Hp2 = 4;
+            Time.timeScale = 0.5f;
+            Debug.Log("v " + v.x + " " + v.y + " hp " + Hp2);
+        }
+        if (_f == 2)
+            Debug.Log("dt " + (Time.deltaTime * 2 == Time.unscaledDeltaTime));
+    }
+}
+"""})
+        self.assertEqual(self._run(root, log=True), ["v 7 2 hp 8", "dt True"])
+
     def test_list_searches_per_element_type(self):
         root = self._mini({"Player.cs": """using UnityEngine;
 using System.Collections.Generic;
