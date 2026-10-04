@@ -2727,7 +2727,7 @@ def _rewrite_recttransform_apis(text, cl, plan):
         return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (go, s, s)
 
     text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*Vector3\s*\.\s*one\s*\*\s*([^;]+);"
+        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*Vector[23]\s*\.\s*one\s*\*\s*([^;]+);"
         % _recv,
         _repl_scale_one, text)
 

@@ -5464,10 +5464,27 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
                     idn, fname, idn, fname, parts[0], parts[1],
                     parts[2] if len(parts) > 2 else "1.f"))
 
-    return cs2cpp.code_sub(
+    alt = "|".join(re.escape(f) for f in transform_fields)
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(%s)\s*\.\s*localScale\s*=\s*new\s+Vector[23]\s*"
-        r"\((.*?)\)\s*;" % "|".join(re.escape(f) for f in transform_fields),
-        _local_scale, text, flags=re.DOTALL)
+        r"\((.*?)\)\s*;" % alt, _local_scale, text, flags=re.DOTALL)
+
+    def target(fname):
+        return ("_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i]"
+                % (idn, fname, idn, fname))
+    # any other Vector2 value (`trs.localScale.SetX(..)` once inlined)
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])(%s)\s*\.\s*localScale\s*=(?!=)\s*([^;]+);" % alt,
+        lambda m: "{ Vector2 _up_ls = %s; _engine_set_world_scale(%s, "
+                  "_up_ls.x, _up_ls.y, 1.f); }" % (m.group(2).strip(),
+                                                   target(m.group(1))),
+        text)
+    return cs2cpp.code_sub(
+        r"(?:\(\s*(%s)\s*\.\s*localScale\s*\)|(?<![.\w])(%s)\s*\.\s*"
+        r"localScale)\s*\.\s*([xyz])\b(?!\s*[-+*/]?=(?!=))" % (alt, alt),
+        lambda m: "1.f" if m.group(3) == "z" else
+        "_engine_get_local_scale(%s, %d)" % (
+            target(m.group(1) or m.group(2)), m.group(3) == "y"), text)
 
 
 def _uses_collision2d_contacts(analyses):
@@ -5648,6 +5665,35 @@ def _rewrite_transform_field_position(text, cl, plan, site=None):
         fname = f.get("name")
         if f.get("ty") != "Transform" or (cl["name"], fname) not in targets:
             continue
+        tgt = ("_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i]"
+               % (idn, fname, idn, fname))
+        if plan.get("has_transform_parents"):
+            # a whole Vector2 written (or added): the world setter, z kept;
+            # a `new Vector3(x, y, z)`: its z (`t.position.z` reads the kept one)
+            def world_set(m, t=tgt):
+                rhs, add = m.group(2).strip(), m.group(1)
+                z = "_up_wz"
+                inner = rhs
+                while inner.startswith("(") and (cs2cpp.match_call_args(
+                        inner, 0) or (0, 0))[1] == len(inner):
+                    inner = inner[1:-1].strip()
+                v3 = re.match(r"new\s+Vector3\s*(?=\()", inner)
+                got = cs2cpp.match_call_args(inner, v3.end()) if v3 else None
+                xyz = cs2cpp._split_top_level(got[0]) if got and got[1] == len(
+                    inner) else []
+                if len(xyz) == 3:
+                    rhs = "Vector2_make(%s, %s)" % (xyz[0], xyz[1])
+                    z = "%s(%s)" % ("_up_wz + " if add else "", xyz[2].strip())
+                return ("{ Vector2 _up_tp = %s; float _up_wx, _up_wy, _up_wz; "
+                        "_engine_world_pos(%s, &_up_wx, &_up_wy, &_up_wz, 0); "
+                        "_engine_set_world(%s, %s_up_tp.x, %s_up_tp.y, %s); }"
+                        % (rhs, t, t, "_up_wx + " if add else "",
+                           "_up_wy + " if add else "", z))
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*position\s*(\+?)=(?!=)"
+                r"\s*([^;]+);" % re.escape(fname), world_set, text)
+            if site is not None and "_up_tp" in text:
+                site.setdefault("protos", set()).add(_WORLD_POS_PROTO)
         pat = (r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*position\s*\.\s*([xyz])\b"
                r"(?!\s*(?:=[^=]|\+=|-=|\*=|/=|\+\+|--))" % re.escape(fname))
         if not re.search(pat, text):
@@ -5845,6 +5891,13 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                         "? (%s, 0.f) "
                         ": _Rigidbody2D_vel_%s[_up_rb]; })"
                         % (get, nre, axis))
+            if fl in ("velocity", "linearvelocity") and not axis:
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 "
+                        "? (%s, Vector2_make(0.f, 0.f)) "
+                        ": Vector2_make(_Rigidbody2D_vel_x[_up_rb], "
+                        "_Rigidbody2D_vel_y[_up_rb]); })"
+                        % (get, nre))
             if fl in ("mass",):
                 return ("({ int _up_rb = %s; "
                         "_up_rb < 0 "
@@ -14575,9 +14628,9 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
         p("    return Vector2_make(x, y);")
         p("}")
-        p("/* position = Vector2: z is 0 (Vector2 → Vector3); local = the parent's")
-        p("   world rotation and scale undone on the offset from its position. */")
-        p("static void Transform_set_position2(int go, Vector2 v) {")
+        p("/* world position (v, wz); local = the parent's world rotation and")
+        p("   scale undone on the offset from its position. */")
+        p("static void Transform_set_position2_z(int go, Vector2 v, float wz) {")
         p("    int c = -1;")
         p("    unsigned n = 0u;")
         p("    float px = 0.f, py = 0.f, pz = 0.f;")
@@ -14586,11 +14639,23 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("        && _engine_go_xf(_engine_go_parent[go], &c, &n))")
         p("        _engine_world_pos(c, n, &px, &py, &pz, 0);")
         if _godot_bases(plan):
-            p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, 0.f - pz);")
+            p("    _engine_set_local_pos_go(go, v.x - px, v.y - py, wz - pz);")
         else:
             p("    { float lx = v.x - px, ly = v.y - py;")
             p("      if (c >= 0) _engine_world_to_local(c, n, v.x - px, v.y - py, &lx, &ly);")
-            p("      _engine_set_local_pos_go(go, lx, ly, 0.f - pz); }")
+            p("      _engine_set_local_pos_go(go, lx, ly, wz - pz); }")
+        p("}")
+        p("/* position = Vector2: z is 0 (Vector2 → Vector3) */")
+        p("static void Transform_set_position2(int go, Vector2 v) {")
+        p("    Transform_set_position2_z(go, v, 0.f);")
+        p("}")
+        p("/* position = new Vector3(x, y, position.z) */")
+        p("static void Transform_set_position2_keepz(int go, Vector2 v) {")
+        p("    int c = -1;")
+        p("    unsigned n = 0u;")
+        p("    float x = 0.f, y = 0.f, z = 0.f;")
+        p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
+        p("    Transform_set_position2_z(go, v, z);")
         p("}")
     if not (want_live_rot and plan.get("handle_rot")):
         p("")
@@ -18091,6 +18156,21 @@ def emit_engine(plan, analyses, used_apis):
         p("    default: break;")
         p("    }")
         p("}")
+        p("static float _engine_get_local_scale(int tc, unsigned ti, int y) {")
+        p("    switch (tc) {")
+        for cname in sorted(live):
+            if cname not in class_ids:
+                continue
+            idn = _c_ident(cname)
+            p("    case %d:" % class_ids[cname])
+            p("        if (ti < (unsigned)_%s_inst_count)" % idn)
+            p("            return y ? _%s_scale_y[ti] : _%s_scale_x[ti];"
+              % (idn, idn))
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    return 1.f;")
+        p("}")
         p("")
 
     _emit_engine_live_rotation(p, want_live_rot)
@@ -18857,7 +18937,7 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
             r"transform\.%s\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
             repl_eq, text, flags=flags)
         text = cs2cpp.code_sub(
-            r"transform\.%s\s*=\s*Vector3\.zero\s*;" % prop,
+            r"transform\.%s\s*=\s*Vector[23]\.zero\s*;" % prop,
             repl_zero, text)
         text = cs2cpp.code_sub(
             r"transform\.%s\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
@@ -18959,7 +19039,7 @@ def _parse_vector3_expr(a):
             return vargs[0], vargs[1], vargs[2]
         return None
     am = re.match(
-        r"Vector3\.(right|left|up|down|forward|back|zero|one)\s*$", a)
+        r"Vector[23]\.(right|left|up|down|forward|back|zero|one)\s*$", a)
     if am:
         name = am.group(1)
         if name == "zero":
@@ -18971,7 +19051,7 @@ def _parse_vector3_expr(a):
                 "%sf" % repr(float(ay)),
                 "%sf" % repr(float(az)))
     am = re.match(
-        r"Vector3\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
+        r"Vector[23]\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
         a, flags=re.S)
     if am:
         ax, ay, az = _VECTOR3_AXIS[am.group(1)]
@@ -19120,8 +19200,17 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
                 pat + r"\s*\.\s*value\b",
                 lambda m, t=ty, e=expr: "%s_get_value(%s)" % (t, e), text)
         text = cs2cpp.code_sub(
-            pat + r"\s*\.\s*parent\b",
+            pat + r"(\s*\.\s*parent)?\s*\.\s*gameObject\s*\.\s*SetActive\s*"
+            r"\(\s*([^)]+)\s*\)",
+            lambda m, e=expr: "GameObject_SetActive(%s, (%s))" % (
+                "Transform_get_parent(%s)" % e if m.group(1) else e,
+                m.group(2)), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*parent(?:\s*\.\s*(?:gameObject|transform)\b)?",
             lambda m, e=expr: "Transform_get_parent(%s)" % e, text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*(?:gameObject|transform)\b",
+            lambda m, e=expr: e, text)
     trs = [(pat, expr) for pat, expr, ty in recvs if ty == "Transform"]
     if trs:
         text = _rewrite_transform_handle_trs(text, trs, site)
@@ -19132,6 +19221,8 @@ _TRANSFORM_HANDLE_PROTOS = {
     "Transform_get_position2": "static Vector2 Transform_get_position2(int go);",
     "Transform_set_position2":
         "static void Transform_set_position2(int go, Vector2 v);",
+    "Transform_set_position2_keepz":
+        "static void Transform_set_position2_keepz(int go, Vector2 v);",
     "Transform_DetachChildren": "static void Transform_DetachChildren(int go);",
     "Transform_get_rotation": "static Quaternion Transform_get_rotation(int go);",
     "Transform_set_rotation":
@@ -19173,10 +19264,35 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
                lambda m: "Transform_get_rotation(%s)" % e(m.group(1)), text)
     text = sub(r"(?<![\w.])Quaternion\s*\.\s*(Slerp|Angle)\s*\(",
                r"Quaternion_\1(", text)
+    # `t.position = new Vector3(x, y, t.position.z);` keeps t's z
+    out, pos = [], 0
+    for m in re.finditer(r"(%s)\s*\.\s*position\s*=(?!=)\s*(\(\s*)?new\s+Vector3\s*\("
+                         % alt, cs2cpp._blank(text)):
+        got = _match_call_args(text, m.end() - 1) if m.start() >= pos else None
+        if not got:
+            continue
+        args, after = got
+        tail = re.match(r"\s*\)\s*;" if m.group(2) else r"\s*;", text[after:])
+        xyz = cs2cpp._split_top_level(args)
+        if not tail or len(xyz) != 3 or not re.fullmatch(
+                r"\(?\s*%s\s*\.\s*position\s*\.\s*z\s*\)?" % re.escape(m.group(1)),
+                xyz[2].strip()):
+            continue
+        out += [text[pos:m.start()], "Transform_set_position2_keepz(%s, Vector2_make(%s, %s));"
+                % (e(m.group(1)), xyz[0].strip(), xyz[1].strip())]
+        pos = after + tail.end()
+    text = "".join(out) + text[pos:]
     text = sub(r"(%s)\s*\.\s*position\s*=(?!=)\s*([^;]+);" % alt,
                lambda m: "Transform_set_position2(%s, %s);" % (
                    e(m.group(1)), m.group(2).strip()), text)
     text = sub(r"\(\s*Vector2\s*\)\s*(%s)\s*\.\s*position\b(?!\s*\.)" % alt,
+               lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
+    # a read of one axis, or of the whole -- as the Vector2 C has (z is 0)
+    text = sub(r"(%s)\s*\.\s*position\s*\.\s*([xyz])\b(?!\s*[-+*/]?=(?!=))"
+               % alt, lambda m: "0.f" if m.group(2) == "z" else
+               "Vector2_%s(Transform_get_position2(%s))" % (
+                   m.group(2), e(m.group(1))), text)
+    text = sub(r"(%s)\s*\.\s*position\b(?!\s*(?:\.|[-+*/]?=(?!=)))" % alt,
                lambda m: "Transform_get_position2(%s)" % e(m.group(1)), text)
     # Implicit Vector3 → Vector2 inside calls whose result is a Vector2.
     # ponytail: Vector3.Distance as the 2D distance; a packed position's z is 0
@@ -19853,7 +19969,7 @@ def _rewrite_transform_look_at(text, cl):
                     tx, ty, tz = vargs[0], vargs[1], vargs[2]
             else:
                 am = re.match(
-                    r"Vector3\.(zero|one|right|left|up|down|forward|back)\s*$",
+                    r"Vector[23]\.(zero|one|right|left|up|down|forward|back)\s*$",
                     a0)
                 if am:
                     name = am.group(1)
@@ -22189,6 +22305,42 @@ def _reference_holds(text, cl, plan, site):
     return holds
 
 
+def _getter_transform_positions(text, plan, site):
+    """`Other_get_trs(Other_Instance()).position[.x]` -- another object's
+    Transform field (a GO index), reached through any expression -- read as
+    its world position, the Vector2 C has (z is 0)."""
+    getters = {"%s_get_%s" % (_c_ident(c), f["name"])
+               for c, ocl in (plan.get("classes") or {}).items()
+               for f in ocl.get("fields") or [] if f.get("ty") == "Transform"}
+    if not getters:
+        return text
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.])(%s)\s*\(" % "|".join(
+            re.escape(g) for g in sorted(getters)), text):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        _args, after = got
+        mm = re.match(r"\s*\.\s*position\b(?:\s*\.\s*([xyz])\b)?"
+                      r"(?!\s*(?:\.|[-+*/]?=(?!=)))", text[after:])
+        if not mm:
+            continue
+        expr = "Transform_get_position2(%s)" % text[m.start():after]
+        if mm.group(1):
+            expr = ("0.f" if mm.group(1) == "z"
+                    else "Vector2_%s(%s)" % (mm.group(1), expr))
+        out += [text[pos:m.start()], expr]
+        pos = after + mm.end()
+    if not out:
+        return text
+    if site is not None:
+        site.setdefault("protos", set()).add(
+            _TRANSFORM_HANDLE_PROTOS["Transform_get_position2"])
+    return "".join(out) + text[pos:]
+
+
 def _lower_own_properties(text, cl, plan, site):
     """An instance property of this class used by name: a read calls its
     getter, `Name = x;` its setter -- the `get_Name` / `set_Name` methods
@@ -24304,6 +24456,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_packed_fields(
         text, idn, members, class_const_names, handle_fields,
         _packed_model(plan))
+    text = _getter_transform_positions(text, plan, site)
     # Same-class instance calls: Do() / Do(a) → Class_Do(i) / Class_Do(i, a).
     # Unity messages and private helpers share the packed instance index.
     this_methods = set()

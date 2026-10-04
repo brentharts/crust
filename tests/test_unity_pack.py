@@ -935,6 +935,19 @@ public class Player : MonoBehaviour {
             {"name": "get_Ready", "body": "return 1;"}])
         self.assertIn("get_Ready", reach)
 
+    def test_other_transform_field_position_reads(self):
+        plan = {"classes": {"Player": {"fields": [
+            {"name": "trs", "ty": "Transform"}]}}}
+        out = unity_pack._getter_transform_positions(
+            "a = Player_get_trs(Player_Instance()).position.y; "
+            "b = Player_get_trs(p).position; "
+            "Player_get_trs(p).position.x = 1;", plan, None)
+        self.assertEqual(out, (
+            "a = Vector2_y(Transform_get_position2(Player_get_trs("
+            "Player_Instance()))); "
+            "b = Transform_get_position2(Player_get_trs(p)); "
+            "Player_get_trs(p).position.x = 1;"))
+
     def test_properties_time_scale_and_vector_helpers_run(self):
         root = self._mini({"VecX.cs": """using UnityEngine;
 
