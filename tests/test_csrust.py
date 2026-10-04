@@ -1795,9 +1795,11 @@ class TestLowerBody(unittest.TestCase):
 
     def test_packed_field_reads_and_writes(self):
         self.assertEqual(
-            self._fields("hp = hp + MAX; speed += 2.f; hp++; --hp;"),
+            self._fields("hp = hp + MAX; speed += 2.f; speed -= 3.f - 1.f;"
+                         " hp++; --hp;"),
             "Coin_set_hp(i, Coin_get_hp(i) + Coin_MAX); "
-            "Coin_set_speed(i, Coin_get_speed(i) + 2.f); "
+            "Coin_set_speed(i, Coin_get_speed(i) + (2.f)); "
+            "Coin_set_speed(i, Coin_get_speed(i) - (3.f - 1.f)); "
             "Coin_set_hp(i, Coin_get_hp(i) + 1); "
             "Coin_set_hp(i, Coin_get_hp(i) - 1);")
 

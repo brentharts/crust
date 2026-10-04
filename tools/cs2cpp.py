@@ -1515,9 +1515,10 @@ def lower_packed_fields(text, owner, members, statics, handle_fields, model,
                 set_(nm, "%s %s 1" % (get(nm), sg)), text)
         # Compound and plain assignment: the value runs to the end of the
         # assigned expression, found on the text as it stands.
-        for pat, op in ((r"(?<![_\w.])%s\s*\+=" % n, "+"),
-                        (r"(?<![_\w.])%s\s*-=" % n, "-"),
-                        (r"(?<![_\w.])%s\s*=(?!=)" % n, None)):
+        for pat, op in [(r"(?<![_\w.])%s\s*%s=" % (n, re.escape(o)), o)
+                        for o in ("<<", ">>", "+", "-", "*", "/", "%",
+                                  "&", "|", "^")] + [
+                            (r"(?<![_\w.])%s\s*=(?!=)" % n, None)]:
             while True:
                 scan = _blank(text)
                 m = re.search(pat, scan)
@@ -1528,7 +1529,7 @@ def lower_packed_fields(text, owner, members, statics, handle_fields, model,
                 lead = len(value) - len(value.lstrip())
                 value = value.strip()
                 if op is not None:
-                    value = "%s %s %s" % (get(name), op, value)
+                    value = "%s %s (%s)" % (get(name), op, value)
                 text = (text[:m.start()] + set_(name, value)
                         + text[end:])
     for name in sorted(members, key=len, reverse=True):
