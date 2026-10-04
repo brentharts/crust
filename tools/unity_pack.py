@@ -20381,19 +20381,24 @@ _VEC_PB = [0]
 
 
 def _vec_helper_suffix(cty):
-    return {"std::string": "str", "fastring": "fstr",
-            "float": "float"}.get(cty, "int")
+    return {"std::string": "str", "fastring": "fstr"}.get(
+        cty, re.sub(r"\W+", "_", cty.strip()))
 
 
 def _vec_helpers_c(ctys):
     """The search helpers for each vector element type used: index of an
     element (`==`, a string by its text) and remove-first-match."""
-    out = []
+    out, seen = [], set()
     for cty in sorted(ctys):
         suf = _vec_helper_suffix(cty)
+        if suf in seen:
+            continue
+        seen.add(suf)
         texty = cty in ("std::string", "fastring")
         arg = "const char *" if texty else cty
-        eq = "strcmp(v[k].c_str(), x) == 0" if texty else "v[k] == x"
+        # ponytail: a struct element compares bytewise (-0.f != 0.f, NaN == NaN)
+        eq = "strcmp(v[k].c_str(), x) == 0" if texty else "v[k] == x" \
+            if cty in ("int", "float") else "memcmp(&v[k], &x, sizeof x) == 0"
         out.append(
             "static int _cs_vec_index_%s(std::vector<%s> &v, %s x) {\n"
             "    int k;\n"

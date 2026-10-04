@@ -910,6 +910,29 @@ public class Player : MonoBehaviour {
         self.assertEqual(col["tris"][0], (6.0, -2.0, 4.0, -3.0, 6.0, -3.0))
         self.assertEqual(len(col["tris"]), 2)
 
+    def test_list_searches_per_element_type(self):
+        root = self._mini({"Player.cs": """using UnityEngine;
+using System.Collections.Generic;
+
+public class Player : MonoBehaviour {
+    public int hp;
+    public float speed;
+    private bool _done;
+
+    public void Update() {
+        if (_done) return;
+        _done = true;
+        List<int> ints = new List<int>();
+        ints.Add(4);
+        List<Vector2Int> cells = new List<Vector2Int>();
+        Vector2Int c = new Vector2Int(1, 2);
+        cells.Add(c);
+        Debug.Log("ix " + ints.IndexOf(4) + " " + cells.IndexOf(c));
+    }
+}
+"""})
+        self.assertEqual(self._run(root, log=True), ["ix 0 0"])
+
     def _mini(self, scripts, scene_edit=None):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
