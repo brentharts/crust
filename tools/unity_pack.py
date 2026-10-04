@@ -6700,6 +6700,7 @@ def _fields_in(body, bscan, body_abs=0):
             # line (method bodies are blanked, so no `for (..; ..)`).
             r"(?m)(?:^|(?<=;))[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:const[ \t]+)?(?:readonly[ \t]+)?"
+            r"(?:event[ \t]+)?"
             # Types may be generics: Dictionary<int, int> / List<Foo>, or T[].
             r"([\w.]+(?:\s*<[^>;{\n]+>)?(?:\s*\[\s*\])?)[ \t]+(\w+)[ \t]*(=|;)",
             bscan):
@@ -6721,6 +6722,9 @@ def _fields_in(body, bscan, body_abs=0):
             "name": name,
             "static": bool(re.search(r"\bstatic\b", decl)),
             "const": bool(re.search(r"\bconst\b", decl)),
+            "delegate": bool(re.search(r"\bevent\b", decl)) or bool(
+                re.match(r"(?:System\.)?(?:Action|Func|Predicate|UnityAction)"
+                         r"\b", ty)),
             "decl_abs": int(body_abs) + int(m.start()),
             "serialized": ((bool(re.match(r"\s*public\b", decl))
                             or "SerializeField" in attrs)
@@ -7802,6 +7806,13 @@ def _writes_unstored_field(body, cl, plan):
     for m in re.finditer(r"(?<![\w.])this\s*\.\s*(\w+)\s*=(?!=)", scan):
         if m.group(1) in unstored:
             return (body or "")[m.start():m.end()]
+    # a delegate field (an event, an Action) used at all: no C name either
+    for f in cl.get("fields") or []:
+        if f.get("delegate") and f["name"] in unstored:
+            m = re.search(r"(?<![\w.])(?:this\s*\.\s*)?%s\b" % re.escape(
+                f["name"]), scan)
+            if m:
+                return (body or "")[m.start():m.end()]
     return None
 
 
@@ -8267,9 +8278,13 @@ def plan_layouts(objects, analyses, two_d=None):
             members.append(("pos_y", "float", 32, "f32"))
             members.append(("pos_z", "float", 32, "f32"))
 
+        delegates = {f["name"] for f in script_fields if f.get("delegate")}
         for fname, ty in field_tys.items():
             if ty == "string":
                 # Instance strings are not packed yet (static strings are).
+                continue
+            if fname in delegates:
+                # an event / Action: no storage; a body using it stubs
                 continue
             if ty in ("StreamWriter", "StreamReader"):
                 # Text streams are FILE* class/static fields, not instance slots.
