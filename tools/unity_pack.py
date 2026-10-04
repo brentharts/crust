@@ -7919,7 +7919,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         # `Class_get_f(Class_Instance()) = v` (not an lvalue → CS0000).
         for vf in ocl.get("vec2_fields") or []:
             text = cs2cpp.code_sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=(?!=)\s*"
                 r"([^;]+);"
                 % (re.escape(ocname), re.escape(vf)),
                 lambda m, o=oidn, f=vf, ix=inst: (
@@ -7963,7 +7963,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             if mem.startswith("pos_"):
                 continue
             text = cs2cpp.code_sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=(?!=)\s*"
                 r"([^;]+);"
                 % (re.escape(ocname), re.escape(mem)),
                 "%s_set_%s(%s, (\\1));" % (oidn, mem, inst),
@@ -24672,7 +24672,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     for vf in cl.get("vec2_fields") or []:
         # Whole-field write before .x/.y / bare-read rewrites.
         text = cs2cpp.code_sub(
-            r"(?<![_\w])%s\s*=\s*(.+?)\s*;" % re.escape(vf),
+            r"(?<![_\w])%s\s*=(?!=)\s*(.+?)\s*;" % re.escape(vf),
             lambda m, name=vf: (
                 "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
                 % (idn, name, m.group(1), idn, name, m.group(1))),

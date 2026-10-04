@@ -791,6 +791,46 @@ public class Mgr : MonoBehaviour {
         self.assertIn("none 4", out)
 
 
+class TestSingletonFieldCompare(unittest.TestCase):
+    """`Lasso.instance.changeLengthInput == 0` is a read: Slime Jump's
+    `Player.DoUpdate` had it lowered as a setter of `= 0) { ... }`."""
+
+    LASSO = """using UnityEngine;
+public class Lasso : MonoBehaviour {
+    public static Lasso instance;
+    public int changeLengthInput;
+    public bool isAttached = true;
+    void Awake() { instance = this; }
+}
+"""
+    CAM = """using UnityEngine;
+public class Cam : MonoBehaviour {
+    public static Cam instance;
+    public bool followPlayer = true;
+    void Awake() { instance = this; }
+}
+"""
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    void Update() {
+        if (Lasso.instance.isAttached && Lasso.instance.changeLengthInput == 0)
+        {
+            Cam.instance.followPlayer = false;
+        }
+        if (!Cam.instance.followPlayer) Debug.Log("follow False");
+    }
+}
+"""
+
+    @needs_cc
+    def test_compare_is_a_read(self):
+        root = project(self, {"Lasso": self.LASSO, "Cam": self.CAM,
+                              "Mgr": self.MGR},
+                       [("Lasso",), ("Cam",), ("Mgr",)])
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("follow False", out)
+
+
 class TestOtherPosition(unittest.TestCase):
     """`target.position` through a Transform field, read as a vector value:
     it stopped at a member of the field's read and emptied the method
