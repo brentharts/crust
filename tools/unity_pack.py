@@ -7150,6 +7150,13 @@ def _rewrite_singleton_method_calls(text, plan, cl, site, string_idents):
     return text
 
 
+#: `T[]` elements that are values, not references to objects.
+_VALUE_ELEM_TYPES = frozenset((
+    "string", "bool", "byte", "sbyte", "char", "short", "ushort", "int",
+    "uint", "long", "ulong", "float", "double", "Vector2", "Vector3",
+    "Vector2Int", "Vector3Int", "Color", "Color32", "Rect", "Quaternion"))
+
+
 def _array_elem_name(ty):
     """Element type from ``T[]``, or None."""
     if not ty:
@@ -8374,10 +8381,12 @@ def plan_layouts(objects, analyses, two_d=None):
             if not f.get("static") and not f.get("const")
             and _list_elem_name(f.get("ty") or "")
         ]
+        # a vector of indices: an array of values (`string[]`) has no slot
         ref_array_fields = [
             f for f in script_fields
             if not f.get("static") and not f.get("const")
             and _array_elem_name(f.get("ty") or "")
+            and _array_elem_name(f.get("ty") or "") not in _VALUE_ELEM_TYPES
         ]
         # Instance `string` fields: a fastring table each, seeded per
         # instance from the scene's value, else the field's initializer.
