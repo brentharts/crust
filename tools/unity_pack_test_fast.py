@@ -870,6 +870,63 @@ public class Mgr : MonoBehaviour {
                       str(cm.exception))
 
 
+class TestEmbeddedStruct(unittest.TestCase):
+    """A [Serializable] struct a component embeds (Slime Jump's
+    `AnimationEntry jumpAnimationEntry`) is authored as a nested mapping:
+    each value is a row of the struct's class, the field its index. The
+    rows are shared by copies, so a write to one is refused."""
+
+    ENTRY = """using System;
+[Serializable]
+public struct Entry {
+    public string stateName;
+    public int layer;
+    public float length;
+    public bool Is(string s) { return stateName == s; }
+    public float Twice() { return length * 2f; }
+}
+"""
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    public Entry jump;
+    public Entry land;
+    void Update() {
+        if (jump.Is("Jump")) Debug.Log("jump " + jump.layer + " " + (int)land.Twice());
+        else Debug.Log("other " + land.layer);
+    }
+}
+"""
+    FIELDS = ("  jump:\n    stateName: %s\n    layer: %d\n    length: 0.5\n"
+              "  land:\n    stateName: Land\n    layer: %d\n    length: %s\n")
+
+    @needs_cc
+    def test_values_per_object(self):
+        root = project(self, {"Entry": self.ENTRY, "Mgr": self.MGR}, [
+            ("Mgr", None, self.FIELDS % ("Jump", 1, 2, "3.5")),
+            ("Mgr", None, self.FIELDS % ("Idle", 4, 5, "1"))])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("jump 1 7", out)
+        self.assertIn("other 5", out)
+
+    def test_prefab_override_reaches_nested_value(self):
+        doc = ("MonoBehaviour:\n  jump:\n    stateName: Jump\n    layer: 1\n"
+               "  land:\n    layer: 2\n")
+        got = unity_pack._set_yaml_property(doc, "land.layer", "7")
+        self.assertIn("  land:\n    layer: 7\n", got)
+        self.assertIn("    layer: 1\n", got)
+        self.assertEqual(unity_pack._embedded_values(got)["land"]["fields"],
+                         {"layer": 7})
+
+    def test_write_is_refused(self):
+        mgr = self.MGR.replace("void Update() {",
+                               "void Update() {\n        jump.layer = 3;")
+        root = project(self, {"Entry": self.ENTRY, "Mgr": mgr}, [
+            ("Mgr", None, self.FIELDS % ("Jump", 1, 2, "3.5"))])
+        with self.assertRaises(unity_pack.PackError) as cm:
+            pack(self, root)
+        self.assertIn("embedded struct", str(cm.exception))
+
+
 class TestInheritedUpdatables(unittest.TestCase):
     """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
     `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class

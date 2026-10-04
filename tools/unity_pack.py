@@ -28,6 +28,7 @@ scene / sprite reload). ``--force`` always rebuilds.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import pickle
@@ -2561,6 +2562,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if not fm.group(1).startswith("m_"):
                 rec.setdefault("object_ref_arrays", {})[fm.group(1)] = \
                     re.findall(r"fileID:\s*(-?\d+)", fm.group(2))
+        sv = _embedded_values(block)
+        if sv:
+            rec["struct_values"] = sv
         if kind == "Light":
             inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
             col = re.search(
@@ -3063,6 +3067,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         vec2_fields = {}
         vec3_fields = {}
         anim_curves = {}
+        struct_values = {}
         sprite = None
         ui_image = None
         ui_button = None
@@ -3115,6 +3120,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 object_ref_arrays.update(k.get("object_ref_arrays") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
                 vec3_fields.update(k.get("vec3_fields") or {})
+                struct_values.update(k.get("struct_values") or {})
                 # AnimationCurve fields: keys and wrap modes, serialized
                 # inline (tools/unity_pack_curves.py).
                 try:
@@ -3550,6 +3556,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "anim_curves": anim_curves,
             "object_refs": object_refs,
             "object_ref_arrays": object_ref_arrays,
+            "struct_values": struct_values,
             "mb_ids": mb_ids,
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
@@ -8173,6 +8180,19 @@ def _unstored_field_names(cl, plan):
     return out
 
 
+def _writes_embedded_struct(body, plan):
+    """The first write to a field of an embedded [Serializable] struct's row
+    in lowered *body*, else None (see `_embedded_struct_rows`)."""
+    for s in sorted(plan.get("embedded_structs") or ()):
+        sid = re.escape(_c_ident(s))
+        m = re.search(r"(?<![\w])%s_set_\w+\s*\(|(?<![\w])%s_AT\s*\([^;]*?\)"
+                      r"\s*\.\s*\w+\s*(?:[-+*/%%&|^]?=(?!=)|\+\+|--)"
+                      % (sid, sid), body)
+        if m:
+            return m.group(0)
+    return None
+
+
 def _writes_unstored_field(body, cl, plan):
     """The `this.f = v` of a field the pack keeps no storage for, or None.
 
@@ -8504,6 +8524,47 @@ def _assigned_int_seeds(fname, methods, fields):
     return seeds
 
 
+def _embedded_struct_rows(by_class, analyses):
+    """Rows for the [Serializable] values objects embed (`public
+    AnimationEntry jump;`, authored as a nested mapping): each becomes a row
+    of its type's packed class, and the owner's field its index, as a
+    reference to another packed object is. Two copies of a value then share
+    a row, so the rows are read-only (`_writes_embedded_struct` refuses a
+    write): sharing a value nobody changes is a copy.
+    ponytail: an owner the scene does not author (AddComponent) holds null,
+    not default(T); a shared default row if that matters."""
+    info = {c["name"]: c for a in analyses for c in a.get("classes") or []}
+    embedded, serial = set(), itertools.count()
+    queue = [(cn, o) for cn in sorted(by_class) for o in by_class[cn]]
+    while queue:
+        cname, o = queue.pop(0)
+        sv = o.get("struct_values") or {}
+        if not sv or cname not in info:
+            continue
+        for f in info[cname].get("fields") or []:
+            ty = (f.get("ty") or "").split(".")[-1]
+            t = info.get(ty)
+            if (f["name"] not in sv or f.get("static") or not t
+                    or t.get("bases")):
+                continue
+            v = sv[f["name"]]
+            rid = "embedded:%d" % next(serial)
+            row = {"name": "%s.%s" % (o.get("name") or cname, f["name"]),
+                   "class": ty, "pos": (0.0, 0.0, 0.0),
+                   "rot": (0.0, 0.0, 0.0, 1.0), "active": 1,
+                   "fields": dict(v["fields"]),
+                   "str_fields": dict(v["str_fields"]),
+                   "object_refs": dict(v["object_refs"]),
+                   "vec2_fields": dict(v["vec2_fields"]),
+                   "struct_values": v.get("struct_values") or {},
+                   "mb_ids": [rid], "embedded": True}
+            o.setdefault("object_refs", {})[f["name"]] = rid
+            by_class.setdefault(ty, []).append(row)
+            embedded.add(ty)
+            queue.append((ty, row))
+    return embedded
+
+
 def plan_layouts(objects, analyses, two_d=None):
     """Per-class packed field list + index width."""
     by_class = {}
@@ -8541,6 +8602,7 @@ def plan_layouts(objects, analyses, two_d=None):
         if t in analyzed and t not in skip:
             by_class.setdefault(t, [])
 
+    embedded = _embedded_struct_rows(by_class, analyses)
     spawn = any(a["spawns"] for a in analyses)
     uses_z = any(a["uses_z"] for a in analyses)
     if two_d is None:
@@ -8849,6 +8911,7 @@ def plan_layouts(objects, analyses, two_d=None):
         "transform_point_classes": sorted(tp_classes),
         "transform_matrix_classes": sorted(matrix_classes),
         "local_position_classes": sorted(local_pos_classes),
+        "embedded_structs": sorted(embedded),
     }
 
 
@@ -13866,15 +13929,20 @@ def _emit_engine_class_groups(
                         "valued return in void method emit",
                         "return …;",
                     )
-                else:
-                    hit = _writes_unstored_field(m.get("body") or "", cl, plan)
-                    if hit:
-                        why = (
-                            "field the pack keeps no storage for (a "
-                            "Transform / component reference, or one "
-                            "declared on a base class)",
-                            hit,
-                        )
+            if why is None:
+                hit = _writes_unstored_field(m.get("body") or "", cl, plan)
+                if hit:
+                    why = (
+                        "field the pack keeps no storage for (a "
+                        "Transform / component reference, a delegate, or "
+                        "one declared on a base class)",
+                        hit,
+                    )
+            if why is None:
+                hit = _writes_embedded_struct(body, plan)
+                if hit:
+                    why = ("field of an embedded struct written (its rows are"
+                           " shared by copies, so they stay read-only)", hit)
             if why is not None:
                 _report_stub(plan, site, cl, m, why)
                 if not m.get("static"):
@@ -22811,6 +22879,33 @@ def _lower_own_properties(text, cl, plan, site):
     return text
 
 
+def _lower_reference_game_objects(text, cl, plan, site):
+    """`ref.gameObject` through a reference to another packed object is its
+    GO index: `ref.gameObject.SetActive(x)`, `Destroy(ref.gameObject)`."""
+    if not plan.get("go_names"):
+        return text
+    holds = _reference_holds(text, cl, plan, site)
+    # a static of a packed class's type, already `Cls_f` (`GameCamera_instance`)
+    classes = plan.get("classes") or {}
+    for oname, ocl in classes.items():
+        for f in ocl.get("class_consts") or []:
+            if f.get("static") and f.get("ty") in classes:
+                for r in ("%s_%s" % (_c_ident(oname), f["name"]),
+                          "%s.%s" % (oname, f["name"]))[:None] + (
+                              (f["name"],) if oname == cl["name"] else ()):
+                    holds.setdefault(r, f["ty"])
+    for recv, other in sorted(holds.items()):
+        go = "_engine_go_of_%s(%s)" % (_c_ident(other), recv)
+        q = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*gameObject" % re.escape(recv)
+        text = cs2cpp.code_sub(q + r"\s*\.\s*SetActive\s*\(",
+                               "GameObject_SetActive(%s, " % go, text)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:Object\s*\.\s*)?Destroy\s*\(\s*" + q[len(
+                r"(?<![\w.])"):] + r"\s*\)", "Object_Destroy(%s)" % go, text)
+        text = cs2cpp.code_sub(q + r"\b(?!\s*\.)", go, text)
+    return text
+
+
 def _lower_godot_tree(text, cl, plan, site):
     """godot_pack's AddChild forms, now that the references' classes are
     known: `GodotTree.Add(parent, child)` -> `_godot_add_child(..)`,
@@ -24304,6 +24399,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # own `transform.position` is lowered (which would take its receiver).
     text = _handle_positions(text, plan, _reference_holds(text, cl, plan,
                                                           site))
+    text = _lower_reference_game_objects(text, cl, plan, site)
+    text = _lower_own_properties(text, cl, plan, site)
     if plan.get("godot_spawn") and "GodotTree." in text:
         text = _lower_godot_tree(text, cl, plan, site)
     text = _lower_mouse_scroll(text)
@@ -26141,6 +26238,41 @@ def _scene_prefab_instances(scene_text):
     return list(insts.values())
 
 
+def _embedded_values(block):
+    """``{field: {"fields", "str_fields", "object_refs", "vec2_fields",
+    "struct_values"}}`` of the embedded [Serializable] values in a
+    component's YAML *block* -- a field written as a nested mapping
+    (``entry:\\n    layer: 1``), read like the component's own fields."""
+    out = {}
+    for fm in re.finditer(r"(?m)^  (\w+):[ \t]*\n((?:    [^\n]*(?:\n|$))+)",
+                          block):
+        if fm.group(1).startswith("m_"):
+            continue
+        sub = re.sub(r"(?m)^  ", "", fm.group(2))
+        v = {"fields": {}, "str_fields": {}, "object_refs": {},
+             "vec2_fields": {}}
+        for m in re.finditer(r"(?m)^  (\w+):[ \t]*(.*?)[ \t]*$", sub):
+            key, raw = m.group(1), m.group(2)
+            if re.fullmatch(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", raw):
+                v["fields"][key] = (float(raw) if re.search(r"[.eE]", raw)
+                                    else int(raw))
+            ref = re.fullmatch(r"\{fileID:\s*(-?\d+)\}", raw)
+            if ref and ref.group(1) != "0":
+                v["object_refs"][key] = ref.group(1)
+            vec = re.fullmatch(r"\{x:\s*([^,}]+),\s*y:\s*([^,}]+)\}", raw)
+            if vec:
+                v["vec2_fields"][key] = (float(vec.group(1)),
+                                         float(vec.group(2)))
+            st = _yaml_scalar_text(raw)
+            if st is not None:
+                v["str_fields"][key] = st
+        inner = _embedded_values(sub)
+        if inner:
+            v["struct_values"] = inner
+        out[fm.group(1)] = v
+    return out
+
+
 def _set_yaml_property(doc, path, value):
     """*doc* with the serialized property *path* (``name`` or ``a.b`` into
     a flow mapping) set to *value*; unchanged for paths this does not model
@@ -26155,7 +26287,14 @@ def _set_yaml_property(doc, path, value):
         body = doc.rstrip("\n")
         return body + "\n  %s: %s" % (top, value) + doc[len(body):]
     if not line.group(1).strip():
-        return doc
+        # `a.b` into an embedded value's block (`a:\n    b: v`)
+        blk = re.match(r"(?:\n    [^\n]*)+", doc[line.end():])
+        sl = sub and blk and re.search(r"(?m)^    %s:[ \t]*(.*)$"
+                                       % re.escape(sub), blk.group(0))
+        if not sl:
+            return doc
+        at = line.end()
+        return doc[:at + sl.start(1)] + value + doc[at + sl.end(1):]
     if not sub:
         return doc[:line.start(1)] + value + doc[line.end(1):]
     flow = line.group(1)
@@ -26489,6 +26628,12 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
         for t in missing:
             sp = typename_map[t]
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
+                continue
+            a = analyze_script(sp)
+            if all(not c.get("bases") for c in a.get("classes") or []):
+                # a plain [Serializable] value (no component): its methods
+                # are what the objects embedding it call
+                analyses.append(a)
                 continue
             a = analyze_script(sp, shallow=True)
             a["shallow"] = True
