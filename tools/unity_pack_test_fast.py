@@ -1105,5 +1105,186 @@ class TestUnity2DDestruction(unittest.TestCase):
                 pass                    # a refusal, with a line and a reason
 
 
+import tools.unity_pack_hybrid as unity_pack_hybrid  # noqa: E402
+
+_hybrid_ok, _hybrid_why = unity_pack_hybrid.available()
+needs_hybrid = unittest.skipUnless(_hybrid_ok, "--hybrid needs: " + _hybrid_why)
+
+
+@needs_cc
+@needs_hybrid
+class TestHybrid(unittest.TestCase):
+    """--hybrid: a script method the packer cannot lower runs as managed code on DotNetAnywhere, from its own C# source, over the same packed state.
+
+    Without it such a method is an empty stub and a CS8000 warning (the player prints `total=0` below).  With it the method runs: it reads
+    what native code wrote and native code reads what it wrote.  And a class whose managed code cannot be built keeps its stub: --hybrid never
+    changes what a pack that worked did."""
+
+    SCENE = (
+        "%%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Spark\n  m_Component:\n"
+        "  - component: {fileID: 2}\n  - component: {fileID: 3}\n"
+        "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+        "  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n%s")
+
+    def _project(self, script, values="  hp: 5\n  speed: 3\n"):
+        root = tempfile.mkdtemp(prefix="upack-hy-")
+        self.addCleanup(shutil.rmtree, root, True)
+        s = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(s)
+        with open(os.path.join(s, "Spark.cs"), "w") as f:
+            f.write(script)
+        with open(os.path.join(s, "Spark.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        sc = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(sc)
+        with open(os.path.join(sc, "S.unity"), "w") as f:
+            f.write(self.SCENE % values)
+        return root
+
+    def _pack(self, root, **kw):
+        out = tempfile.mkdtemp(prefix="upack-hy-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                unity_pack.pack(root, out, force=True, **kw)
+        except unity_pack.PackError as e:
+            e.stderr = err.getvalue()
+            raise
+        return out, err.getvalue()
+
+    def _play(self, out, frames=4):
+        """link the player (DotNetAnywhere in it, if the pack is hybrid) and run `frames` ticks from another directory: it must find its
+        managed assembly and corlib.dll beside itself, wherever it is started"""
+        with open(os.path.join(out, "harness.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int argc, char **argv) { int f;\n"
+                    "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f;\n"
+                    "  for (f = 1; f <= %d; f++) engine_tick(); return 0; }\n" % frames)
+
+        def run(cmd):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        objs, libs = unity_pack_hybrid.link_inputs(out, _CC, run, lambda m: None)
+        exe = os.path.join(out, "h")
+        run([_CC, "-O0", "-w", "-I", out, "-o", exe, os.path.join(out, "harness.c"),
+             os.path.join(out, "engine.c"), os.path.join(out, "data.c")] + objs + libs + ["-lm"])
+        other = tempfile.mkdtemp(prefix="upack-hy-cwd-")
+        self.addCleanup(shutil.rmtree, other, True)
+        r = subprocess.run([exe, "-logFile", "-"], cwd=other, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-1000:])
+        return r.stdout.split("\n")[:-1]
+
+    def _script(self, members):
+        return "using UnityEngine;\nusing System;\npublic class Spark : MonoBehaviour {\n" + members + "\n}\n"
+
+    # Update is lowered to C; Tally has a lambda, which the lowering cannot take.  hp starts at 5 and Update takes one off first.
+    TALLY = """
+    public int hp = 3;
+    public float speed = 2f;
+    public int total;
+    void Update() {
+        transform.position += new Vector3(speed * Time.deltaTime, 0, 0);
+        hp -= 1;
+        Tally();
+        Debug.Log("hp=" + hp + " total=" + total);
+    }
+    public void Tally() {
+        Func<int, int> sq = x => x * x + hp;
+        total = sq(3) + sq(4);
+    }"""
+
+    def test_a_stub_runs_as_managed_code_over_the_packed_state(self):
+        out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True)
+        self.assertNotIn("CS8000", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        # sq(3) + sq(4) = 25 + 2 * hp: native Update's hp, read by managed code; its total, read by native code
+        self.assertEqual(self._play(out), ["hp=4 total=33", "hp=3 total=31", "hp=2 total=29", "hp=1 total=27"])
+
+    def test_without_hybrid_it_is_still_a_stub(self):
+        out, err = self._pack(self._project(self._script(self.TALLY)))
+        self.assertIn("warning CS8000", err)
+        self.assertIn("`Spark.Tally` is not lowered yet", err)
+        for name in ("hybrid_glue.c", "hybrid.managed.dll", "hybrid.ffi.json", "hybrid_generated.cs"):
+            self.assertFalse(os.path.exists(os.path.join(out, name)), name)
+        self.assertEqual(self._play(out), ["hp=4 total=0", "hp=3 total=0", "hp=2 total=0", "hp=1 total=0"])
+
+    def test_a_pack_with_nothing_to_stub_has_no_hybrid_pieces(self):
+        out, err = self._pack(self._project(self._script(
+            "    public int hp;\n    void Update() { hp += 1; Debug.Log(\"hp=\" + hp); }")), hybrid=True)
+        self.assertNotIn("hybrid", err)
+        for name in ("hybrid_glue.c", "hybrid.managed.dll", "hybrid.ffi.json"):
+            self.assertFalse(os.path.exists(os.path.join(out, name)), name)
+
+    def test_managed_code_that_does_not_compile_keeps_its_stub(self):
+        # `Foo` is not in the managed UnityEngine: the class does not build, so it is exactly what a plain pack gives, with the reason added
+        root = self._project(self._script(
+            "    public int hp = 3;\n    public int total;\n"
+            "    void Update() { hp -= 1; Tally(); Debug.Log(\"hp=\" + hp + \" total=\" + total); }\n"
+            "    public void Tally() { total = Foo.Bar(hp); }"))
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("warning CS8000", err)
+        self.assertIn("hybrid: the managed code does not compile", err)
+        self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
+        self.assertEqual(self._play(out, 2), ["hp=4 total=0", "hp=3 total=0"])
+
+    def test_strict_is_met_when_managed_code_takes_the_method_and_refused_when_not(self):
+        out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True, strict=True)     # no error: nothing is dropped
+        self.assertNotIn("CS8000", err)
+        root = self._project(self._script("    public int hp;\n    public void Update() { hp = Foo.Bar(hp); }"))
+        with self.assertRaises(unity_pack.PackError) as cm:
+            self._pack(root, hybrid=True, strict=True)
+        self.assertIn("error CS8000", cm.exception.message)
+        self.assertIn("hybrid:", cm.exception.message)
+
+    def test_a_field_the_engine_stores_out_of_reach_is_not_copied(self):
+        # `dir` is a Vector2, which the packed engine keeps in two arrays managed code has no accessor for: a managed copy would silently
+        # disagree with it, so the class stays a stub
+        root = self._project(self._script(
+            "    public Vector2 dir;\n    public int total;\n"
+            "    void Update() { Tally(); Debug.Log(\"total=\" + total); }\n"
+            "    public void Tally() { Func<float, int> f = v => (int)(v * 10f); total = f(dir.x); }"),
+            values="  dir: {x: 2, y: 0}\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("warning CS8000", err)
+        self.assertIn("`Vector2 dir`", err)
+        self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
+
+    def test_managed_code_calls_a_lowered_method_and_uses_bool_and_float_fields(self):
+        root = self._project(self._script("""
+    public int hp = 3;
+    public int total;
+    public float speed = 2f;
+    public bool alive = true;
+    void Update() { Tally(); Debug.Log("hp=" + hp + " total=" + total + " alive=" + (alive ? 1 : 0)); }
+    public void Bump(int by) { hp += by; }
+    public void Tally() {
+        Func<int, int> twice = n => n * 2;
+        Bump(twice(2));
+        total = hp * 10;
+        if (hp > 8) alive = false;
+    }"""), values="  hp: 5\n  speed: 3\n  alive: 1\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertNotIn("CS8000", err)
+        # each tick: Bump(4) is a lowered method called from managed code; alive goes false once hp passes 8
+        self.assertEqual(self._play(out, 3), ["hp=9 total=90 alive=0", "hp=13 total=130 alive=0", "hp=17 total=170 alive=0"])
+
+    def test_without_the_toolchain_the_stub_is_reported_with_the_reason(self):
+        saved = os.environ.get("DNA_HOME")
+        os.environ["DNA_HOME"] = os.path.join(tempfile.gettempdir(), "no-such-dotnetanywhere")
+        try:
+            out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True)
+        finally:
+            if saved is None:
+                del os.environ["DNA_HOME"]
+            else:
+                os.environ["DNA_HOME"] = saved
+        self.assertIn("warning CS8000", err)
+        self.assertIn("hybrid: DotNetAnywhere not found", err)
+        self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
+
+
 if __name__ == "__main__":
     unittest.main()

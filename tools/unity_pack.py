@@ -13869,6 +13869,8 @@ def _emit_engine_class_groups(
                     n += 1
                 sym = "%s_%d" % (sym, n)
             used_syms.add(sym)
+            hy_params = ([(prm.type, prm.name) for prm in cs2cpp.parse_params(m.get("args") or "")]
+                         if plan.get("hybrid") else None)
             if not m.get("static") and not (m.get("args") or "").strip():
                 emitted_syms.setdefault((cname, m["name"]), sym)
             rty = _ret_c_ty(m.get("ret"), plan)
@@ -13943,8 +13945,26 @@ def _emit_engine_class_groups(
                 if hit:
                     why = ("field of an embedded struct written (its rows are"
                            " shared by copies, so they stay read-only)", hit)
+            hy_ok = False
+            if plan.get("hybrid") and not m.get("static") and not coll_param and m["name"] not in overloaded:
+                import tools.unity_pack_hybrid as _hy
+                hy_ok = _hy.signature_ok(
+                    cs2cpp.parse_params(m.get("args") or ""), m.get("ret"))
+                hy_info = {"name": m["name"], "sym": sym, "params": hy_params,
+                           "ret": (m.get("ret") or "void").strip(),
+                           "body": m.get("body") or "", "scalar": hy_ok}
+                if why is None:
+                    plan.setdefault("_hybrid_methods", {}).setdefault(
+                        cname, []).append(dict(hy_info, stub=False))
             if why is not None:
-                _report_stub(plan, site, cl, m, why)
+                if hy_ok:
+                    # reported by unity_pack_hybrid.apply, unless managed code takes the method
+                    plan.setdefault("_hybrid_deferred", []).append(
+                        (site, cl, m, why))
+                    plan.setdefault("_hybrid_cands", {}).setdefault(
+                        cname, []).append(hy_info)
+                else:
+                    _report_stub(plan, site, cl, m, why)
                 if not m.get("static"):
                     p("    (void)i;")
                 if coll_param:
@@ -13970,6 +13990,8 @@ def _emit_engine_class_groups(
                         p("    " + s.rstrip(";").rstrip() + ";")
                 p("    /* unlowered C# (GetComponentsInChildren / T[] / "
                   "leftover Instantiate / lambda / Type.Method) — stub */")
+                if hy_ok:
+                    p("    /* unity_pack:hybrid %s */" % sym)
                 # A stub of a value-returning method still returns one.
                 if rty and rty != "void":
                     p("    return %s;" % (
@@ -27605,7 +27627,7 @@ def pack(root, outdir, *args, **kwargs):
 
 def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
          gpu_handles=False, physics_inject=False, box2d_root=None,
-         coost_root=None):
+         coost_root=None, hybrid=False):
     """Pack the Unity-subset project at *root* into *outdir*.
 
     2D physics (Rigidbody2D, Collider2D) is Box2D-Packed: box2d_unity.py from
@@ -27618,6 +27640,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     Box2D's event arrays.
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
+    if hybrid:
+        force = True      # (the stamp does not know about --hybrid: a hybrid pack must not reuse a plain one, nor the reverse)
     _TYPE_DECL_ROOT[0] = os.path.abspath(root)
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
@@ -27979,6 +28003,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     if strict is None:
         strict = _godot.is_godot_project(root)
     plan["strict"] = bool(strict)
+    plan["hybrid"] = bool(hybrid)
     import tools.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
     if plan.get("_gpu_batch"):
@@ -27987,6 +28012,12 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         plan["gpu_atlas"] = _gpu.build_atlas(plan.get("textures") or [], outdir, root)
         _gpu.build_lights(plan, _load_sorting_layers(root))
     engine = emit_engine(plan, analyses, used_apis)
+    import tools.unity_pack_hybrid as _hybrid
+    if plan.get("hybrid"):
+        # a method the lowering left a stub: managed code on DotNetAnywhere where that compiles (tools/unity_pack_hybrid.py)
+        engine = _hybrid.apply(plan, engine, outdir, _report_stub, _progress)
+    else:
+        _hybrid.clean(outdir)
     _used_helpers = plan.pop("_cs_str_used", None) or set()
     _used_helpers = {h for h in _used_helpers if not re.search(
         r"^static [\w\s*]+\b%s\(" % re.escape(h), engine, re.M)}
@@ -28173,6 +28204,10 @@ def main():
     if "--gpu-handles" in args:
         gpu_handles = True
         args.remove("--gpu-handles")
+    hybrid = False
+    if "--hybrid" in args:
+        hybrid = True
+        args.remove("--hybrid")
     gpu_batch = False
     if "--gpu-batch" in args:
         gpu_batch = True
@@ -28231,11 +28266,13 @@ def main():
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
             "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
             "       [--physics-inject] [--box2d PATH] [--box2d-lto]"
-            " [--coost PATH]\n"
+            " [--coost PATH] [--hybrid]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  default layout:  SoA position tables (use --aos for AoS)\n"
-            "  --force:         ignore stamp; always re-emit and transpile\n")
+            "  --force:         ignore stamp; always re-emit and transpile\n"
+            "  --hybrid:        a method that cannot be lowered to C runs as managed\n"
+            "                   code on DotNetAnywhere (needs ../DotNetAnywhere, mcs)\n")
         return 2
     if outdir is None:
         outdir = default_pack_dir(args[0])
@@ -28243,7 +28280,7 @@ def main():
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
                     strict=strict, gpu_handles=gpu_handles, gpu_batch=gpu_batch,
                     physics_inject=physics_inject, box2d_root=box2d_root,
-                    coost_root=coost_root)
+                    coost_root=coost_root, hybrid=hybrid)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player",
             box2d_root=box2d_root, box2d_lto=box2d_lto)

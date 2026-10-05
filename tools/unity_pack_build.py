@@ -179,6 +179,12 @@ def build_player_executable(outdir, product, box2d_root=None, box2d_lto=False):
         physics_objs = [glue_o]
         physics_libs = [lib, "-lpthread"]
 
+    # --hybrid: DotNetAnywhere and the managed assembly (tools/unity_pack_hybrid.py)
+    import tools.unity_pack_hybrid as _hybrid
+    hybrid_objs, hybrid_libs = _hybrid.link_inputs(outdir, cc, _run, _progress)
+    physics_objs = physics_objs + hybrid_objs
+    physics_libs = physics_libs + hybrid_libs
+
     # OpenGL ES 3.1 by default -- what has SSBOs, for `--gpu-handles` --
     # and ES 2.0 for hardware without it (UNITY_PACK_GLES2=1).
     host = os.path.normpath(os.path.join(
