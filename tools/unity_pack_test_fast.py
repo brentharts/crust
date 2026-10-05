@@ -1271,6 +1271,23 @@ class TestHybrid(unittest.TestCase):
         # each tick: Bump(4) is a lowered method called from managed code; alive goes false once hp passes 8
         self.assertEqual(self._play(out, 3), ["hp=9 total=90 alive=0", "hp=13 total=130 alive=0", "hp=17 total=170 alive=0"])
 
+    def test_managed_code_may_index_an_array_with_a_uint_or_a_long(self):
+        # an unsigned or wide index is a conv.u / conv.i before the element opcode: DotNetAnywhere used to leave its evaluation stack misaligned
+        # and crash the player (fixed in its JIT, JIT_NARROW_INDEX_BELOW), where this method must simply run
+        root = self._project(self._script("""
+    public int total;
+    void Update() { Tally(); Debug.Log("total=" + total); }
+    public void Tally() {
+        int[] xs = new int[4];
+        Func<int, int> sq = n => n * n;
+        for (uint k = 0; k < 4; k++) xs[k] = sq((int)k + 1);
+        uint j = 2; long m = 3;
+        total = xs[j] * 100 + xs[m];
+    }"""), values="  total: 0\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 2), ["total=916", "total=916"])
+
     def test_without_the_toolchain_the_stub_is_reported_with_the_reason(self):
         saved = os.environ.get("DNA_HOME")
         os.environ["DNA_HOME"] = os.path.join(tempfile.gettempdir(), "no-such-dotnetanywhere")
