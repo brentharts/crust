@@ -565,7 +565,7 @@ def _lower_except(text, path="<cpp>"):
     is refused (declare it before the `try`). Everything else is plain
     statement rewriting.
     """
-    look = _strip_comments(text)
+    look = _code_view(text)
     if "except" not in look and _RAISE_RE.search(look) is None \
             and _TRY_RE.search(look) is None:
         # Nothing of ours in the file. (`try` is in the test on purpose:
@@ -600,8 +600,10 @@ def _lower_except(text, path="<cpp>"):
     if not fallible and _TRY_RE.search(look) is None \
             and _RAISE_RE.search(look) is None:
         return text, False
-    text = re.sub(r"(\))\s*except\b(\s*[;{])", r"\1\2", text)
-    look = _strip_comments(text)
+    # `) except {` -> `) {`: found in the code view, so a string that happens to contain it is left alone
+    for em in reversed(list(re.finditer(r"(\))\s*except\b(\s*[;{])", look))):
+        text = text[:em.end(1)] + text[em.start(2):]
+    look = _code_view(text)
 
     # Calls are recognized by *name*, whether spelled `f(..)`, `x.f(..)`
     # or `p->f(..)`. Coarse on purpose: if any class marks `take` as
@@ -623,7 +625,7 @@ def _lower_except(text, path="<cpp>"):
     def stmt_needs_check(seg, at=None):
         if call_re is None:
             return False
-        sl = _strip_comments(seg)
+        sl = _code_view(seg)
         for cm in call_re.finditer(sl):
             # The definition site of the function itself is not a call.
             before = sl[:cm.start()].rstrip()
@@ -665,7 +667,7 @@ def _lower_except(text, path="<cpp>"):
         # Hoisted: stripping comments per loop step made the walk
         # quadratic in the block size. Positions align with `body`, so
         # one strip serves every probe below.
-        lm = _strip_comments(body)
+        lm = _code_view(body)
 
         def line(at):
             return _src_line(look, off + at)
@@ -679,7 +681,7 @@ def _lower_except(text, path="<cpp>"):
             tm = _TRY_RE.match(lm, i)
             rm = _RAISE_RE.match(lm, i)
             if tm:
-                ob = body.find("{", tm.end())
+                ob = lm.find("{", tm.end())
                 if ob < 0:
                     raise CppError("%s: `try` without a block"
                                    % os.path.basename(path))
@@ -710,7 +712,7 @@ def _lower_except(text, path="<cpp>"):
                 # destructor call will later be placed. A destructor the
                 # error path silently skips is a leak dressed as
                 # handling, so it is refused with the fix in hand.
-                tl = _strip_comments(tbody)
+                tl = _code_view(tbody)
                 for cn in classes:
                     if re.search(r"(?<![\w.>])%s\s+[A-Za-z_]\w*\s*[(;=]"
                                  % re.escape(cn), tl):
@@ -874,7 +876,7 @@ def _lower_except(text, path="<cpp>"):
             base = [("fn", fallible[name])]
         else:
             base = [("none", None)]
-        lb = _strip_comments(body)
+        lb = _code_view(body)
         if _TRY_RE.search(lb) or _RAISE_RE.search(lb) \
                 or stmt_needs_check(lb + ";"):
             body = walk(body, base, ob + 1)
@@ -888,7 +890,7 @@ def _lower_except(text, path="<cpp>"):
     # destructor body -- ordinary methods and free functions were walked
     # above. Same position as the `except`-on-a-constructor refusal, and
     # the same fix.
-    leftover = _strip_comments(new)
+    leftover = _code_view(new)
     lm = _TRY_RE.search(leftover) or _RAISE_RE.search(leftover)
     if lm:
         raise CppError(
@@ -1051,6 +1053,49 @@ def _strip_comments(text):
             pos = i + 1
     out.append(text[last:])
     return "".join(out)
+
+
+_LITERAL_OPEN = re.compile(r"[\"']")
+
+
+def _mask_literals(text):
+    """Blank the INSIDE of string and character literals, keeping the quotes, the length and every newline.
+
+    For a scan that must see code only. `_strip_comments` keeps literals as they are, so a keyword inside one (`"this must raise no event"`,
+    `"please try again"`) was found by the scans that look for `raise`, `try` and `except`, and a `;` inside one was taken for the end of a
+    statement. Comments must already be blanked (`_strip_comments` first), or an apostrophe in a comment could open a literal. Raw string
+    literals and C++14 digit separators (`1'000`) are not supported by this subset, here or in `_match_brace` and `_strip_comments`, which read every `'`
+    as a quote; they are not handled. A literal left open at a line's end is closed there: a stray quote costs one
+    line, not the rest of the file.
+    """
+    n = len(text)
+    out, last, pos = [], 0, 0
+    while True:
+        m = _LITERAL_OPEN.search(text, pos)
+        if m is None:
+            break
+        i = m.start()
+        q = text[i]
+        j = i + 1
+        while j < n and text[j] != q:
+            if text[j] == "\\":
+                j += 2
+            elif text[j] == "\n":
+                break
+            else:
+                j += 1
+        j = min(j, n)
+        out.append(text[last:i + 1])
+        out.append(_NOT_NEWLINE.sub(" ", text[i + 1:j]))
+        last = j
+        pos = j + 1 if j < n and text[j] == q else j
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _code_view(text):
+    """`text` with comments and the insides of literals blanked, at the same length: what is left is code, and offsets in it are offsets in `text`."""
+    return _mask_literals(_strip_comments(text))
 
 
 _PROBE_START = re.compile(r"\*|(?<!\w)\w")
