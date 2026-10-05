@@ -85,6 +85,7 @@ Hardware:
 - [BAREMETAL_THREADS.md](BAREMETAL_THREADS.md)
 
 Crust Papers:
+- https://doi.org/10.5281/zenodo.23170050 "From LaTeX and OCaml to LEAN4 and Executables: Lean-Checked Theorems and Generating Proof-Carrying Rust"
 - https://doi.org/10.5281/zenodo.22907133 "Proof-Carrying Rust: Logic safety on top of memory safety, in a toolchain small enough to read"
 - https://dx.doi.org/10.2139/ssrn.7396160 "Memory Safety Where it is Needed: Proof-guided Runtime Checking in a Toolchain Small Enough to Read"
 - https://dx.doi.org/10.2139/ssrn.7382398 "A Successor Discipline, Not a Successor Language: Safety by Subtraction in a Self-Contained C++ Toolchain"
