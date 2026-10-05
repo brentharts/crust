@@ -273,6 +273,8 @@ def glue_c(cands_by_class, ok_names):
            "\t\tif (s != NULL) {", "\t\t\tsnprintf(s + 1, n - (size_t)(s + 1 - buf), \"%s\", \"" + ASSEMBLY + "\");",
            "\t\t\tif (access(buf, R_OK) == 0) return buf;", "\t\t}", "\t}", "\treturn \"" + ASSEMBLY + "\";", "}", "",
            "static void hy_ensure(void) {", "\tchar buf[4096];", "\tconst char *path;", "\tif (hy_asm != NULL) return;", "\tpath = hy_dll_path(buf, sizeof buf);",
+           "\tif (access(path, R_OK) != 0) { fprintf(stderr, \"unity_pack: cannot load the managed assembly %s (it belongs beside the player; "
+           "UNITY_PACK_MANAGED_DLL names another)\\n\", path); exit(70); }",
            "\tDNA_SetCrashMode(1);", "\tDNA_SetAssemblyDirFromFile(path);", "\tDNA_Init();", "\thy_asm = DNA_Load(path);",
            "\tif (hy_asm == NULL) { fprintf(stderr, \"unity_pack: cannot load the managed assembly: %s\\n\", DNA_Error()); exit(70); }", "}", "",
            "static DNA_Method *hy_find(const char *cls, const char *name, const char *sig) {", "\tDNA_Method *m;", "\thy_ensure();",

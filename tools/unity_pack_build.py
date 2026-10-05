@@ -39,6 +39,24 @@ def emit_makefile(outdir, box2d=False, box2d_inject=False):
     py = sys.executable
     physics_objs = " physics_box2d.o" if box2d else ""
     physics_libs = " box2d/libbox2d.a -lpthread" if box2d else ""
+    # --hybrid (tools/unity_pack_hybrid.py): DotNetAnywhere and the managed assembly are part of the player
+    import tools.unity_pack_hybrid as _hybrid
+    hybrid = os.path.isfile(os.path.join(outdir, "hybrid_glue.c")) and _hybrid.dna_home() is not None
+    hybrid_objs = " hybrid_glue.o" if hybrid else ""
+    hybrid_libs = " $(DNA_BUILD)/libdna_ffi.a -lpthread" if hybrid else ""
+    hybrid_rule = ""
+    if hybrid:
+        hybrid_rule = (
+            "# --hybrid: a script method that could not be lowered to C runs as managed code on DotNetAnywhere\n"
+            "DNA_HOME ?= %s\n"
+            "DNA_BUILD ?= $(CURDIR)/dna_build\n"
+            "hybrid_glue.o: hybrid_glue.c\n"
+            "\t$(CC) -O2 -I $(DNA_HOME)/native/src -c -o $@ $<\n"
+            "$(DNA_BUILD)/libdna_ffi.a: hybrid.ffi.json\n"
+            "\t$(CRUST_PY) $(DNA_HOME)/build.py --lib-only --build-dir $(DNA_BUILD)\n"
+            "\t$(CRUST_PY) $(DNA_HOME)/build.py --ffi hybrid.ffi.json --lib-only --no-corlib --build-dir $(DNA_BUILD)\n"
+            "corlib.dll: $(DNA_BUILD)/libdna_ffi.a\n"
+            "\tcp $(DNA_BUILD)/corlib.dll $@\n") % _hybrid.dna_home()
     physics_rule = ""
     if box2d:
         physics_rule = (
@@ -66,9 +84,10 @@ def emit_makefile(outdir, box2d=False, box2d_inject=False):
         "\t$(CC) -O2 -c -o $@ $<\n"
     ) % (repo, py)
     link = (
-        "game: engine.o data.o main.o%s\n"
-        "\t$(CC) -O2 -o $@ engine.o data.o main.o%s%s -lm\n"
-    ) % (physics_objs, physics_objs, physics_libs)
+        "game: engine.o data.o main.o%s%s%s\n"
+        "\t$(CC) -O2 -o $@ engine.o data.o main.o%s%s%s%s -lm\n"
+    ) % (physics_objs, hybrid_objs, " corlib.dll hybrid.managed.dll" if hybrid else "",
+         physics_objs, hybrid_objs, physics_libs, hybrid_libs)
     tail = (
         "# Clang remarks: which loops miss auto-vectorization (stderr).\n"
         "vectorize-report: engine.c\n"
@@ -86,8 +105,8 @@ def emit_makefile(outdir, box2d=False, box2d_inject=False):
         "clean:\n"
         "\trm -f engine.o data.o main.o game engine.vectorize.o "
         "engine.crust.o data.crust.o main.crust.o%s\n"
-    ) % physics_objs
-    return head + physics_rule + link + tail
+    ) % (physics_objs + hybrid_objs)
+    return head + physics_rule + hybrid_rule + link + tail
 
 
 def exe_filename(product):

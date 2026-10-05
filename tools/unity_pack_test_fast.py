@@ -1288,6 +1288,30 @@ class TestHybrid(unittest.TestCase):
         self.assertNotIn("CS8000", err)
         self.assertEqual(self._play(out, 2), ["total=916", "total=916"])
 
+    @unittest.skipUnless(shutil.which("make"), "needs make")
+    def test_make_builds_a_hybrid_player_that_runs_its_managed_assembly(self):
+        out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True)
+        mk = subprocess.run(["make", "-C", out, "game", "CC=" + _CC, "DNA_BUILD=" + unity_pack_hybrid.build_dir()],
+                            capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout[-800:] + mk.stderr[-1200:])
+        game = os.path.join(out, "game")
+        for name in ("corlib.dll", "hybrid.managed.dll"):
+            self.assertTrue(os.path.exists(os.path.join(out, name)), name)
+        other = tempfile.mkdtemp(prefix="upack-hy-cwd-")
+        self.addCleanup(shutil.rmtree, other, True)
+        r = subprocess.run([game], cwd=other, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertIn("ticks=60", r.stdout)
+        # Update calls the managed Tally on every tick, so a player that cannot load its assembly must stop, saying why
+        env = dict(os.environ, UNITY_PACK_MANAGED_DLL=os.path.join(other, "missing.dll"))
+        r = subprocess.run([game], cwd=other, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 70)
+        self.assertIn("cannot load the managed assembly", r.stderr)
+        # and `make clean` takes what it built away
+        subprocess.run(["make", "-C", out, "clean"], capture_output=True, text=True)
+        self.assertFalse(os.path.exists(game))
+        self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.o")))
+
     def test_without_the_toolchain_the_stub_is_reported_with_the_reason(self):
         saved = os.environ.get("DNA_HOME")
         os.environ["DNA_HOME"] = os.path.join(tempfile.gettempdir(), "no-such-dotnetanywhere")
