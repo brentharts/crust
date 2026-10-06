@@ -8250,7 +8250,12 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 continue
             text = cs2cpp.code_sub(pat + r"\s*\.\s*Length\b",
                                    "(int)%s.size()" % alias, text)
-            text = bind + "\n" + cs2cpp.code_sub(pat, alias, text)
+            # a whole-array store goes to the row: cpprust cannot assign
+            # through the reference
+            text = cs2cpp.code_sub(pat + r"(?=\s*=(?!=))", "%s_%s[%s]" % (
+                oidn, fname, "i" if ocname == this else inst), text)
+            # same line: the body's lines stay the C# lines (NRE sites)
+            text = bind + " " + cs2cpp.code_sub(pat, alias, text)
         # Other.Instance / Other.instance — including Other.Instance.unknownField
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
@@ -13593,11 +13598,23 @@ def _emit_engine_get_components_in_children(
             if tname == "RectTransform":
                 p("        out.push_back(go);")
             elif collectors:
-                # Unity polymorphism: Weapon finds Blaster : Weapon, etc.
+                # Unity polymorphism: Weapon finds Blaster : Weapon, etc. --
+                # but the result holds bare row indices its users read as
+                # Weapon rows, so finding a subclass stops.
+                # ponytail: needs class-tagged references to go further
                 for cname in collectors:
                     cidn = _c_ident(cname)
                     p("        ci = GameObject_GetComponent_%s(go);" % cidn)
-                    p("        if (ci >= 0) out.push_back(ci);")
+                    if cname == tname:
+                        p("        if (ci >= 0) out.push_back(ci);")
+                        continue
+                    p("        if (ci >= 0) {")
+                    p("            fprintf(stderr, \"GetComponentsInChildren<%s>"
+                      " found a %s: crust holds it as a %s row index only;"
+                      " stopping rather than misreading it\\n\");"
+                      % (tname, cname, tname))
+                    p("            exit(70);")
+                    p("        }")
             else:
                 p("        ci = GameObject_GetComponent_%s(go);" % idn)
                 p("        if (ci >= 0) out.push_back(ci);")
@@ -13633,6 +13650,11 @@ def _emit_engine_find_object_of_type(
                 p("        if (_engine_go_destroyed[go]) continue;")
             if _multi_scene(plan):
                 p("        if (!_engine_go_in_loaded_scene(go)) continue;")
+            asset = plan.get("go_asset_active")
+            if want_ui and asset:
+                # an unplaced prefab is an asset: never found
+                p("        if (go < %d && _engine_go_asset_active[go] >= 0)"
+                  " continue;" % len(asset))
             p("        ci = _engine_go_%s[go];" % idn)
             p("        if (ci < 0) continue;")
             if want_ui:
@@ -23536,6 +23558,8 @@ def _lower_reference_game_objects(text, cl, plan, site):
         text = cs2cpp.code_sub(
             r"(?<![\w.])(?:Object\s*\.\s*)?Destroy\s*\(\s*" + q[len(
                 r"(?<![\w.])"):] + r"\s*\)", "Object_Destroy(%s)" % go, text)
+        text = cs2cpp.code_sub(q + r"\s*\.\s*activeSelf\b(?!\s*[.=])",
+                               "GameObject_activeSelf(%s)" % go, text)
         text = cs2cpp.code_sub(q + r"\b(?!\s*\.)", go, text)
     return text
 
@@ -24628,6 +24652,58 @@ def _desugar_drop_achievements_sounds(text, where):
         % (where, ", ".join(str(n) for n in sorted(
             {text.count("\n", 0, a + len(scan[a:b]) - len(scan[a:b].lstrip()))
              + 1 for a, b in spans}))))
+    return text
+
+
+def _item_gain_types(files):
+    """Slime Jump's item system: an `Item` class with a virtual `OnGain`,
+    and every class under it."""
+    if not any(re.search(r"\bclass\s+Item\b[^{]*\{[\s\S]*?\bvirtual\s+void"
+                         r"\s+OnGain\s*\(", t) for t in files):
+        return set()
+    bases = {}
+    for t in files:
+        for c, b in re.findall(r"\bclass\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*(\w+)",
+                               t):
+            bases.setdefault(b, set()).add(c)
+    out, todo = set(), ["Item"]
+    while todo:
+        c = todo.pop()
+        if c not in out:
+            out.add(c)
+            todo.extend(bases.get(c, ()))
+    return out
+
+
+def _desugar_drop_item_gains(text, where, item_types):
+    """`items = x.GetComponentsInChildren<Item>();` for the item system
+    (`_item_gain_types`: lasso, blaster and useable items, out of scope) is
+    dropped with a warning, so the arrays stay empty and the `OnGain` loops
+    over them run no pass. The statement becomes `;`; lines stay put.
+
+    ponytail: the player gains no items. Upgrade: class-tagged references
+    with a virtual OnGain dispatch."""
+    if not item_types or "GetComponentsInChildren" not in text:
+        return text
+    scan = cs2cpp._blank(text)
+    pat = re.compile(
+        r"(?<![\w.])(?:this\s*\.\s*)?\w+\s*=\s*(?:\w+\s*\.\s*)?"
+        r"GetComponentsInChildren\s*<\s*(?:%s)\s*>\s*\([^;{}]*\)\s*;"
+        % "|".join(re.escape(t) for t in sorted(item_types)))
+    lines = []
+    for m in reversed(list(pat.finditer(scan))):
+        before = scan[:m.start()].rstrip()
+        if not (before[-1:] in ";{})" or re.search(r"\belse$", before)):
+            continue
+        lines.append(text.count("\n", 0, m.start()) + 1)
+        text = (text[:m.start()] + ";" + re.sub(
+            r"[^\n]", " ", text[m.start() + 1:m.end()]) + text[m.end():])
+    if lines:
+        sys.stderr.write(
+            "unity_pack: warning: %s: lines %s: item GetComponentsInChildren "
+            "stores are dropped (lasso / blaster / items are not lowered; "
+            "the arrays stay empty)\n"
+            % (where, ", ".join(str(n) for n in sorted(lines))))
     return text
 
 
@@ -26129,12 +26205,12 @@ def _late_call_members(text, plan):
                 [call[call.index("(") + 1:-1]] + a), True)
     return _call_suffix_sub(
         text, gos,
-        r"\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
-        r"(?!\s*\.)",
-        lambda call, mm: (
-            "GameObject_activeSelf(%s)" % call if mm.group(1) == "activeSelf"
-            else "GameObject_SetActive(%s, " % call if mm.group(1)
-            else call))
+        r"(?:\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
+        r"|\s*\.\s*(activeSelf\b|SetActive\s*\())(?!\s*\.)",
+        lambda call, mm: (lambda g: (
+            "GameObject_activeSelf(%s)" % call if g == "activeSelf"
+            else "GameObject_SetActive(%s, " % call if g
+            else call))(mm.group(1) or mm.group(2)))
 
 
 _COLLIDER2D_FIELD_TYPES = frozenset((
@@ -28694,6 +28770,7 @@ def pack(root, outdir, *args, **kwargs):
             _common.SOURCE_ENABLED_WRITTEN.update(re.findall(
                 r"(\w+)\s*(?:\[\s*\])?\s+%s\b" % re.escape(r), scan))
     _has_remove = _phys.has_standard_remove(files.values())
+    _items = _item_gain_types(files.values())
     _n = [0]
     for fp in sorted(files):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
@@ -28704,6 +28781,7 @@ def pack(root, outdir, *args, **kwargs):
                                        _ia_serialized.get(os.path.abspath(fp)))
         t = _desugar_destroy_immediate(t)
         t = _desugar_drop_achievements_sounds(t, os.path.relpath(fp, root))
+        t = _desugar_drop_item_gains(t, os.path.relpath(fp, root), _items)
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)

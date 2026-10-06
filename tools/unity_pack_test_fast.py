@@ -1905,6 +1905,68 @@ def _run_rc(test, out, frames=1):
     return run.returncode, run.stdout, run.stderr
 
 
+class TestPlayerAwakeItems(unittest.TestCase):
+    """Slime Jump's Player.Awake item loop, over a `Gear` class: a field
+    array stored from GetComponentsInChildren<Gear>,
+    `item.gameObject.activeSelf` and `item.OnGain(this)` on a typed local.
+    The result holds bare Gear row indices, so finding a subclass stops
+    instead of misreading it. Named `Item` it is Slime Jump's item system,
+    out of scope: the store goes and the loop runs no pass."""
+
+    A = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+         "    public Transform itemsParent;\n    public int got;\n"
+         "    Item[] items;\n    void Awake() {\n"
+         "        items = itemsParent.GetComponentsInChildren<Item>();\n"
+         "        for (int i = 0; i < items.Length; i ++) {\n"
+         "            Item item = items[i];\n"
+         "            if (item.gameObject.activeSelf)\n"
+         "                item.OnGain (this);\n        }\n"
+         "        Debug.Log(\"got \" + got);\n    }\n}\n")
+    ITEM = ("using UnityEngine;\npublic class Item : MonoBehaviour {\n"
+            "    public int v;\n"
+            "    public virtual void OnGain (A a) { a.got += v; }\n}\n")
+
+    def _root(self, scripts, child):
+        root = project(self, scripts, [("A", None, "  itemsParent: {fileID: 101}\n"),
+                                       (child, None, "  v: 5\n")])
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            text = f.read().replace(
+                "Transform:\n  m_GameObject: {fileID: 110}\n",
+                "Transform:\n  m_GameObject: {fileID: 110}\n"
+                "  m_Father: {fileID: 101}\n")
+        with open(sc, "w") as f:
+            f.write(text)
+        return root
+
+    def _gear(self, extra=()):
+        s = {"A": self.A.replace("Item", "Gear"),
+             "Gear": self.ITEM.replace("Item", "Gear")}
+        s.update(extra)
+        return s
+
+    @needs_cc
+    def test_items_loop(self):
+        root = self._root(self._gear(), "Gear")
+        self.assertIn("got 5", run_frames(self, pack(self, root), 1))
+
+    @needs_cc
+    def test_item_system_dropped(self):
+        root = self._root({"A": self.A, "Item": self.ITEM}, "Item")
+        self.assertIn("got 0", run_frames(self, pack(self, root, False), 1))
+
+    @needs_cc
+    def test_subclass_found_stops(self):
+        b = ("using UnityEngine;\npublic class Blaster : Gear {\n"
+             "    public override void OnGain (A a) { a.got += 100; }\n}\n")
+        root = self._root(self._gear({"Blaster": b}), "Blaster")
+        rc, out, err = _run_rc(self, pack(self, root, strict=False))
+        self.assertEqual(rc, 70, out + err)
+        self.assertIn("GetComponentsInChildren<Gear> found a Blaster", err)
+        self.assertIn("A.Awake () (at Assets/Scripts/A.cs:7:", err)
+        self.assertNotIn("got", out)
+
+
 class TestUnpackedClassCall(unittest.TestCase):
     """`g.Use();` on a class crust packs no methods of (Slime Jump's
     `World.Instance.SetPieces()`, `fallerObject.Awake()`): Unity's NRE for
