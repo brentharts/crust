@@ -2084,6 +2084,17 @@ class TestLiveScaleSpriteHalf(unittest.TestCase):
         # 8 px at 8 px per unit, scale 2: 2 units wide
         self.assertEqual(self._draws(), ["half 1 1 at 0.000 0.000"])
 
+    @needs_cc
+    def test_pivot_offsets_the_quad_in_its_frame(self):
+        # Slime Jump's platforms (pivot 0.52, 0.56) drew centred, 0.12 high.
+        # Bottom-centre pivot (alignment 7), turned 90 degrees: the quad's
+        # centre is 1 along the turned +y, i.e. at (-1, 0)
+        h = 0.5 ** 0.5
+        self.assertEqual(self._draws("  alignment: 7\n", (h, h)),
+                         ["half 1 1 at -1.000 0.000"])
+        self.assertEqual(self._draws(
+            "  alignment: 9\n  spritePivot: {x: 0.25, y: 0.5}\n"),
+            ["half 1 1 at 0.500 0.000"])
 
 
 class TestUnpackedClassCall(unittest.TestCase):

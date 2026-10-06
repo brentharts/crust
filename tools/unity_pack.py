@@ -17692,6 +17692,17 @@ def _emit_engine_class_draws(
             p("        static const float _spr_oy[] = { %s };" % ", ".join(
                 "%sf" % repr(float(sp.get("draw_off_y") or 0.0))
                 for _i, sp in spr_idx))
+        # the sprite's pivot sits on the transform: the quad's centre is
+        # off it by (0.5 - pivot) of the size, in the quad's own frame
+        # ponytail: the authored sprite's pivot, kept when an animation
+        # swaps the sprite
+        pivs = [sp.get("pivot") or (0.5, 0.5) for _i, sp in spr_idx]
+        use_piv = any(tuple(map(float, pv)) != (0.5, 0.5) for pv in pivs)
+        if use_piv:
+            p("        static const float _spr_pvx[] = { %s };" % ", ".join(
+                "%sf" % repr(1.0 - 2.0 * float(pv[0])) for pv in pivs))
+            p("        static const float _spr_pvy[] = { %s };" % ", ".join(
+                "%sf" % repr(1.0 - 2.0 * float(pv[1])) for pv in pivs))
         p("        static const int _spr_layer[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_order[] = { %s };" % ", ".join(
@@ -17934,6 +17945,16 @@ def _emit_engine_class_draws(
             p("            out[n].m01 = _spr_m01[k];")
             p("            out[n].m10 = _spr_m10[k];")
             p("            out[n].m11 = _spr_m11[k];")
+        if use_piv:
+            p("            if (%s_spr_pvx[k] != 0.f || _spr_pvy[k] != 0.f) {"
+              % ("!_spr_ui[k] && " if any_ui else ""))
+            p("                float dx = _spr_pvx[k] * out[n].half_w;")
+            p("                float dy = _spr_pvy[k] * out[n].half_h;")
+            p("                out[n].x = out[n].x + out[n].m00 * dx"
+              " + out[n].m01 * dy;")
+            p("                out[n].y = out[n].y + out[n].m10 * dx"
+              " + out[n].m11 * dy;")
+            p("            }")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
