@@ -2009,6 +2009,83 @@ class TestSharedTransformRow(unittest.TestCase):
                          [(1, 0, "Player")])
 
 
+class TestLiveScaleSpriteHalf(unittest.TestCase):
+    """Slime Jump's walls (scale 2, a Transform field's target, so a live
+    localScale): the sprite half held the authored scale and the draw
+    multiplied by the localScale again, twice Unity's size."""
+
+    def _draws(self, meta="", rot=(0, 1)):
+        """A scale-2 wall (8 px at 8 px per unit) with *meta* in its sprite's
+        importer, turned by the quaternion (z, w) *rot*: its draws'
+        `half hw hh at x y`."""
+        import struct
+        import zlib
+        root = tempfile.mkdtemp(prefix="upack-ls-")
+        self.addCleanup(shutil.rmtree, root, True)
+        sd = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(sd)
+        for name, src, guid in (
+                ("Wall", "using UnityEngine;\npublic class Wall : MonoBehaviour"
+                 " { }\n", "a" * 32),
+                ("Holder", "using UnityEngine;\npublic class Holder :"
+                 " MonoBehaviour {\n    public Transform t;\n    void Update()"
+                 " { if (t == null) Debug.Log(\"none\"); }\n}\n", "b" * 32)):
+            with open(os.path.join(sd, name + ".cs"), "w") as f:
+                f.write(src)
+            with open(os.path.join(sd, name + ".cs.meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        with open(os.path.join(sd, "q.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 32) * 8))
+                    + chunk(b"IEND", b""))
+        with open(os.path.join(sd, "q.png.meta"), "w") as f:
+            f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n"
+                    % ("c" * 32) + meta)
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Wall\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: %s, w: %s}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 2, y: 2, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_Sprite: {fileID: 21300000, guid: %s,"
+                " type: 3}\n  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Holder\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 5, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                "  t: {fileID: 2}\n"
+                % (rot[0], rot[1], "a" * 32, "c" * 32, "b" * 32))
+        out = pack(self, root, strict=False)
+        return [ln.replace("-0.000", "0.000") for ln in run_frames(
+            self, out, 1, body=(
+            "EngineDraw b[8]; int n = engine_collect_draws(b, 8), k;\n"
+            "  for (k = 0; k < n; k++) if (b[k].tex >= 0)"
+            " printf(\"half %g %g at %.3f %.3f\\n\", b[k].half_w, b[k].half_h,"
+            " b[k].x, b[k].y);"))]
+
+    @needs_cc
+    def test_scaled_target_draws_unity_size(self):
+        # 8 px at 8 px per unit, scale 2: 2 units wide
+        self.assertEqual(self._draws(), ["half 1 1 at 0.000 0.000"])
+
+
+
 class TestUnpackedClassCall(unittest.TestCase):
     """`g.Use();` on a class crust packs no methods of (Slime Jump's
     `World.Instance.SetPieces()`, `fallerObject.Awake()`): Unity's NRE for

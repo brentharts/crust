@@ -17832,10 +17832,14 @@ def _emit_engine_class_draws(
                 p(ind + "out[n].half_h = _spr_hh[k];")
                 p(ind + "out[n].tex = _spr_tex[k];")
             if use_scale:
-                p(ind + "out[n].half_w = out[n].half_w * _%s_scale_x[i];"
-                  % idn)
-                p(ind + "out[n].half_h = out[n].half_h * _%s_scale_y[i];"
-                  % idn)
+                # the halves hold the authored world scale: the live
+                # localScale over the authored one
+                # ponytail: an authored 0 scale stays 0 (its halves hold
+                # no size to scale back up)
+                for ax, half in (("x", "half_w"), ("y", "half_h")):
+                    p(ind + "if (_%s_scale0_%s[i] != 0.f) out[n].%s = "
+                      "out[n].%s * _%s_scale_%s[i] / _%s_scale0_%s[i];"
+                      % (idn, ax, half, half, idn, ax, idn, ax))
 
         if any_ui:
             p("            if (_spr_ui[k]) {")
@@ -18609,6 +18613,8 @@ def emit_engine(plan, analyses, used_apis):
         n = max(1, plan["classes"][cname]["n"])
         p("extern float _%s_scale_x[%d];" % (idn, n))
         p("extern float _%s_scale_y[%d];" % (idn, n))
+        p("extern const float _%s_scale0_x[%d];" % (idn, n))
+        p("extern const float _%s_scale0_y[%d];" % (idn, n))
     for cname in sorted(plan.get("live_rot_classes") or []):
         if cname not in plan["classes"]:
             continue
@@ -27087,6 +27093,11 @@ def emit_data(plan, used_apis=None):
         p("float _%s_scale_x[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sys)))
+        # the authored localScale: sprite halves hold it already
+        p("const float _%s_scale0_x[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
+        p("const float _%s_scale0_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
     # Live localRotation for Transform.Rotate / LookAt / eulerAngles / rotation.
     for cname in sorted(plan.get("live_rot_classes") or []):
