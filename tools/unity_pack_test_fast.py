@@ -1988,6 +1988,27 @@ class TestChildColliderBody(unittest.TestCase):
                           for c in cols], [(0, 0, 0), (1, -1, 2)])
 
 
+class TestSharedTransformRow(unittest.TestCase):
+    """Slime Jump's Player GameObject also carries a `Test` script: its
+    Graphics child followed the Test row, which nothing moves, so the
+    sprite hung at the spawn while the Rigidbody2D fell."""
+
+    def test_child_follows_rigidbody_row(self):
+        plan = {"classes": {
+            "Test": {"instances": [{"xf_id": "10"}]},
+            "Player": {"instances": [{"xf_id": "10", "rigidbody2d": {"body_type": 0}}],
+                       "fields": [{"name": "t", "ty": "Transform"}]},
+            "Graphics": {"instances": [{"xf_id": "20", "father_id": "10"}]}}}
+        plan["classes"]["Player"]["instances"][0]["object_refs"] = {"t": "10"}
+        unity_pack._attach_transform_parents(plan)
+        g = plan["classes"]["Graphics"]["instances"][0]
+        self.assertEqual((g["xf_parent_class"], g["xf_parent_inst"]),
+                         ("Player", 0))
+        unity_pack._resolve_transform_field_targets(plan)
+        self.assertEqual(plan["transform_field_targets"][("Player", "t")],
+                         [(1, 0, "Player")])
+
+
 class TestUnpackedClassCall(unittest.TestCase):
     """`g.Use();` on a class crust packs no methods of (Slime Jump's
     `World.Instance.SetPieces()`, `fallerObject.Awake()`): Unity's NRE for

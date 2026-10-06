@@ -5515,6 +5515,26 @@ def _gcic_resolve_type(tname):
     return _GCIC_TYPE_ALIAS.get(tname, tname)
 
 
+def _xf_rows(plan):
+    """Transform fileID → the packed (class, inst) that stands for it.
+
+    Several MonoBehaviours on one GameObject each hold a position copy:
+    the Rigidbody's row is the one physics moves, else the first class by
+    name, as _engine_go_xf picks at runtime."""
+    xf_to, xf_rb = {}, set()
+    for cname in sorted(plan["classes"]):
+        for i, o in enumerate(plan["classes"][cname].get("instances") or []):
+            xid = o.get("xf_id")
+            if xid is None or str(xid) == "0":
+                continue
+            rb = bool(o.get("rigidbody2d") or o.get("rigidbody"))
+            if str(xid) not in xf_to or (rb and str(xid) not in xf_rb):
+                xf_to[str(xid)] = (cname, i)
+                if rb:
+                    xf_rb.add(str(xid))
+    return xf_to
+
+
 def _attach_transform_parents(plan):
     """Wire authored m_Father → packed parent for live world composition.
 
@@ -5525,12 +5545,7 @@ def _attach_transform_parents(plan):
     Main Camera under a packed body follows the same rule via Camera_main_pos_*.
     """
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    xf_to = {}
-    for cname, cl in plan["classes"].items():
-        for i, o in enumerate(cl.get("instances") or []):
-            xid = o.get("xf_id")
-            if xid is not None and str(xid) != "0":
-                xf_to[str(xid)] = (cname, i)
+    xf_to = _xf_rows(plan)
     any_parent = False
     for cname, cl in plan["classes"].items():
         for i, o in enumerate(cl.get("instances") or []):
@@ -5589,12 +5604,7 @@ def _resolve_transform_field_targets(plan):
     Player.graphicsTrs → Graphics Transform fileID → Graphics instance.
     """
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    xf_to = {}
-    for cname, cl in plan["classes"].items():
-        for i, o in enumerate(cl.get("instances") or []):
-            xid = o.get("xf_id")
-            if xid is not None and str(xid) != "0":
-                xf_to[str(xid)] = (cname, i)
+    xf_to = _xf_rows(plan)
     targets = {}
     scale_classes = set()
     for cname, cl in plan["classes"].items():
@@ -25182,7 +25192,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     # first: their warnings point into the source by offset
-    body = _trap_shallow_calls(_drop_sprite_swaps(_drop_shader_params(body, plan, site), plan, site), plan, site)
+    body = _trap_shallow_calls(_drop_sprite_swaps(
+        _drop_shader_params(body, plan, site), plan, site), plan, site)
     # the packed instance index is `i`: a C# local of that name (a loop
     # counter) would take its place in every field access below
     if any(m.group(1) not in ("return", "else", "case", "goto", "throw",
