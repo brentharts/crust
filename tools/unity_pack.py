@@ -8048,9 +8048,9 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 r"([^;]+);"
                 % (re.escape(ocname), re.escape(vf)),
                 lambda m, o=oidn, f=vf, ix=inst: (
-                    "%s_set_%s_x(%s, Vector2_x(%s)); "
-                    "%s_set_%s_y(%s, Vector2_y(%s));"
-                    % (o, f, ix, m.group(1), o, f, ix, m.group(1))),
+                    "{ Vector2 _v2 = (%s); %s_set_%s_x(%s, _v2.x); "
+                    "%s_set_%s_y(%s, _v2.y); }"
+                    % (m.group(1), o, f, ix, o, f, ix)),
                 text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
@@ -25008,8 +25008,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=(?!=)\s*(.+?)\s*;" % re.escape(vf),
             lambda m, name=vf: (
-                "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
-                % (idn, name, m.group(1), idn, name, m.group(1))),
+                "{ Vector2 _v2 = (%s); %s_set_%s_x(i, _v2.x); "
+                "%s_set_%s_y(i, _v2.y); }"
+                % (m.group(1), idn, name, idn, name)),
             text)
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
@@ -25038,10 +25039,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\s*=\s*(.+?)\s*;" % re.escape(vf),
                 lambda m, o=oidn, f=vf: (
-                    "%s_set_%s_x(%s, Vector2_x(%s)); "
-                    "%s_set_%s_y(%s, Vector2_y(%s));"
-                    % (o, f, m.group(1), m.group(2),
-                       o, f, m.group(1), m.group(2))),
+                    "{ Vector2 _v2 = (%s); %s_set_%s_x(%s, _v2.x); "
+                    "%s_set_%s_y(%s, _v2.y); }"
+                    % (m.group(2), o, f, m.group(1), o, f, m.group(1))),
                 text)
             # recv.transform.localPosition = recv.vf (before bare-field read).
             text = cs2cpp.code_sub(

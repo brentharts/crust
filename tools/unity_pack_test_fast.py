@@ -1012,6 +1012,27 @@ class TestNullFieldRead(unittest.TestCase):
         self.assertNotIn("read", run.stdout)
 
 
+class TestVector2FieldAssign(unittest.TestCase):
+    """A Vector2 field store was `set_x(..); set_y(..);`: an unbraced
+    `if` / `else` around it did not compile (Slime Jump's `blasterLaunchVel
+    *= ..`), and `v = new Vector2(v.y, v.x)` read the new x for y."""
+
+    @needs_cc
+    def test_swap_and_unbraced_else(self):
+        src = ("using UnityEngine;\npublic class V : MonoBehaviour {\n"
+               "    public Vector2 vel = new Vector2(1f, 2f);\n"
+               "    bool flip = true;\n"
+               "    void Update() {\n"
+               "        if (flip)\n            vel = new Vector2(vel.y, vel.x);\n"
+               "        else\n            vel *= 2f;\n        flip = false;\n"
+               "        Debug.Log(\"v \" + Mathf.RoundToInt(vel.x) + \" \" + "
+               "Mathf.RoundToInt(vel.y));\n    }\n}\n")
+        root = project(self, {"V": src}, [("V", None, "  vel: {x: 1, y: 2}\n")])
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("v 2 1", out)
+        self.assertIn("v 4 2", out)
+
+
 class TestInheritedUpdatables(unittest.TestCase):
     """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
     `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class
