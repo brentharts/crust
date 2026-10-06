@@ -16397,6 +16397,29 @@ class TestBox2DInactiveChildCollider(unittest.TestCase):
         # radius 0.5 on the floor's top at y = 0; 2.0 on the leg's box
         self.assertAlmostEqual(y, 0.5, delta=0.06)
 
+    @needs_box2d
+    def test_edge_radius_rounds_the_box_outward(self):
+        # Slime Jump's platforms (edge radius 0.05): the player sank into them
+        _plan, out = self._pack_run(
+            TestBox2DTerrainChunk._BALL,
+            self._FLOOR + "  m_EdgeRadius: 0.25\n" + (
+                "--- !u!1 &10\nGameObject:\n  m_Name: Ball\n  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 3, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+                "--- !u!50 &12\nRigidbody2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+                "  m_LinearDamping: 0\n"
+                "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
+                "--- !u!114 &14\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: 7e44a2" + "0" * 26 + "}\n"))
+        y = float(out.split("y=")[1].split()[0])
+        self.assertAlmostEqual(y, 0.75, delta=0.02)
 
 
 class TestBox2DPhysicsBackend(unittest.TestCase):

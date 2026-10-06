@@ -2863,6 +2863,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "size_y": float(sz.group(2)) if sz else 1.0,
                 "material_guid": _parse_material_guid(block),
             }
+            er = re.search(r"(?m)^\s+m_EdgeRadius:\s*([^\s]+)", block)
+            if kind == "BoxCollider2D" and er:
+                rec["collider2d"]["edge_radius"] = float(er.group(1))
         if kind == "PolygonCollider2D":
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
@@ -18576,6 +18579,7 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _Collider2D_oy[%d];" % nc)
         p("extern const float _Collider2D_hw[%d];" % nc)
         p("extern const float _Collider2D_hh[%d];" % nc)
+        p("extern const float _Collider2D_edge_r[%d];" % nc)
         p("extern const float _Collider2D_cos[%d];" % nc)
         p("extern const float _Collider2D_sin[%d];" % nc)
         p("extern const float _Collider2D_friction[%d];" % nc)
@@ -26502,7 +26506,10 @@ def _emit_bounds(p, plan):
             p("    } else if (kind == 3) {")
             p("        r = hh; l = hw - hh; if (l < 0.f) l = 0.f;")
             p("        ex = c * l + r; ey = s * l + r;")
-            p("    } else { ex = c * hw + s * hh; ey = s * hw + c * hh; }")
+            p("    } else {")
+            p("        ex = c * hw + s * hh + _Collider2D_edge_r[ci];")
+            p("        ey = s * hw + c * hh + _Collider2D_edge_r[ci];")
+            p("    }")
             p("    return what == 2 ? ex : ey;")
         else:
             p('    (void)ci; (void)what;')
@@ -26891,6 +26898,9 @@ def emit_data(plan, used_apis=None):
             n, ", ".join("%sf" % repr(float(c["hw"])) for c in col2d_list)))
         p("const float _Collider2D_hh[%d] = { %s };" % (
             n, ", ".join("%sf" % repr(float(c["hh"])) for c in col2d_list)))
+        p("const float _Collider2D_edge_r[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c.get("edge_r") or 0.0))
+                         for c in col2d_list)))
         p("const float _Collider2D_cos[%d] = { %s };" % (
             n, ", ".join("%sf" % repr(float(c["cos_z"])) for c in col2d_list)))
         p("const float _Collider2D_sin[%d] = { %s };" % (
