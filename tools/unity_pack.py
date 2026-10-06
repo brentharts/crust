@@ -14043,6 +14043,15 @@ def _emit_engine_class_groups(
                 body, args_str=m.get("args") or "", emitted_params=emitted,
                 known_types=_engine_types_declared(lines) | {"fastring"},
                 properties=class_properties.get(cname) or ())
+            if why is None:
+                bscan = cs2cpp._blank(body)
+                for _c, om in (plan.get("_methods_by") or {}).get(cname, ()):
+                    mg = re.search(r"(?<![\w.])%s\b(?!\s*\()"
+                                   % re.escape(om["name"]), bscan)
+                    if mg:
+                        why = ("Method group passed as a delegate nothing "
+                               "lowered", om["name"])
+                        break
             # MB methods always emit as `static void`. A non-void C# return
             # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
             # still leaves `return 1;` and crust refuses CS0000.

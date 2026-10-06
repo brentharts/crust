@@ -1012,6 +1012,27 @@ class TestNullFieldRead(unittest.TestCase):
         self.assertNotIn("read", run.stdout)
 
 
+class TestMethodGroupStub(unittest.TestCase):
+    """`Ev.Add(Show, t)` (Slime Jump's Achievement.OnAchieve) reached
+    crust as an undeclared `Show`; it is a CS8000 stub."""
+
+    def test_method_group(self):
+        ev = ("using UnityEngine;\nusing System;\npublic class Ev : MonoBehaviour {\n"
+              "    public static void Add(Action a, float t) { }\n}\n")
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    void Show() { }\n"
+             "    void Update() { Ev.Add(Show, Time.time); }\n}\n")
+        root = project(self, {"Ev": ev, "A": a}, [("A",)])
+        out = tempfile.mkdtemp(prefix="upf-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            unity_pack.pack(root, out, force=True)
+        self.assertIn("`A.Update` is not lowered yet (`Show`: Method group",
+                      err.getvalue())
+
+
 class TestVector2FieldAssign(unittest.TestCase):
     """A Vector2 field store was `set_x(..); set_y(..);`: an unbraced
     `if` / `else` around it did not compile (Slime Jump's `blasterLaunchVel
