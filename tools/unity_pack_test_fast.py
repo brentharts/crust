@@ -111,13 +111,14 @@ def pack(test, root, strict=True):
     return out
 
 
-def run_frames(test, out, frames=1, body=""):
+def run_frames(test, out, frames=1, body="", pre=""):
     """Run the packed engine *frames* ticks at 60 fps (then *body*, C over
-    engine_draw.h) and return its stdout lines (Debug.Log included)."""
+    engine_draw.h; *pre*: C before main) and return its stdout lines
+    (Debug.Log included)."""
     src = os.path.join(out, "h.c")
     with open(src, "w") as f:
         f.write('#include <stdio.h>\n#include "engine_draw.h"\n'
-                "extern float Time_deltaTime;\n"
+                "extern float Time_deltaTime;\n" + pre +
                 "int main(int c, char **v) { int f;\n"
                 "  engine_apply_argv(c, v); Time_deltaTime = 1.f / 60.f;\n"
                 "  for (f = 0; f < %d; f++) engine_tick();\n  %s\n  return 0; }\n"
@@ -1064,6 +1065,71 @@ AnimationClip:
         with self.assertRaises(unity_pack.PackError) as cm:
             pack(self, self._project(ctrl))
         self.assertIn("parameters", str(cm.exception))
+
+
+class TestColliderBounds(unittest.TestCase):
+    """`Collider2D.bounds` of a field (Slime Jump's wall probe): the world
+    AABB of a rotated, offset box and of a capsule."""
+
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    public BoxCollider2D box;
+    public Collider2D cap;
+    int f;
+    void Update() {
+        f++; if (f > 1) return;
+        Vector2 c = (Vector2) box.bounds.center + Vector2.down * box.bounds.extents.y;
+        Debug.Log("box " + R(box.bounds.center.x) + " " + R(box.bounds.center.y) + " " + R(box.bounds.extents.x) + " " + R(box.bounds.max.y) + " " + R(box.bounds.size.x) + " " + R(c.y));
+        Debug.Log("cap " + R(cap.bounds.min.x) + " " + R(cap.bounds.extents.y));
+    }
+    static int R(float v) { return Mathf.RoundToInt(v * 100f); }
+}
+"""
+    BOX = ("--- !u!61 &{fid}\nBoxCollider2D:\n  m_GameObject: {{fileID: {go}}}\n"
+           "  m_Enabled: 1\n  m_Offset: {{x: 0.5, y: 0}}\n  m_Size: {{x: 2, y: 1}}\n")
+    CAP = ("--- !u!70 &{fid}\nCapsuleCollider2D:\n  m_GameObject: {{fileID: {go}}}\n"
+           "  m_Enabled: 1\n  m_Offset: {{x: 0, y: 0}}\n  m_Size: {{x: 1, y: 3}}\n"
+           "  m_Direction: 0\n")
+
+    @needs_cc
+    def test_box_and_capsule(self):
+        log = "using UnityEngine;\npublic class Log : MonoBehaviour { }\n"
+        root = project(self, {"Mgr": self.MGR, "Log": log}, [
+            ("Mgr", self.BOX, "  box: {fileID: 103}\n  cap: {fileID: 113}\n",
+             (0.0, 0.0, 0.70710678, 0.70710678)),
+            ("Log", self.CAP)])
+        # no Box2D in this harness: nothing moves
+        out = run_frames(self, pack(self, root), 1,
+                         pre="void engine_box2d_step(float dt) { (void)dt; }\n")
+        # turned 90 degrees: the 2 x 1 box offset (0.5, 0) is 1 x 2 at (0, 0.5)
+        self.assertIn("box 0 50 50 150 100 -50", out)
+        # the capsule at x = 1: 1 wide, 3 tall
+        self.assertIn("cap 50 150", out)
+
+
+class TestSpriteRendererColor(unittest.TestCase):
+    """`sr.color = sr.color.SetAlpha(a)` through a SpriteRenderer field
+    (Slime Jump's dust cloud fade): the authored tint, then the set one."""
+
+    @needs_cc
+    def test_fade(self):
+        ext = ("using UnityEngine;\npublic static class ColorExtensions {\n"
+               "    public static Color SetAlpha(this Color c, float a) {\n"
+               "        return new Color(c.r, c.g, c.b, a);\n    }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public SpriteRenderer sr;\n    int f;\n"
+               "    void Update() {\n        f++;\n"
+               "        Debug.Log(\"a\" + f + \" \" + Mathf.RoundToInt("
+               "sr.color.a * 100f) + \" \" + Mathf.RoundToInt(sr.color.g * 100f));\n"
+               "        sr.color = sr.color.SetAlpha(0.25f);\n    }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Color: {{r: 1, g: 0.5, b: 1, a: 0.5}}\n"
+               "  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"ColorExtensions": ext, "Mgr": mgr}, [
+            ("Mgr", spr, "  sr: {fileID: 103}\n")])
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("a1 50 50", out)
+        self.assertIn("a2 25 50", out)
 
 
 class TestHandleEulerZ(unittest.TestCase):

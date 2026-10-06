@@ -472,6 +472,7 @@ def _build_collider2d_tables(plan):
             cols.append({
                 "tris": c.get("tris") or [],
                 "name": o.get("name") or "obj",
+                "file_id": c.get("file_id"),
                 "owner_class": cname,
                 "owner_class_id": cid,
                 "owner_inst": i,

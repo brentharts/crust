@@ -3218,7 +3218,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                                  "CapsuleCollider2D",
                                  "PolygonCollider2D") and k.get(
                     "collider2d"):
-                col2d = dict(k["collider2d"])
+                col2d = dict(k["collider2d"], file_id=k.get("file_id"))
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
                     "collider3d"):
                 col3d = dict(k["collider3d"])
@@ -3355,7 +3355,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             sprite["m01"] = m01
             sprite["m10"] = m10
             sprite["m11"] = m11
-        else:
+        # SpriteRenderer.color: an undrawn renderer (no sprite) has one too
+        spr_color = tuple(float(sprite.get(c, 1.0)) for c in "rgba") \
+            if sprite else None
+        if not (sprite and sprite.get("enabled", 1)
+                and sprite.get("has_sprite")):
             sprite = None
         class_name = None
         if script:
@@ -3573,6 +3577,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "script": script,
             "class": class_name or _scriptless_packed_class(go.get("name")),
             "sprite": sprite,
+            "spr_color": spr_color,
             "canvas": canvas,
             "rect": rect,
             "ui_image": ui_image,
@@ -6495,6 +6500,11 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
                  scan):
         apis.add("transform.LookAt")
+    # (any `x.color =` in a script naming SpriteRenderer: the live table
+    # costs only memory when x is something else)
+    if "SpriteRenderer" in scan and re.search(
+            r"(?<![\w.])\w+\s*\.\s*color\s*=(?!=)", scan):
+        apis.add("SpriteRenderer.color")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
                  r"(?:eulerAngles\b|Translate\s*\()", scan):
         apis.add("transform.eulerAngles")
@@ -8963,6 +8973,9 @@ def plan_layouts(objects, analyses, two_d=None):
                 # to the handle case below, as an index into a class named
                 # `string`, and never declared at all.
                 continue
+            elif ty in _COLLIDER2D_FIELD_TYPES:
+                # a row of the collider table (GetComponent<Collider2D>'s)
+                members.append((fname, "uint32_t", 32, "idx:" + ty))
             else:
                 # Foreign MonoBehaviour → index into that class's array, as
                 # wide as *that* class's index: the owner's could be
@@ -10429,7 +10442,7 @@ def _emit_engine_gameobject_tables(
         go_n_sr = max(1, len(go_names) + go_spawn_budget)
         init_vals = []
         for i, _n in enumerate(go_names if go_names else []):
-            init_vals.append("0" if i in go_has_sprite else "-1")
+            init_vals.append(str(i) if i in go_has_sprite else "-1")
         for _pad in range(go_spawn_budget):
             init_vals.append("-1")
         if not init_vals:
@@ -13298,6 +13311,8 @@ def _emit_engine_instantiate(
                 p("    go = _engine_go_count;")
                 p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
+            if plan.get("_spr_color_cap"):
+                p("    _engine_spr_clone(go, _engine_%s_go_of[src]);" % idn)
             if _multi_scene(plan):
                 p("    _engine_go_scene[go] = _engine_scene_active;")
             if want_ui:
@@ -14602,6 +14617,66 @@ def _spawnable(plan, cname):
     authored instances (a sprite's draw row) are per instance."""
     return (cname in (plan.get("godot_spawn") or {})
             or _mb_pool_extra(plan, cname) > 0)
+
+
+def _emit_sprite_color_tables(p, plan, cap):
+    """`SpriteRenderer.color` by GameObject: the authored tint of each a
+    class instance draws, whether it has one, and whether a script set it
+    (the draw list then takes it, `engine_collect_draws`)."""
+    col = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            sp, gi = o.get("spr_color"), o.get("go_index")
+            if sp and gi is not None and 0 <= int(gi) < cap:
+                col[int(gi)] = sp
+    plan["_spr_color_cap"] = cap
+    top = max(col) + 1 if col else 0
+    tint = sorted((g, c) for g, c in col.items() if c != (1.0, 1.0, 1.0, 1.0))
+    p("/* SpriteRenderer.color per GameObject; _has: it has one; _set: a"
+      " script wrote it (else the authored tint: white, or _tint's) */")
+    p("static float _engine_spr_col[%d][4];" % cap)
+    p("static unsigned char _engine_spr_has[%d]%s;" % (cap, (" = { %s }" % (
+        ", ".join("1" if g in col else "0" for g in range(top)))) if top else ""))
+    p("static unsigned char _engine_spr_set[%d];" % cap)
+    p("static const int _engine_spr_tint_go[%d] = { %s };" % (
+        max(1, len(tint)), ", ".join(str(g) for g, _c in tint) or "-1"))
+    p("static const float _engine_spr_tint[%d][4] = { %s };" % (
+        max(1, len(tint)), ", ".join("{ %s }" % ", ".join(
+            "%rf" % v for v in c) for _g, c in tint) or "{ 1.f, 1.f, 1.f, 1.f }"))
+    p("static int _engine_spr_go(int go) {")
+    p("    if (go < 0 || go >= %d || !_engine_spr_has[go]) {" % cap)
+    p('        fprintf(stderr, "NullReferenceException: Object reference not'
+      ' set to an instance of an object (SpriteRenderer.color)\\n");')
+    p("        exit(70);")
+    p("    }")
+    p("    return go;")
+    p("}")
+    p("static float SpriteRenderer_color(int go, int k) {")
+    p("    int t;")
+    p("    go = _engine_spr_go(go);")
+    p("    if (_engine_spr_set[go]) return _engine_spr_col[go][k];")
+    p("    for (t = 0; t < %d; t = t + 1)" % len(tint))
+    p("        if (_engine_spr_tint_go[t] == go) return _engine_spr_tint[t][k];")
+    p("    return 1.f;")
+    p("}")
+    p("static void SpriteRenderer_set_color(int go, float r, float g, float b,"
+      " float a) {")
+    p("    go = _engine_spr_go(go);")
+    p("    _engine_spr_col[go][0] = r; _engine_spr_col[go][1] = g;")
+    p("    _engine_spr_col[go][2] = b; _engine_spr_col[go][3] = a;")
+    p("    _engine_spr_set[go] = 1;")
+    p("}")
+    # a clone's tint is its source's, kept as set (its row has no authored)
+    p("static void _engine_spr_clone(int go, int src) {")
+    p("    int k;")
+    p("    if (go < 0 || go >= %d) return;" % cap)
+    p("    _engine_spr_has[go] = src >= 0 && src < %d && _engine_spr_has[src];"
+      % cap)
+    p("    _engine_spr_set[go] = _engine_spr_has[go];")
+    p("    for (k = 0; k < 4 && _engine_spr_has[go]; k = k + 1)")
+    p("        _engine_spr_col[go][k] = SpriteRenderer_color(src, k);")
+    p("}")
+    p("")
 
 
 def _emit_spawn_sprite_rows(p, plan):
@@ -18764,6 +18839,10 @@ def emit_engine(plan, analyses, used_apis):
         for _root in sorted({t["nodes"][0]["class"]
                              for t in plan.get("godot_templates") or []}):
             p("static int _godot_spawn_%s(int src);" % _c_ident(_root))
+    plan["_spr_color_cap"] = 0
+    if "SpriteRenderer.color" in used_apis and plan.get("go_names"):
+        _emit_sprite_color_tables(p, plan, max(
+            1, len(plan.get("go_names") or []) + go_spawn_budget))
     _emit_spawn_sprite_rows(p, plan)
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
     _emit_engine_instantiate(
@@ -19516,6 +19595,18 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_collect(out, &n, max);")
     if plan.get("lines"):
         p("    _lr_collect(out, &n, max);")
+    if plan.get("_spr_color_cap"):
+        p("    {")
+        p("        int r;")
+        p("        for (r = 0; r < n; r = r + 1)")
+        p("            if (out[r].go >= 0 && out[r].go < %d"
+          " && _engine_spr_set[out[r].go]) {" % plan["_spr_color_cap"])
+        p("                out[r].r = _engine_spr_col[out[r].go][0];")
+        p("                out[r].g = _engine_spr_col[out[r].go][1];")
+        p("                out[r].b = _engine_spr_col[out[r].go][2];")
+        p("                out[r].a = _engine_spr_col[out[r].go][3];")
+        p("            }")
+        p("    }")
     # The main camera's culling mask (Slime Jump hides its World Map layer).
     # ponytail: authored GOs' layers only -- a spawned object or a runtime
     # `gameObject.layer =` is always drawn; a live layer table if needed
@@ -19544,6 +19635,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    return n;")
     p("}")
     p("")
+    _emit_bounds(p, plan)
     if _want_gpu_sprites:
         import tools.unity_pack_gpu2d as _gpu
         p(_gpu.HEADER.split("int engine_atlas_side")[0])   # the typedef
@@ -25420,6 +25512,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _own_string_locals(text, string_idents, int_idents,
                               _string_store_names(plan) | string_arrays | _sl,
                               arrays=string_arrays | _sl)
+    text = _lower_bounds(text, plan, site)
     # Vector2 operators (a + b, v * s, -v, v += w, ==) as the engine's
     # component-wise helpers: C has no operators on the struct.
     text = _vec.lower_vector2_ops(
@@ -25587,6 +25680,183 @@ def _late_call_members(text, plan):
             "GameObject_activeSelf(%s)" % call if mm.group(1) == "activeSelf"
             else "GameObject_SetActive(%s, " % call if mm.group(1)
             else call))
+
+
+_COLLIDER2D_FIELD_TYPES = frozenset((
+    "Collider2D", "BoxCollider2D", "CircleCollider2D", "CapsuleCollider2D",
+    "PolygonCollider2D"))
+
+
+def _lower_bounds(text, plan, site=None):
+    """`c.bounds.center|extents|size|min|max[.x|.y]` of a Collider2D field
+    (a collider row) or a SpriteRenderer field (a GO): the world AABB, by
+    `Collider2D_bounds` / `SpriteRenderer_bounds` (`_emit_bounds`). A
+    whole vector is the Vector2 C has; `.z` is left to the stub check."""
+    funcs = {}
+    for cn, c in (plan.get("classes") or {}).items():
+        for f in c.get("fields") or []:
+            if f.get("static") or f.get("const"):
+                continue
+            if f.get("ty") in _COLLIDER2D_FIELD_TYPES:
+                funcs["%s_get_%s" % (_c_ident(cn), f["name"])] = \
+                    "Collider2D_bounds"
+            elif f.get("ty") == "SpriteRenderer":
+                funcs["%s_get_%s" % (_c_ident(cn), f["name"])] = \
+                    "SpriteRenderer_bounds"
+    sprs = {k for k, v in funcs.items() if v == "SpriteRenderer_bounds"}
+    if sprs and plan.get("_spr_color_cap") and ".color" in text:
+        # `r.color.r|g|b|a` and `r.color = new Color(r, g, b[, a]);`
+        # (the inlined extension wraps both in parentheses)
+        text = re.sub(r"\(\s*((?:%s)\s*\([^()]*\)\s*\.\s*color)\s*\)" % "|".join(
+            map(re.escape, sorted(sprs))), r"\1", text)
+        for m in reversed(list(re.finditer(
+                r"\.\s*color\s*=(?!=)\s*(\()\s*new\s+(?:UnityEngine\s*\.\s*)?"
+                r"Color\s*\(", text))):
+            got = _match_call_args(text, m.start(1))
+            if got and _match_call_args(text, m.end() - 1)[1] == got[1] - 1:
+                text = (text[:m.start(1)] + text[m.start(1) + 1:got[1] - 1]
+                        + text[got[1]:])
+        text = _call_suffix_sub(
+            text, sprs, r"\s*\.\s*color\s*\.\s*([rgba])\b"
+            r"(?!\s*(?:\.|\(|[-+*/]?=(?!=)))",
+            lambda call, mm: "SpriteRenderer_color(%s, %d)" % (
+                call, "rgba".index(mm.group(1))))
+        text = _call_suffix_sub(
+            text, sprs, r"\s*\.\s*color\s*=(?!=)\s*new\s+"
+            r"(?:UnityEngine\s*\.\s*)?Color\s*\(",
+            lambda call, mm, a: "SpriteRenderer_set_color(%s, %s)" % (
+                call, ", ".join(a + ["1.f"] if len(a) == 3 else a))
+            if len(a) in (3, 4) else call + mm.group(0) + ", ".join(a) + ")",
+            args=True)
+    if not funcs or ".bounds" not in text:
+        return text
+    used = set()
+
+    def build(call, mm):
+        fn = funcs[call[:call.index("(")].strip()]
+        used.add(fn)
+
+        def a(k):
+            return "%s(%s, %d)" % (fn, call, k)
+        part, ax = mm.group(1), mm.group(2)
+        val = {
+            "center": lambda k: a(k),
+            "extents": lambda k: a(k + 2),
+            "size": lambda k: "(2.f * %s)" % a(k + 2),
+            "min": lambda k: "(%s - %s)" % (a(k), a(k + 2)),
+            "max": lambda k: "(%s + %s)" % (a(k), a(k + 2)),
+        }[part]
+        if ax:
+            return val("xy".index(ax))
+        return "Vector2_make(%s, %s)" % (val(0), val(1))
+    text = _call_suffix_sub(
+        text, set(funcs),
+        r"\s*\.\s*bounds\s*\.\s*(center|extents|size|min|max)\b"
+        r"(?:\s*\.\s*([xy])\b)?(?!\s*(?:\.|\(|[-+*/]?=(?!=)))", build)
+    plan.setdefault("_bounds_used", set()).update(used)
+    if site is not None:
+        for fn in used:
+            site.setdefault("protos", set()).add(
+                "static float %s(int h, int what);" % fn)
+    return text
+
+
+def _emit_bounds(p, plan):
+    """The runtime of `_lower_bounds` (what: 0/1 the center's x/y, 2/3 the
+    extents'), after the draw list."""
+    used = plan.get("_bounds_used") or ()
+    if "Collider2D_bounds" in used:
+        # ponytail: the shape's own AABB; Box2D pads a polygon by its skin
+        # radius (b2_polygonRadius), which Unity's bounds may include
+        p("static float Collider2D_bounds(int ci, int what) {")
+        if plan.get("collider2d"):
+            p("    float cx, cy, c, s, hw, hh, r, l, ex, ey;")
+            p("    int kind;")
+            p("    if (ci < 0 || ci >= _Collider2D_count) {")
+            p('        fprintf(stderr, "NullReferenceException: Object reference'
+              ' not set to an instance of an object (Collider2D.bounds)\\n");')
+            p("        exit(70);")
+            p("    }")
+            p("    kind = _Collider2D_kind[ci];")
+            if plan.get("physics2d_polygons"):
+                # vertices are relative to the collider's center; the
+                # rotated AABB need not be centered on it
+                p("    if (kind == 4) {")
+                p("        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;")
+                p("        int k, n = _Collider2D_tri_count[ci] * 3;")
+                p("        const float *v = &_Collider2D_tri_xy["
+                  "_Collider2D_tri_start[ci] * 6];")
+                p("        c = _Collider2D_cos[ci]; s = _Collider2D_sin[ci];")
+                p("        for (k = 0; k < n; k = k + 1) {")
+                p("            float wx = c * v[2 * k] - s * v[2 * k + 1];")
+                p("            float wy = s * v[2 * k] + c * v[2 * k + 1];")
+                p("            if (wx < x0) x0 = wx;")
+                p("            if (wx > x1) x1 = wx;")
+                p("            if (wy < y0) y0 = wy;")
+                p("            if (wy > y1) y1 = wy;")
+                p("        }")
+                p("        if (n == 0) { x0 = x1 = y0 = y1 = 0.f; }")
+                p("        _col2d_center(ci, &cx, &cy);")
+                p("        if (what == 0) return cx + 0.5f * (x0 + x1);")
+                p("        if (what == 1) return cy + 0.5f * (y0 + y1);")
+                p("        return what == 2 ? 0.5f * (x1 - x0) : 0.5f * (y1 - y0);")
+                p("    }")
+            p("    if (kind != 0 && kind != 1 && kind != 2 && kind != 3) {")
+            p('        fprintf(stderr, "Collider2D.bounds of a polygon or terrain'
+              ' collider is not lowered by crust; stopping rather than'
+              ' skipping it\\n");')
+            p("        exit(70);")
+            p("    }")
+            p("    _col2d_center(ci, &cx, &cy);")
+            p("    if (what == 0) return cx;")
+            p("    if (what == 1) return cy;")
+            p("    c = fabsf(_Collider2D_cos[ci]); s = fabsf(_Collider2D_sin[ci]);")
+            p("    hw = _Collider2D_hw[ci]; hh = _Collider2D_hh[ci];")
+            p("    if (kind == 1) { ex = hw; ey = hw; }")
+            p("    else if (kind == 2) {")
+            p("        r = hw; l = hh - hw; if (l < 0.f) l = 0.f;")
+            p("        ex = s * l + r; ey = c * l + r;")
+            p("    } else if (kind == 3) {")
+            p("        r = hh; l = hw - hh; if (l < 0.f) l = 0.f;")
+            p("        ex = c * l + r; ey = s * l + r;")
+            p("    } else { ex = c * hw + s * hh; ey = s * hw + c * hh; }")
+            p("    return what == 2 ? ex : ey;")
+        else:
+            p('    (void)ci; (void)what;')
+            p('    fprintf(stderr, "NullReferenceException: Object reference'
+              ' not set to an instance of an object (Collider2D.bounds)\\n");')
+            p("    exit(70);")
+            p("    return 0.f;")
+        p("}")
+    if "SpriteRenderer_bounds" in used:
+        cap = 4096
+        # ponytail: the drawn quad of the GO, found by collecting every
+        # draw (O(draws) a call); Unity's Sprite.bounds is the sprite's rect
+        # and pivot, which is that quad
+        p("static float SpriteRenderer_bounds(int go, int what) {")
+        p("    static EngineDraw d[%d];" % cap)
+        p("    int n, k;")
+        p("    if (go < 0) {")
+        p('        fprintf(stderr, "NullReferenceException: Object reference'
+          ' not set to an instance of an object (SpriteRenderer.bounds)\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    n = engine_collect_draws(d, %d);" % cap)
+        p("    for (k = 0; k < n; k = k + 1)")
+        p("        if (d[k].go == go) {")
+        p("            if (what == 0) return d[k].x;")
+        p("            if (what == 1) return d[k].y;")
+        p("            if (what == 2) return fabsf(d[k].m00) * d[k].half_w"
+          " + fabsf(d[k].m01) * d[k].half_h;")
+        p("            return fabsf(d[k].m10) * d[k].half_w"
+          " + fabsf(d[k].m11) * d[k].half_h;")
+        p("        }")
+        p('    fprintf(stderr, "SpriteRenderer.bounds of GameObject %d, which'
+          ' crust does not draw, is not lowered; stopping rather than'
+          ' skipping it\\n", go);')
+        p("    exit(70);")
+        p("    return 0.f;")
+        p("}")
 
 
 def _vector2_methods(plan):
@@ -26331,6 +26601,15 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:AudioSource":
                     parts.append(str(_audiosource_field_init_index(
                         plan, o, name)))
+                elif str(kind)[4:] in _COLLIDER2D_FIELD_TYPES:
+                    # a collider the table does not hold (a second one on
+                    # its GameObject) is null, not another collider
+                    fid = str((o.get("object_refs") or {}).get(name))
+                    row = next((ci for ci, c in enumerate(
+                        plan.get("collider2d") or [])
+                        if str(c.get("file_id")) == fid), None)
+                    parts.append(str(row) if row is not None
+                                 else "%du" % _idx_null(bits))
                 elif str(kind).startswith("idx:"):
                     # The scene's reference, by the referenced script
                     # component's fileID; one the scene leaves empty (or that
