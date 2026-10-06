@@ -17153,6 +17153,23 @@ def _emit_engine_box2d_exports(
             p("    *y = 0.f;")
         p("}")
         p("")
+        # the collider GameObject's world origin and rotation-scale basis:
+        # the glue reshapes a body's collider when they change (Slime Jump
+        # flips its player's collider by its localScale)
+        p("void engine_col2d_frame(int ci, float *o, float *b) {")
+        if (want_col2d and col2d_list and plan.get("has_transform_parents")
+                and not _godot_bases(plan)):
+            p("    float z;")
+            p("    _engine_world_pos(_Collider2D_owner_class[ci],"
+              " (unsigned)_Collider2D_owner_inst[ci], &o[0], &o[1], &z, 0);")
+            p("    _engine_world_basis(_Collider2D_owner_class[ci],"
+              " (unsigned)_Collider2D_owner_inst[ci], b, 0);")
+        else:
+            p("    (void)ci;")
+            p("    o[0] = 0.f; o[1] = 0.f;")
+            p("    b[0] = 1.f; b[1] = 0.f; b[2] = 0.f; b[3] = 1.f;")
+        p("}")
+        p("")
         p("void engine_col2d_contact(int a, int b) {")
         if want_collision2d_msgs:
             p("    _col2d_add_contact(a, b);")

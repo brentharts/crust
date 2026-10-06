@@ -16398,6 +16398,60 @@ class TestBox2DInactiveChildCollider(unittest.TestCase):
         self.assertAlmostEqual(y, 0.5, delta=0.06)
 
     @needs_box2d
+    def test_flipping_a_childs_scale_mirrors_its_collider(self):
+        # Slime Jump's player faces left by colliderTrs's localScale.x = -1:
+        # its collider mirrors, so the box offset 2 right moves 2 left, off
+        # the pedestal
+        ball = (
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    public Transform leg;\n    private int n;\n"
+            "    void Update() {\n        n = n + 1;\n"
+            "        if (n == 40) { Debug.Log(\"y \" + transform.position.y);"
+            " leg.localScale = new Vector3(-1, 1, 1); }\n"
+            "        if (n == 89) Debug.Log(\"y \" + transform.position.y);\n"
+            "    }\n}\n")
+        scene = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Pedestal\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 2, y: -0.5, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+            "--- !u!61 &3\nBoxCollider2D:\n  m_GameObject: {fileID: 1}\n"
+            "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+            "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 1, y: 1}\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Ball\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n  - component: {fileID: 14}\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 0, y: 1, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+            "  m_Children:\n  - {fileID: 21}\n"
+            "--- !u!50 &12\nRigidbody2D:\n  m_GameObject: {fileID: 10}\n"
+            "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+            "  m_LinearDamping: 0\n"
+            "--- !u!114 &14\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+            "  m_Script: {fileID: 11500000, guid: 7e44a2" + "0" * 26 + "}\n"
+            "  leg: {fileID: 21}\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: Leg\n  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 21}\n"
+            "  - component: {fileID: 22}\n"
+            "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 11}\n"
+            "--- !u!61 &22\nBoxCollider2D:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+            "  m_Offset: {x: 2, y: 0}\n  m_Size: {x: 1, y: 1}\n")
+        _plan, out = self._pack_run(ball, scene)
+        ys = [float(l.split()[1]) for l in out.splitlines()
+              if l.startswith("y ")]
+        self.assertEqual(len(ys), 2, out)
+        self.assertAlmostEqual(ys[0], 0.5, delta=0.05)  # on the pedestal
+        self.assertLess(ys[1], -1.5)                    # mirrored off it
+
+    @needs_box2d
     def test_edge_radius_rounds_the_box_outward(self):
         # Slime Jump's platforms (edge radius 0.05): the player sank into them
         _plan, out = self._pack_run(
