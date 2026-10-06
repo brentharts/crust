@@ -5626,18 +5626,26 @@ def _promote_handle_rot_classes(plan):
               for o in cl.get("instances") or []
               if o.get("go_index") is not None}
     live = set(plan.get("live_rot_classes") or [])
+    srcs = {}
     for cname, cl in plan["classes"].items():
         try:
             with open(cl.get("script_path") or "", encoding="utf-8",
                       errors="replace") as f:
-                src = cs2cpp._blank(f.read())
+                srcs[cname] = cs2cpp._blank(f.read())
         except OSError:
+            pass
+    # ponytail: a field is matched by name in any script (`Lasso.instance.
+    # hookTrs.eulerAngles` from Player.cs), so a same-named field elsewhere
+    # gets live rotation it may not need -- table space, not behaviour
+    rot_names = {n for src in srcs.values() for n in re.findall(
+        r"(?<![\w])(\w+)\s*\.\s*(?:rotation|eulerAngles)\b", src)}
+    for cname, cl in plan["classes"].items():
+        src = srcs.get(cname)
+        if src is None:
             continue
         names = set(re.findall(r"(?<![\w.])Transform(?:\[\])?\s+(\w+)\s*[;=,)]",
                                src))
-        used = {n for n in names if re.search(
-            r"(?<![\w.])%s\s*\.\s*(?:rotation|eulerAngles)\b" % re.escape(n),
-            src)}
+        used = names & rot_names
         if not used:
             continue
         plan["handle_rot"] = True
@@ -6584,7 +6592,10 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])\w+\s*\.\s*DetachChildren\s*\(", scan) or any(
             re.search(r"(?<![.\w])%s\s*\.\s*(?:position\b(?!\s*\.\s*[xyz]\b)"
                       r"|rotation\b|eulerAngles\b)" % re.escape(n), scan)
-            for n in trs_names):
+            for n in trs_names) or re.search(
+                # another script's handle through its singleton
+                r"\.\s*[Ii]nstance\s*\.\s*\w+\s*\.\s*(?:rotation|eulerAngles)\b",
+                scan):
         apis.add("transform.SetParent")
     if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*GetSiblingIndex\s*\(",
@@ -15322,6 +15333,15 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    }")
     p("    (void)inst;")
     p("}")
+    p("/* t.eulerAngles += Vector3.forward * deg: Unity's Euler is Y*X*Z, so")
+    p("   a z step is q * Euler(0, 0, deg), whatever x and y are. */")
+    p("static void Transform_rotate_z(int go, float deg) {")
+    p("    Quaternion q = Transform_get_rotation(go), r;")
+    p("    float h = deg * 0.00872664626f, s = sinf(h), c = cosf(h);")
+    p("    r.x = q.x * c + q.y * s; r.y = q.y * c - q.x * s;")
+    p("    r.z = q.z * c + q.w * s; r.w = q.w * c - q.z * s;")
+    p("    Transform_set_rotation(go, r);")
+    p("}")
     p("/* a.eulerAngles == b.eulerAngles: Unity Vector3 == (1e-5 epsilon). */")
     p("static int Transform_eulerAngles_eq(int a, int b) {")
     p("    Quaternion qa = Transform_get_rotation(a);")
@@ -19830,6 +19850,21 @@ def _go_handle_receivers(text, cl, plan):
                                                re.escape(on)),
                 "%s_get_%s(%s)" % (_c_ident(other), on, hname),
                 oty.get(on)))
+    # `Other.instance.trs` of a singleton (`Lasso.instance.hookTrs`), as
+    # written or once the singleton pass made it the accessor
+    singles = set(plan.get("singleton_instance_types") or ()) | set(
+        plan.get("findobject_types") or ())
+    for other in sorted(singles & set(classes)):
+        ocl, oidn = classes[other], _c_ident(other)
+        if other not in text and oidn not in text:
+            continue
+        oty = {f["name"]: f.get("ty") for f in ocl.get("fields") or []}
+        for on, _t2, _b2, ok in ocl.get("members") or []:
+            if ok == "go" and on in text:
+                expr = "%s_get_%s(%s_Instance())" % (oidn, on, oidn)
+                out.append((r"(?:(?<![\w.])%s\s*\.\s*[Ii]nstance\s*\.\s*%s\b"
+                            r"|%s)" % (re.escape(other), re.escape(on),
+                                       re.escape(expr)), expr, oty.get(on)))
     named = {n: field_ty.get(n) for n, _t, _b, k in cl.get("members") or []
              if k == "go"}
     decl = r"(?<![\w.])(%s)\s+(\w+)\s*[=;]" % "|".join(
@@ -19925,6 +19960,7 @@ _TRANSFORM_HANDLE_PROTOS = {
         "static void Transform_set_rotation(int go, Quaternion q);",
     "Transform_eulerAngles_eq":
         "static int Transform_eulerAngles_eq(int a, int b);",
+    "Transform_rotate_z": "static void Transform_rotate_z(int go, float deg);",
 }
 
 
@@ -19953,6 +19989,15 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
                lambda m: "%sTransform_eulerAngles_eq(%s, %s)" % (
                    "!" if m.group(2) == "!=" else "", e(m.group(1)),
                    e(m.group(3))), text)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*\+=\s*Vector3\s*\.\s*forward\s*\*"
+               r"\s*([^;]+);" % alt,
+               lambda m: "Transform_rotate_z(%s, (%s));" % (
+                   e(m.group(1)), m.group(2).strip()), text)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*=(?!=)\s*(?:Vector[23]\s*\.\s*zero|"
+               r"Vector2_make\(\s*0\.f\s*,\s*0\.f\s*\))\s*;" % alt,
+               lambda m: "{ Quaternion _q0; _q0.x = 0.f; _q0.y = 0.f; "
+               "_q0.z = 0.f; _q0.w = 1.f; Transform_set_rotation(%s, _q0); }"
+               % e(m.group(1)), text)
     text = sub(r"(%s)\s*\.\s*rotation\s*=(?!=)\s*([^;]+);" % alt,
                lambda m: "Transform_set_rotation(%s, %s);" % (
                    e(m.group(1)), m.group(2).strip()), text)

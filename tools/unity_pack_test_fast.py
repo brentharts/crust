@@ -927,6 +927,47 @@ public class Mgr : MonoBehaviour {
         self.assertIn("embedded struct", str(cm.exception))
 
 
+class TestHandleEulerZ(unittest.TestCase):
+    """`t.eulerAngles += Vector3.forward * d` and `t.eulerAngles =
+    Vector3.zero` through a Transform field (Slime Jump's lasso swing)."""
+
+    @needs_cc
+    def test_step_and_reset(self):
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public Transform other;\n    int f;\n    void Update() {\n"
+               "        f++;\n        if (f <= 2) other.eulerAngles += Vector3.forward * 30f / 2f * 3f;\n"
+               "        if (f == 3) other.eulerAngles = Vector3.zero;\n    }\n}\n")
+        log = ("using UnityEngine;\npublic class Log : MonoBehaviour {\n"
+               "    int f;\n    void LateUpdate() {\n        f++;\n"
+               "        Debug.Log(\"z\" + f + \" \" + Mathf.RoundToInt(transform.eulerAngles.z));\n"
+               "    }\n}\n")
+        root = project(self, {"Mgr": mgr, "Log": log}, [
+            ("Mgr", None, "  other: {fileID: 111}\n"), ("Log",)])
+        out = run_frames(self, pack(self, root), 3)
+        for want in ("z1 45", "z2 90", "z3 0"):
+            self.assertIn(want, out)
+
+    @needs_cc
+    def test_through_singleton(self):
+        """`Hook.instance.trs.eulerAngles += ..` (`Lasso.instance.hookTrs`)."""
+        hook = ("using UnityEngine;\npublic class Hook : MonoBehaviour {\n"
+                "    public static Hook instance;\n    public Transform trs;\n"
+                "    void Awake() { instance = this; }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    int f;\n    void Update() {\n        f++;\n"
+               "        if (f <= 2) Hook.instance.trs.eulerAngles += "
+               "Vector3.forward * 30f;\n    }\n}\n")
+        log = ("using UnityEngine;\npublic class Log : MonoBehaviour {\n"
+               "    int f;\n    void LateUpdate() {\n        f++;\n"
+               "        Debug.Log(\"z\" + f + \" \" + Mathf.RoundToInt(transform.eulerAngles.z));\n"
+               "    }\n}\n")
+        root = project(self, {"Hook": hook, "Mgr": mgr, "Log": log}, [
+            ("Mgr",), ("Hook", None, "  trs: {fileID: 121}\n"), ("Log",)])
+        out = run_frames(self, pack(self, root), 2)
+        for want in ("z1 30", "z2 60"):
+            self.assertIn(want, out)
+
+
 class TestLocalNamedI(unittest.TestCase):
     """`for (int i = 0; ..) speed += 1f;`: the packed instance index is `i`,
     so the loop counter took its place and each pass bumped instance
