@@ -38,10 +38,43 @@ SCALAR = {
     "long": ("long", "long", "l", "long long", "DNA_Long"),
     "float": ("float", "float", "f", "float", "DNA_Float"), "double": ("double", "double", "d", "double", "DNA_Double"),
 }
+# A Vector2 crosses the boundary as its two floats; a Vector2 result comes back through a two-float slot (ccs_ret2, in hybrid_glue.c) that the
+# callee sets and the caller reads, since neither the FFI nor DNA_Call returns a struct.
+VEC2 = "Vector2"
+
+
+def _carrier(t):
+    """may a value of C# type *t* cross the boundary?"""
+    return t in SCALAR or t == VEC2
+
+
+def _ctype(t):
+    return VEC2 if t == VEC2 else SCALAR[t][3]
+
+
+def _mtype(t):
+    return VEC2 if t == VEC2 else SCALAR[t][0]
+
+
+def _ffi_args(params):
+    out = []
+    for t, _n in params:
+        out += ["float", "float"] if t == VEC2 else [SCALAR[t][1]]
+    return out
+
+
+def _dna_letters(params):
+    return "".join("ff" if t == VEC2 else SCALAR[t][2] for t, _n in params)
+
+
 # what an engine accessor's C type is, in the manifest
 ACCESSOR_FFI = {"unsigned": "uint", "int": "int", "float": "float", "double": "double"}
 # the fields managed code can have as properties: C# type -> (getter cast, setter cast)
 FIELD_TYPES = {"int", "uint", "short", "ushort", "sbyte", "byte", "bool", "float"}
+
+
+# the names of the managed Transform's rotation API: a class whose managed code uses one needs the engine's rotation storage (ClassGen._rotation_storage)
+ROTATION_WORDS = frozenset(("rotation", "localRotation", "eulerAngles", "localEulerAngles", "Rotate", "LookAt", "TransformDirection", "InverseTransformDirection"))
 
 
 class HybridError(Exception):
@@ -59,10 +92,39 @@ def build_dir():
     return os.environ.get("UNITY_PACK_DNA_BUILD") or os.path.join(REPO, "build", "dna")
 
 
+def ccs_dll():
+    """CC#'s compiler (CCSharp, built: `python3 build.py compiler`), which compiles the managed side with Roslyn; None when it or `dotnet` is absent.
+    $CCS_DLL names it, $CCS_HOME the checkout; otherwise a CCSharp checkout beside this repository."""
+    if shutil.which("dotnet") is None:
+        return None
+    cands = []
+    if os.environ.get("CCS_DLL"):
+        cands.append(os.environ["CCS_DLL"])
+    home = os.environ.get("CCS_HOME") or os.path.join(os.path.dirname(REPO), "CCSharp")
+    cands.append(os.path.join(home, "build", "compiler", "ccs.dll"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def compiler_name():
+    """'roslyn' (CC#'s compiler) or 'mcs' (mono): what compiles the managed C#.  Roslyn when it is there; $UNITY_PACK_MANAGED_COMPILER forces one."""
+    want = os.environ.get("UNITY_PACK_MANAGED_COMPILER", "").strip().lower()
+    if want == "mcs":
+        return "mcs" if shutil.which("mcs") else None
+    if want == "roslyn":
+        return "roslyn" if ccs_dll() else None
+    if ccs_dll():
+        return "roslyn"
+    return "mcs" if shutil.which("mcs") else None
+
+
 def available():
-    """(True, '') or (False, why): DotNetAnywhere beside this repository (or $DNA_HOME) and mono's mcs."""
-    if shutil.which("mcs") is None:
-        return False, "mcs (mono-mcs) is not installed"
+    """(True, '') or (False, why): DotNetAnywhere beside this repository (or $DNA_HOME) and a compiler for the managed C#
+    (CC#'s Roslyn one beside this repository, or mono's mcs)."""
+    if compiler_name() is None:
+        return False, "no managed C# compiler: build CCSharp beside this repository (python3 build.py compiler; needs dotnet), or install mono-mcs"
     if dna_home() is None:
         return False, "DotNetAnywhere not found: clone it beside this repository, or set DNA_HOME"
     return True, ""
@@ -88,9 +150,23 @@ def prepare_corlib():
 
 
 def mcs(sources, out, corlib):
-    p = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-target:library", "-nowarn:0169,0414,0219,0649", "-r:" + corlib, "-out:" + out] + list(sources),
+    p = subprocess.run(["mcs", "-nostdlib", "-unsafe", "-target:" + ("exe" if out.endswith(".exe") else "library"), "-nowarn:0169,0414,0219,0649",
+                        "-r:" + corlib, "-out:" + out] + list(sources),
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return p.returncode == 0, p.stdout.decode("utf-8", "replace")
+
+
+def roslyn(sources, out, corlib):
+    """The same, with CC#'s compiler: Roslyn against DotNetAnywhere's corlib (`ccs --managed-compile`), so current C# (what mcs, which stops at
+    C# 7, cannot parse) compiles."""
+    p = subprocess.run(["dotnet", ccs_dll(), "--managed-compile", out, corlib] + list(sources), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return p.returncode == 0, p.stdout.decode("utf-8", "replace")
+
+
+def compile_managed(sources, out, corlib):
+    """(ok, messages): compile the managed C# *sources* to *out* (a console program when it ends in .exe, else a library) against *corlib*
+    with whichever compiler compiler_name() picks."""
+    return (roslyn if compiler_name() == "roslyn" else mcs)(sources, out, corlib)
 
 
 # ---- what the packer tells us about a method -------------------------------------------------------------------------------------------
@@ -98,9 +174,10 @@ def mcs(sources, out, corlib):
 def signature_ok(params, ret):
     """May a method with these parameters (cs2cpp.Param) and C# return type be called across the boundary?  Numbers and bools only, for now."""
     for prm in params:
-        if prm.type not in SCALAR or getattr(prm, "modifier", None):
+        if not _carrier(prm.type) or getattr(prm, "modifier", None):
             return False
-    return (ret or "void").strip() in SCALAR or (ret or "void").strip() == "void"
+    r = (ret or "void").strip()
+    return _carrier(r) or r == "void"
 
 
 def accessors(engine, cname):
@@ -129,8 +206,9 @@ class ClassGen(object):
         self.cands = cands
         self.siblings = [s for s in siblings if not s.get("stub")]
         self.acc = accessors(engine, self.name)
+        self.engine = engine
         self.natives = {}          # export name -> (ret FFI type, [arg FFI types], C text of the wrapper, managed extern declaration)
-        self.time = "Time_deltaTime" in engine and re.search(r"^extern float Time_deltaTime;", engine, re.M) is not None
+        self.time = time_members(engine)          # the Time members the managed Time class gets (all the engine declares)
         self.problem = None
         self.src = self._build()
 
@@ -154,19 +232,54 @@ class ClassGen(object):
         sc = "(%s)" % ("uint" if ACCESSOR_FFI[st] == "uint" else "int" if ACCESSOR_FFI[st] == "int" else "float")
         return "    public %s %s { get { return (%s)HybridNative.%s(__i); } set { HybridNative.%s(__i, %svalue); } }" % (mt, n, mt, get_ex, set_ex, sc)
 
+    def _rotation_storage(self):
+        """Does the engine keep a rotation for this class (`_Class_rot_x/y/z/w[i]` and the basis `_Class_rot_m00..m11[i]`), and the helper that sets
+        the quaternion and the basis together?  Then managed code can read and write transform.rotation through them."""
+        e, n = self.engine, re.escape(self.name)
+        return (all(re.search(r"^extern float _%s_rot_%s\[" % (n, a), e, re.M) for a in ("x", "y", "z", "w", "m00", "m01", "m10", "m11"))
+                and re.search(r"^static void _engine_transform_set_quat\(", e, re.M) is not None)
+
     def _transform(self):
-        """position through the SoA position accessors, when the class has them"""
-        need = ("pos_x", "pos_y", "pos_z")
-        if not all(n in self.acc and self.acc[n][0] == "float" and self.acc[n][1] == "float" for n in need):
+        """position through the SoA position accessors, when the class has them.  A 2D class has no pos_z: z reads 0 and a write of it is dropped.
+        rotation through the engine's rotation arrays, when the class has them (_rotation_storage)."""
+        def has(n):
+            return n in self.acc and self.acc[n][0] == "float" and self.acc[n][1] == "float"
+        if not (has("pos_x") and has("pos_y")):
             return None
-        for n in need:
+        axes = ("pos_x", "pos_y") + (("pos_z",) if has("pos_z") else ())
+        for n in axes:
             self.natives["ccs_x_%s_get_%s" % (self.name, n)] = ("float", ["uint"], "float ccs_x_%s_get_%s(unsigned i) { return %s_get_%s(i); }" % (self.name, n, self.name, n))
             self.natives["ccs_x_%s_set_%s" % (self.name, n)] = ("void", ["uint", "float"], "void ccs_x_%s_set_%s(unsigned i, float v) { %s_set_%s(i, v); }" % (self.name, n, self.name, n))
         g = lambda n: "HybridNative.ccs_x_%s_get_%s(i)" % (self.name, n)
         s = lambda n, v: "HybridNative.ccs_x_%s_set_%s(i, %s);" % (self.name, n, v)
+        z_get = g("pos_z") if "pos_z" in axes else "0f"
+        z_set = s("pos_z", "value.z") if "pos_z" in axes else ""
+        if self._rotation_storage():
+            for a in "xyzw":
+                self.natives["ccs_x_%s_get_rot_%s" % (self.name, a)] = (
+                    "float", ["uint"], "float ccs_x_%s_get_rot_%s(unsigned i) { return _%s_rot_%s[i]; }" % (self.name, a, self.name, a))
+            self.natives["ccs_x_%s_set_rot" % self.name] = (
+                "void", ["uint", "float", "float", "float", "float"],
+                "void ccs_x_%s_set_rot(unsigned i, float x, float y, float z, float w) { _engine_transform_set_quat("
+                "&_%s_rot_x[i], &_%s_rot_y[i], &_%s_rot_z[i], &_%s_rot_w[i], &_%s_rot_m00[i], &_%s_rot_m01[i], &_%s_rot_m10[i], &_%s_rot_m11[i], x, y, z, w); }"
+                % ((self.name,) + (self.name,) * 8))
+            rot = ("    public override UnityEngine.Quaternion rotation {\n        get { return new UnityEngine.Quaternion(%s, %s, %s, %s); }\n"
+                   "        set { HybridNative.ccs_x_%s_set_rot(i, value.x, value.y, value.z, value.w); }\n    }\n"
+                   % (g("rot_x"), g("rot_y"), g("rot_z"), g("rot_w"), self.name))
+        else:
+            # (_build declines a class whose managed code names rotation, so this is only reached by code that does not)
+            rot = ("    public override UnityEngine.Quaternion rotation {\n"
+                   "        get { throw new System.NotSupportedException(\"the packed engine keeps no rotation for %s\"); }\n"
+                   "        set { throw new System.NotSupportedException(\"the packed engine keeps no rotation for %s\"); }\n    }\n" % (self.name, self.name))
         return ("public class %s_Transform : UnityEngine.Transform {\n    readonly uint i;\n    public %s_Transform(uint i) { this.i = i; }\n"
                 "    public override UnityEngine.Vector3 position {\n        get { return new UnityEngine.Vector3(%s, %s, %s); }\n"
-                "        set { %s %s %s }\n    }\n}\n") % (self.name, self.name, g("pos_x"), g("pos_y"), g("pos_z"), s("pos_x", "value.x"), s("pos_y", "value.y"), s("pos_z", "value.z"))
+                "        set { %s %s %s }\n    }\n%s}\n") % (self.name, self.name, g("pos_x"), g("pos_y"), z_get, s("pos_x", "value.x"), s("pos_y", "value.y"), z_set, rot)
+
+    def _ret2(self):
+        """the natives of the two-float result slot a Vector2 result travels through"""
+        self.natives["ccs_x_ret2_set"] = ("void", ["float", "float"], "void ccs_x_ret2_set(float x, float y) { ccs_ret2[0] = x; ccs_ret2[1] = y; }")
+        self.natives["ccs_x_ret2_x"] = ("float", [], "float ccs_x_ret2_x(void) { return ccs_ret2[0]; }")
+        self.natives["ccs_x_ret2_y"] = ("float", [], "float ccs_x_ret2_y(void) { return ccs_ret2[1]; }")
 
     def _build(self):
         cl, name = self.cl, self.name
@@ -186,6 +299,15 @@ class ClassGen(object):
                             % ", ".join("`%s`" % u for u in unreachable))
             return ""
         transform = self._transform()
+        if transform is None and "transform" in used:
+            # (it would build, and then fail at run time on a null transform: say so now, and keep the lowered C)
+            self.problem = "the method uses `transform`, and the packed engine keeps no position accessors for this class"
+            return ""
+        if ROTATION_WORDS & used or re.search(r"\btransform\s*\.\s*(?:right|up|forward)\b", bodies):
+            if not self._rotation_storage():
+                # (it would build, and then fail at run time with no rotation to read: say so now, and keep the lowered C)
+                self.problem = "the method uses the transform's rotation, which the packed engine keeps no storage for in this class"
+                return ""
         lines = ["public class %s : UnityEngine.MonoBehaviour\n{" % name]
         lines.append("    static %s[] __objs = new %s[8];" % (name, name))
         # (an int index: DotNetAnywhere's array opcodes take a 32-bit index, and `a[uint]` is a conv.u it does not narrow)
@@ -195,31 +317,57 @@ class ClassGen(object):
                      % (name, name, name, name, name, ("            o.transform = new %s_Transform(i);\n" % name) if transform else ""))
         lines += props
         # the lowered methods of the class, for the managed ones to call (only those a managed body names)
-        managed = {c["name"] for c in self.cands}
+        managed = {c["sym"] for c in self.cands}
         for s in self.siblings:
-            if s["name"] in managed or s["name"] not in used or not s["scalar"]:
+            if s["sym"] in managed or s["name"] not in used or not s["scalar"]:
                 continue
             ex = "ccs_x_%s" % s["sym"]
-            cparams = "".join(", %s a%d" % (SCALAR[t][3], k) for k, (t, _n) in enumerate(s["params"]))
-            ffi = ["uint"] + [SCALAR[t][1] for t, _n in s["params"]]
-            rc = SCALAR[s["ret"]][3] if s["ret"] in SCALAR else "void"
-            call = "%s(i%s)" % (s["sym"], "".join(", a%d" % k for k in range(len(s["params"]))))
-            self.natives[ex] = ("void" if rc == "void" else SCALAR[s["ret"]][1], ffi,
-                                "%s %s(unsigned i%s) { %s%s; }" % (rc, ex, cparams, "" if rc == "void" else "return ", call))
-            mparams = ", ".join("%s %s" % (SCALAR[t][0], n) for t, n in s["params"])
-            margs = "".join(", " + n for _t, n in s["params"])
-            mret = SCALAR[s["ret"]][0] if s["ret"] in SCALAR else "void"
-            conv = ""
-            lines.append("    public %s %s(%s) { %sHybridNative.%s(__i%s); }" % (mret, s["name"], mparams, "" if mret == "void" else "return ", ex, margs))
+            st = bool(s.get("static"))
+            ps = s["params"]
+            cps, pre, cargs = [], [], []
+            for k, (t_, _n) in enumerate(ps):
+                if t_ == VEC2:
+                    cps.append("float a%dx, float a%dy" % (k, k))
+                    pre.append("%s a%d = {a%dx, a%dy};" % (VEC2, k, k, k))
+                else:
+                    cps.append("%s a%d" % (SCALAR[t_][3], k))
+                cargs.append("a%d" % k)
+            ffi = ([] if st else ["uint"]) + _ffi_args(ps)
+            vret = s["ret"] == VEC2
+            rc = "void" if vret else (SCALAR[s["ret"]][3] if s["ret"] in SCALAR else "void")
+            call = "%s(%s)" % (s["sym"], ", ".join(([] if st else ["i"]) + cargs))
+            head = "%s %s(%s)" % (rc, ex, ", ".join(([] if st else ["unsigned i"]) + cps) or "void")
+            if vret:
+                stmt = "%s r = %s; ccs_ret2[0] = r.x; ccs_ret2[1] = r.y;" % (VEC2, call)
+                self._ret2()
+            else:
+                stmt = "%s%s;" % ("" if rc == "void" else "return ", call)
+            self.natives[ex] = ("void" if rc == "void" else SCALAR[s["ret"]][1], ffi, "%s { %s%s }" % (head, " ".join(pre) + " " if pre else "", stmt))
+            mparams = ", ".join("%s %s" % (_mtype(t_), n) for t_, n in ps)
+            margs = ", ".join(([] if st else ["__i"]) + [("%s.x, %s.y" % (n, n)) if t_ == VEC2 else n for t_, n in ps])
+            mret = VEC2 if vret else (SCALAR[s["ret"]][0] if s["ret"] in SCALAR else "void")
+            if vret:
+                body = ("HybridNative.%s(%s); return new %s(HybridNative.ccs_x_ret2_x(), HybridNative.ccs_x_ret2_y());" % (ex, margs, VEC2))
+            else:
+                body = "%sHybridNative.%s(%s);" % ("" if mret == "void" else "return ", ex, margs)
+            lines.append("    public %s%s %s(%s) { %s }" % ("static " if st else "", mret, s["name"], mparams, body))
         for c in self.cands:
-            mparams = ", ".join("%s %s" % (SCALAR[t][0], n) for t, n in c["params"])
+            st = bool(c.get("static"))
+            mparams = ", ".join("%s %s" % (_mtype(t_), n) for t_, n in c["params"])
             ret = (c["ret"] or "void").strip()
-            mret = SCALAR[ret][0] if ret in SCALAR else "void"
-            lines.append("    public %s %s(%s)\n    {\n%s\n    }" % (mret, c["name"], mparams, c["body"]))
-            eparams = "".join(", %s %s" % (SCALAR[t][0], n) for t, n in c["params"])
-            eargs = "".join(", " + n for _t, n in c["params"])
-            lines.append("    public static %s __%s(uint i%s) { %s__Get(i).%s(%s); }" % (
-                mret, c["name"], eparams, "" if mret == "void" else "return ", c["name"], ", ".join(n for _t, n in c["params"])))
+            mret = _mtype(ret) if _carrier(ret) else "void"
+            lines.append("    public %s%s %s(%s)\n    {\n%s\n    }" % ("static " if st else "", mret, c["name"], mparams, c["body"]))
+            # the entry native code calls: named by the C symbol, which tells overloads apart (a Vector2 comes in as its two floats, goes out in ccs_ret2)
+            eps = ([] if st else ["uint i"])
+            for t_, n in c["params"]:
+                eps += ["float %s_x, float %s_y" % (n, n)] if t_ == VEC2 else ["%s %s" % (SCALAR[t_][0], n)]
+            eargs = ", ".join(("new %s(%s_x, %s_y)" % (VEC2, n, n)) if t_ == VEC2 else n for t_, n in c["params"])
+            target = "%s(%s)" % (c["name"], eargs) if st else "__Get(i).%s(%s)" % (c["name"], eargs)
+            if ret == VEC2:
+                self._ret2()
+                lines.append("    public static void __%s(%s) { %s r = %s; HybridNative.ccs_x_ret2_set(r.x, r.y); }" % (c["sym"], ", ".join(eps), VEC2, target))
+            else:
+                lines.append("    public static %s __%s(%s) { %s%s; }" % (mret, c["sym"], ", ".join(eps), "" if mret == "void" else "return ", target))
         lines.append("}\n")
         return (transform or "") + "\n".join(lines)
 
@@ -236,20 +384,31 @@ def _native_decls(natives):
     return "\n".join(out)
 
 
-def _time_class(natives):
-    natives["ccs_x_Time_deltaTime"] = ("float", [], "float ccs_x_Time_deltaTime(void) { return Time_deltaTime; }")
-    return ("namespace UnityEngine\n{\n    public static class Time\n    {\n"
-            "        public static float deltaTime { get { return HybridNative.ccs_x_Time_deltaTime(); } }\n    }\n}\n")
+# UnityEngine.Time members that are floats the engine keeps as `extern float Time_<name>;` (each only when the engine has it)
+TIME_FIELDS = ("deltaTime", "unscaledDeltaTime", "timeScale", "time", "fixedDeltaTime")
 
 
-def managed_source(gens, with_time):
+def time_members(engine):
+    """The Time members (TIME_FIELDS) this engine.c declares, for the managed Time class to read."""
+    return [n for n in TIME_FIELDS if re.search(r"^extern float Time_%s;" % n, engine, re.M)]
+
+
+def _time_class(natives, names):
+    props = []
+    for n in names:
+        natives["ccs_x_Time_%s" % n] = ("float", [], "float ccs_x_Time_%s(void) { return Time_%s; }" % (n, n))
+        props.append("        public static float %s { get { return HybridNative.ccs_x_Time_%s(); } }" % (n, n))
+    return "namespace UnityEngine\n{\n    public static class Time\n    {\n" + "\n".join(props) + "\n    }\n}\n"
+
+
+def managed_source(gens, time_names):
     natives = {}
     parts = ["using System;\nusing UnityEngine;\n"]
     for g in gens:
         natives.update(g.natives)
     body = []
-    if with_time:
-        body.append(_time_class(natives))
+    if time_names:
+        body.append(_time_class(natives, time_names))
     body += [g.src for g in gens]
     parts.append(_native_decls(natives))
     parts += body
@@ -266,7 +425,7 @@ def glue_c(cands_by_class, ok_names):
     """hybrid_glue.c: native -> managed.  One function for each managed method, with the C signature the engine's stub has."""
     out = ["/* unity_pack --hybrid: the C side of the native/managed bridge.  Generated. */",
            "#include <stdio.h>", "#include <stdlib.h>", "#include <string.h>", "#include <unistd.h>", '#include "Host.h"', "",
-           "static DNA_Assembly *hy_asm;", "",
+           "static DNA_Assembly *hy_asm;", "", "typedef struct Vector2 { float x; float y; } Vector2;", "float ccs_ret2[2];", "",
            "static const char *hy_dll_path(char *buf, size_t n) {",
            "\tconst char *e = getenv(\"UNITY_PACK_MANAGED_DLL\");", "\tssize_t k;", "\tif (e != NULL && *e) return e;",
            "\tk = readlink(\"/proc/self/exe\", buf, n - 1);", "\tif (k > 0) {", "\t\tchar *s;", "\t\tbuf[k] = 0;", "\t\ts = strrchr(buf, '/');",
@@ -283,19 +442,32 @@ def glue_c(cands_by_class, ok_names):
     for cname in sorted(ok_names):
         for c in cands_by_class[cname]:
             ret = (c["ret"] or "void").strip()
-            n = len(c["params"])
-            rc = SCALAR[ret][3] if ret in SCALAR else "void"
-            sig = "i" + "".join(SCALAR[t][2] for t, _n in c["params"]) + ">" + (SCALAR[ret][2] if ret in SCALAR else "v")
-            cparams = "unsigned i" + "".join(", %s a%d" % (SCALAR[t][3], k) for k, (t, _n) in enumerate(c["params"]))
-            out.append("%s ccs_b_%s(%s) {" % (rc, c["sym"], cparams))
+            st = bool(c.get("static"))
+            lead = 0 if st else 1
+            n = len(c["params"]) + lead
+            vret = ret == VEC2
+            rc = VEC2 if vret else (SCALAR[ret][3] if ret in SCALAR else "void")
+            n = lead + sum(2 if t_ == VEC2 else 1 for t_, _n in c["params"])
+            sig = ("" if st else "i") + _dna_letters(c["params"]) + ">" + ("v" if vret else (SCALAR[ret][2] if ret in SCALAR else "v"))
+            out.append("%s ccs_b_%s(%s) {" % (rc, c["sym"], _cparams(c)))
             out.append("\tstatic DNA_Method *m;")
-            out.append("\tDNA_Value a[%d], r;" % (n + 1))
-            out.append("\tif (m == NULL) m = hy_find(\"%s\", \"__%s\", \"%s\");" % (cname, c["name"], sig))
-            out.append("\ta[0] = DNA_Int(i);")
+            out.append("\tDNA_Value a[%d], r;" % max(n, 1))
+            out.append("\tif (m == NULL) m = hy_find(\"%s\", \"__%s\", \"%s\");" % (cname, c["sym"], sig))
+            if not st:
+                out.append("\ta[0] = DNA_Int(i);")
+            slot = lead
             for k, (t, _n) in enumerate(c["params"]):
-                out.append("\ta[%d] = %s(a%d);" % (k + 1, SCALAR[t][4], k))
-            out.append("\tif (DNA_Call(m, a, %d, &r) != 0) { fprintf(stderr, \"unity_pack: %%s\\n\", DNA_Error()); exit(70); }" % (n + 1))
-            if ret in SCALAR:
+                if t == VEC2:
+                    out.append("\ta[%d] = DNA_Float(a%d.x);" % (slot, k))
+                    out.append("\ta[%d] = DNA_Float(a%d.y);" % (slot + 1, k))
+                    slot += 2
+                else:
+                    out.append("\ta[%d] = %s(a%d);" % (slot, SCALAR[t][4], k))
+                    slot += 1
+            out.append("\tif (DNA_Call(m, a, %d, &r) != 0) { fprintf(stderr, \"unity_pack: %%s\\n\", DNA_Error()); exit(70); }" % n)
+            if vret:
+                out.append("\t{ %s v; v.x = ccs_ret2[0]; v.y = ccs_ret2[1]; return v; }" % VEC2)
+            elif ret in SCALAR:
                 field = {"i": "i", "l": "l", "f": "f", "d": "d"}[SCALAR[ret][2]]
                 out.append("\treturn (%s)r.u.%s;" % (rc, field))
             else:
@@ -305,11 +477,16 @@ def glue_c(cands_by_class, ok_names):
     return "\n".join(out)
 
 
+def _cparams(c):
+    """the C parameter list of a managed method's engine-side function: `unsigned i, int a0, ..`, or without `i` for a static (`void` when empty)"""
+    ps = ([] if c.get("static") else ["unsigned i"]) + ["%s a%d" % (_ctype(t), k) for k, (t, _n) in enumerate(c["params"])]
+    return ", ".join(ps) if ps else "void"
+
+
 def _proto(c):
     ret = (c["ret"] or "void").strip()
-    rc = SCALAR[ret][3] if ret in SCALAR else "void"
-    cparams = "unsigned i" + "".join(", %s a%d" % (SCALAR[t][3], k) for k, (t, _n) in enumerate(c["params"]))
-    return "%s ccs_b_%s(%s);" % (rc, c["sym"], cparams)
+    rc = _ctype(ret) if _carrier(ret) else "void"
+    return "%s ccs_b_%s(%s);" % (rc, c["sym"], _cparams(c))
 
 
 def ffi_manifest(natives):
@@ -328,7 +505,29 @@ def apply(plan, engine, outdir, report_stub, progress=lambda m: None):
     methods = plan.pop("_hybrid_methods", {}) or {}
     notes = {}
 
+    # --managed: a selected class runs as managed C# whole.  Its methods the packer lowered fine (and the boundary can carry) join the ones it
+    # could not lower, as candidates; they are swapped for the managed call only once the managed assembly has built, so a class that cannot
+    # be built managed is exactly what it was without --managed.
+    selected = plan.get("managed") or set()
+    forced = set()
+    if selected:
+        for cname, sibs in methods.items():
+            if selected != "*" and cname not in selected:
+                continue
+            fs = [dict(s, forced=True) for s in sibs if s.get("scalar") and not s.get("stub")]
+            if fs:
+                cands_by_class.setdefault(cname, []).extend(fs)
+                forced.add(cname)
+        if selected != "*":
+            for cname in sorted(selected - set(methods) - set(cands_by_class)):
+                progress("managed: no script class %s with a method to run managed" % cname)
+    declined = plan.setdefault("managed_declined", {})
+
     def finish(resolved):
+        for cname in sorted(forced):
+            if not any(r[0] == cname for r in resolved):
+                declined[cname] = notes.get(cname) or "no managed method could be built"
+                progress("managed: %s stays lowered: %s" % (cname, declined[cname]))
         for site, cl, m, why in deferred:
             if (cl["name"], m["name"]) in resolved:
                 plan.setdefault("hybrid_methods", []).append({"class": cl["name"], "method": m["name"]})
@@ -358,17 +557,16 @@ def apply(plan, engine, outdir, report_stub, progress=lambda m: None):
     for cname, cands in sorted(cands_by_class.items()):
         cl = next(c for c in plan["classes"] if c["name"] == cname) if isinstance(plan["classes"], list) else plan["classes"][cname]
         gens[cname] = ClassGen(plan, engine, cl, cands, methods.get(cname, []))
-    with_time = any(g.time for g in gens.values())
     good = []
     for cname, g in sorted(gens.items()):
         if g.problem:
             notes[cname] = g.problem
             continue
-        text, _n = managed_source([g], with_time and g.time)
+        text, _n = managed_source([g], g.time)
         src = os.path.join(work, "check_%s.cs" % cname)
         with open(src, "w") as f:
             f.write(text)
-        ok, msg = mcs([SHIM, src], os.path.join(work, "check_%s.dll" % cname), corlib)
+        ok, msg = compile_managed([SHIM, src], os.path.join(work, "check_%s.dll" % cname), corlib)
         if ok:
             good.append(cname)
         else:
@@ -378,11 +576,11 @@ def apply(plan, engine, outdir, report_stub, progress=lambda m: None):
         shutil.rmtree(work, ignore_errors=True)
         return finish(set())
 
-    text, natives = managed_source([gens[c] for c in good], any(gens[c].time for c in good))
+    text, natives = managed_source([gens[c] for c in good], time_members(engine))
     gen_cs = os.path.join(outdir, "hybrid_generated.cs")
     with open(gen_cs, "w") as f:
         f.write(text)
-    ok, msg = mcs([SHIM, gen_cs], os.path.join(outdir, ASSEMBLY), corlib)
+    ok, msg = compile_managed([SHIM, gen_cs], os.path.join(outdir, ASSEMBLY), corlib)
     if not ok:                                   # (each class compiled alone: this is the union; it should too)
         for c in good:
             notes[c] = "the managed code does not compile together: " + msg.strip()[:160]
@@ -394,25 +592,52 @@ def apply(plan, engine, outdir, report_stub, progress=lambda m: None):
     for cname in good:
         for c in cands_by_class[cname]:
             marker = "/* unity_pack:hybrid %s */" % c["sym"]
-            args = "i" + "".join(", " + n for _t, n in c["params"])
+            args = ", ".join(([] if c.get("static") else ["i"]) + [n for _t, n in c["params"]])
             ret = (c["ret"] or "void").strip()
-            call = ("return " if ret in SCALAR else "") + "ccs_b_%s(%s);" % (c["sym"], args)
-            if marker not in engine:
+            call = ("return " if _carrier(ret) else "") + "ccs_b_%s(%s);" % (c["sym"], args)
+            if c.get("forced"):
+                swapped = _swap_body(engine, c["sym"], call)
+                if swapped is None:
+                    raise HybridError("internal: the function %s of %s.%s is not in engine.c" % (c["sym"], cname, c["name"]))
+                engine = swapped
+                plan.setdefault("managed_methods", []).append({"class": cname, "method": c["name"]})
+            elif marker not in engine:
                 raise HybridError("internal: the marker of %s.%s is not in engine.c" % (cname, c["name"]))
-            engine = engine.replace(marker, call, 1)
+            else:
+                engine = engine.replace(marker, call, 1)
             resolved.add((cname, c["name"]))
     protos = "".join(_proto(c) + "\n" for cname in good for c in cands_by_class[cname])
     anchor = "#include <stdint.h>\n"
+    if "Vector2" in protos and "} Vector2;\n" in engine:
+        anchor = "} Vector2;\n"             # (the prototypes name the type)
     k = engine.index(anchor) + len(anchor)
-    engine = engine[:k] + "/* unity_pack --hybrid: managed methods, defined in hybrid_glue.c */\n" + protos + engine[k:]
+    engine = engine[:k] + "/* unity_pack --hybrid: managed methods, defined in hybrid_glue.c */\n" + (
+        "extern float ccs_ret2[2];\n" if any("ccs_ret2" in natives[ex][2] for ex in natives) or "Vector2 ccs_b_" in protos else "") + protos + engine[k:]
     wrappers = "\n/* unity_pack --hybrid: what managed code may call (hybrid.ffi.json) */\n" + "\n".join(natives[ex][2] for ex in sorted(natives)) + "\n"
     engine = engine.rstrip("\n") + "\n" + wrappers
     with open(os.path.join(outdir, "hybrid_glue.c"), "w") as f:
         f.write(glue_c(cands_by_class, good))
     with open(os.path.join(outdir, "hybrid.ffi.json"), "w") as f:
         json.dump(ffi_manifest(natives), f, indent=1)
-    progress("hybrid: %d managed method(s) in %d class(es): %s" % (len(resolved), len(good), ", ".join(sorted("%s.%s" % r for r in resolved))))
+    counts = {}
+    for cname in good:
+        for c in cands_by_class[cname]:
+            counts[(cname, c["name"])] = counts.get((cname, c["name"]), 0) + 1
+    progress("hybrid: %d managed method(s) in %d class(es): %s" % (
+        sum(counts.values()), len(good), ", ".join("%s.%s%s" % (k[0], k[1], " x%d" % n if n > 1 else "") for k, n in sorted(counts.items()))))
     return finish(resolved)
+
+
+def _swap_body(engine, sym, call):
+    """engine with the body of the lowered function *sym* replaced by *call* (the C that calls its managed twin); None when it is not there.
+    The packer writes a function as `static T sym(...) {` .. a line that is only `}`, its body indented."""
+    m = re.search(r"^static [^\n]*?\b%s\([^\n]*\) \{\n" % re.escape(sym), engine, re.M)
+    if m is None:
+        return None
+    end = engine.find("\n}\n", m.end() - 1)
+    if end < 0:
+        return None
+    return engine[:m.end()] + "    " + call + engine[end:]
 
 
 def clean(outdir):

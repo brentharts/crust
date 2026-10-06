@@ -13841,31 +13841,29 @@ def _emit_engine_live_rotation(p, want_live_rot):
         p("        dx, dy, dz, 0.f, 1.f, 0.f);")
         p("}")
         p("")
-        p("/* Transform.eulerAngles get: quat → degrees (Unity ZXY). */")
+        p("/* Transform.eulerAngles get: quat → degrees, Unity's order (Z, then X,")
+        p("   then Y: R = Ry * Rx * Rz, so m12 = -sin(x), y = atan2(m02, m22),")
+        p("   z = atan2(m10, m11)). Angles are in (-180, 180]; x in [-90, 90]. */")
         p("static void _engine_quat_to_euler_deg(")
         p("    float qx, float qy, float qz, float qw,")
         p("    float *ex, float *ey, float *ez) {")
-        p("    float sqx = qx * qx;")
-        p("    float sqy = qy * qy;")
-        p("    float sqz = qz * qz;")
-        p("    float sqw = qw * qw;")
-        p("    float unit = sqx + sqy + sqz + sqw;")
-        p("    float test = qx * qy + qz * qw;")
+        p("    float n = qx * qx + qy * qy + qz * qz + qw * qw;")
         p("    float rad2deg = 57.29577951308232f;")
-        p("    if (test > 0.499f * unit) {")
-        p("        *ey = 2.f * atan2f(qx, qw) * rad2deg;")
-        p("        *ex = 90.f;")
-        p("        *ez = 0.f;")
-        p("    } else if (test < -0.499f * unit) {")
-        p("        *ey = -2.f * atan2f(qx, qw) * rad2deg;")
-        p("        *ex = -90.f;")
+        p("    float s;")
+        p("    if (n < 1e-12f) { *ex = 0.f; *ey = 0.f; *ez = 0.f; return; }")
+        p("    s = 2.f * (qx * qw - qy * qz) / n;")
+        p("    if (s > 0.999999f || s < -0.999999f) {")
+        p("        /* gimbal lock: x is +-90, z is folded into y */")
+        p("        *ex = (s > 0.f ? 90.f : -90.f);")
+        p("        *ey = atan2f(-2.f * (qx * qz - qy * qw),")
+        p("                     n - 2.f * (qy * qy + qz * qz)) * rad2deg;")
         p("        *ez = 0.f;")
         p("    } else {")
-        p("        *ey = atan2f(2.f * qy * qw - 2.f * qx * qz,")
-        p("                    sqx - sqy - sqz + sqw) * rad2deg;")
-        p("        *ex = asinf(2.f * test / unit) * rad2deg;")
-        p("        *ez = atan2f(2.f * qx * qw - 2.f * qy * qz,")
-        p("                    -sqx + sqy - sqz + sqw) * rad2deg;")
+        p("        *ex = asinf(s) * rad2deg;")
+        p("        *ey = atan2f(2.f * (qx * qz + qy * qw),")
+        p("                     n - 2.f * (qx * qx + qy * qy)) * rad2deg;")
+        p("        *ez = atan2f(2.f * (qx * qy + qz * qw),")
+        p("                     n - 2.f * (qx * qx + qz * qz)) * rad2deg;")
         p("    }")
         p("}")
         p("")
@@ -14355,13 +14353,15 @@ def _emit_engine_class_groups(
                     why = ("field of an embedded struct written (its rows are"
                            " shared by copies, so they stay read-only)", hit)
             hy_ok = False
-            if plan.get("hybrid") and not m.get("static") and not coll_param and m["name"] not in overloaded:
+            if plan.get("hybrid") and not coll_param:
                 import tools.unity_pack_hybrid as _hy
                 hy_ok = _hy.signature_ok(
                     cs2cpp.parse_params(m.get("args") or ""), m.get("ret"))
                 hy_info = {"name": m["name"], "sym": sym, "params": hy_params,
                            "ret": (m.get("ret") or "void").strip(),
-                           "body": m.get("body") or "", "scalar": hy_ok}
+                           "body": m.get("body") or "", "scalar": hy_ok,
+                           "static": bool(m.get("static")),
+                           "overloaded": m["name"] in overloaded}
                 if why is None:
                     plan.setdefault("_hybrid_methods", {}).setdefault(
                         cname, []).append(dict(hy_info, stub=False))
@@ -29003,8 +29003,13 @@ def pack(root, outdir, *args, **kwargs):
 
 def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
          gpu_handles=False, physics_inject=False, box2d_root=None,
-         coost_root=None, hybrid=False):
+         coost_root=None, hybrid=False, managed=None):
     """Pack the Unity-subset project at *root* into *outdir*.
+
+    managed: run whole script classes as managed C# on DotNetAnywhere instead
+    of lowering them (implies hybrid): "*" for every script class, or a
+    collection of class names. A class whose managed code cannot be built
+    keeps its lowered C (tools/unity_pack_hybrid.py).
 
     2D physics (Rigidbody2D, Collider2D) is Box2D-Packed: box2d_unity.py from
     the Box2D-Packed checkout at *box2d_root*, $BOX2D_PACKED_ROOT, or a
@@ -29016,6 +29021,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     Box2D's event arrays.
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
+    if managed:
+        hybrid = True
     if hybrid:
         force = True      # (the stamp does not know about --hybrid: a hybrid pack must not reuse a plain one, nor the reverse)
     _TYPE_DECL_ROOT[0] = os.path.abspath(root)
@@ -29395,6 +29402,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         strict = _godot.is_godot_project(root)
     plan["strict"] = bool(strict)
     plan["hybrid"] = bool(hybrid)
+    plan["managed"] = "*" if managed == "*" else (set(managed) if managed else set())
     import tools.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
     if plan.get("_gpu_batch"):
@@ -29599,6 +29607,15 @@ def main():
     if "--hybrid" in args:
         hybrid = True
         args.remove("--hybrid")
+    managed = None
+    for a in list(args):
+        if a == "--managed":
+            managed = "*"
+            args.remove(a)
+        elif a.startswith("--managed="):
+            names = [n.strip() for n in a.split("=", 1)[1].split(",") if n.strip()]
+            managed = "*" if "*" in names else (set(names) | (managed if isinstance(managed, set) else set()))
+            args.remove(a)
     gpu_batch = False
     if "--gpu-batch" in args:
         gpu_batch = True
@@ -29657,13 +29674,17 @@ def main():
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
             "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
             "       [--physics-inject] [--box2d PATH] [--box2d-lto]"
-            " [--coost PATH] [--hybrid]\n"
+            " [--coost PATH] [--hybrid] [--managed[=Class,..]]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  default layout:  SoA position tables (use --aos for AoS)\n"
             "  --force:         ignore stamp; always re-emit and transpile\n"
             "  --hybrid:        a method that cannot be lowered to C runs as managed\n"
-            "                   code on DotNetAnywhere (needs ../DotNetAnywhere, mcs)\n")
+            "                   code on DotNetAnywhere (needs ../DotNetAnywhere, and\n"
+            "                   ../CCSharp built (Roslyn) or mcs)\n"
+            "  --managed[=A,B]: run whole script classes (all, or the named ones) as\n"
+            "                   managed C# on DotNetAnywhere instead of lowering them;\n"
+            "                   a class that cannot be built managed stays lowered\n")
         return 2
     if outdir is None:
         outdir = default_pack_dir(args[0])
@@ -29671,7 +29692,7 @@ def main():
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
                     strict=strict, gpu_handles=gpu_handles, gpu_batch=gpu_batch,
                     physics_inject=physics_inject, box2d_root=box2d_root,
-                    coost_root=coost_root, hybrid=hybrid)
+                    coost_root=coost_root, hybrid=hybrid, managed=managed)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player",
             box2d_root=box2d_root, box2d_lto=box2d_lto)

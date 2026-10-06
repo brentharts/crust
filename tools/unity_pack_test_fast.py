@@ -1618,14 +1618,149 @@ _hybrid_ok, _hybrid_why = unity_pack_hybrid.available()
 needs_hybrid = unittest.skipUnless(_hybrid_ok, "--hybrid needs: " + _hybrid_why)
 
 
-@needs_cc
 @needs_hybrid
-class TestHybrid(unittest.TestCase):
-    """--hybrid: a script method the packer cannot lower runs as managed code on DotNetAnywhere, from its own C# source, over the same packed state.
+class TestManagedShim(unittest.TestCase):
+    """The managed UnityEngine (tools/unity_pack_managed/UnityShim.cs) gives Unity's answers when it runs on DotNetAnywhere.  The packer is not in
+    this: a console program is built against the shim and run.  The expected values are Unity's, worked by hand."""
 
-    Without it such a method is an empty stub and a CS8000 warning (the player prints `total=0` below).  With it the method runs: it reads
-    what native code wrote and native code reads what it wrote.  And a class whose managed code cannot be built keeps its stub: --hybrid never
-    changes what a pack that worked did."""
+    PROGRAM = """
+using System;
+using UnityEngine;
+public class Check {
+    static int R(float f) { return Mathf.RoundToInt(f); }
+    public static void Main() {
+        Vector3 v = Quaternion.Euler(0, 90, 0) * Vector3.forward;
+        Console.WriteLine("a=" + R(v.x * 1000) + "," + R(v.y * 1000) + "," + R(v.z * 1000));
+        Vector3 e = Quaternion.Euler(30, 60, 90).eulerAngles;
+        Console.WriteLine("b=" + R(e.x) + "," + R(e.y) + "," + R(e.z));
+        Console.WriteLine("c=" + R(Mathf.DeltaAngle(10f, 350f)) + "," + R(Mathf.Repeat(5.5f, 2f) * 10) + "," + R(Mathf.PingPong(2.5f, 2f) * 10));
+        Vector2Int vi = new Vector2Int(3, 4) * 2 + Vector2Int.one;
+        Vector3Int wi = new Vector3Int(1, 2, 3) + (Vector3Int)vi;
+        Console.WriteLine("d=" + vi.x + "," + vi.y + "," + R(((Vector2)vi).magnitude * 100) + "," + wi.x + "," + wi.y + "," + wi.z);
+        Vector3 le = Quaternion.LookRotation(Vector3.right, Vector3.up).eulerAngles;
+        Console.WriteLine("e=" + R(le.x) + "," + R(le.y) + "," + R(le.z));
+        Color c = Color.Lerp(Color.black, Color.white, 0.25f);
+        Console.WriteLine("f=" + R(c.r * 100) + "," + R(c.a * 100));
+        Vector3 cr = Vector3.Cross(Vector3.right, Vector3.up);
+        Console.WriteLine("g=" + R(cr.z) + "," + R(Vector3.SignedAngle(Vector3.right, Vector3.up, Vector3.forward)) + "," + R(Vector2.SignedAngle(Vector2.right, Vector2.down)));
+        Quaternion half = Quaternion.Slerp(Quaternion.identity, Quaternion.Euler(0, 0, 90), 0.5f);
+        Console.WriteLine("h=" + R(half.eulerAngles.z) + "," + R(Quaternion.Angle(Quaternion.identity, Quaternion.Euler(0, 80, 0))));
+        Rect rc = new Rect(1, 2, 4, 6);
+        Bounds bd = new Bounds(new Vector3(1, 1, 1), new Vector3(2, 4, 6));
+        Console.WriteLine("i=" + R(rc.center.x * 10) + "," + R(rc.center.y * 10) + "," + (rc.Contains(new Vector2(2, 3)) ? 1 : 0) + "," + R(bd.max.z) + "," + (bd.Contains(Vector3.zero) ? 1 : 0));
+        Vector3 p = Vector3.ProjectOnPlane(new Vector3(1, 2, 3), Vector3.up);
+        Vector3 rf = Vector3.Reflect(new Vector3(1, -1, 0), Vector3.up);
+        Console.WriteLine("j=" + R(p.x) + "," + R(p.y) + "," + R(p.z) + "," + R(rf.x) + "," + R(rf.y) + "," + R(Mathf.MoveTowards(1f, 5f, 2f)) + "," + R(Mathf.LerpAngle(350f, 10f, 0.5f)));
+        Quaternion inv = Quaternion.Inverse(Quaternion.Euler(10, 20, 30)) * Quaternion.Euler(10, 20, 30);
+        Vector3 ft = Quaternion.FromToRotation(Vector3.up, Vector3.right) * Vector3.up;
+        Console.WriteLine("k=" + R(Quaternion.Angle(inv, Quaternion.identity) * 100) + "," + R(ft.x * 1000) + "," + R(ft.y * 1000) + "," + (Mathf.Approximately(0.1f + 0.2f, 0.3f) ? 1 : 0));
+        // LookRotation takes each of its four quaternion branches somewhere here: forward and up must land where they were asked to
+        Vector3[] axes = { Vector3.right, Vector3.left, Vector3.up, Vector3.down, Vector3.forward, Vector3.back };
+        int bad = 0, tested = 0;
+        for (int xi = -1; xi <= 1; xi++) for (int yi = -1; yi <= 1; yi++) for (int zi = -1; zi <= 1; zi++) {
+            if (xi == 0 && yi == 0 && zi == 0) continue;
+            Vector3 f = new Vector3(xi, yi, zi).normalized;
+            foreach (Vector3 up in axes) {
+                if (Vector3.Cross(up, f).sqrMagnitude < 0.01f) continue;
+                Quaternion q = Quaternion.LookRotation(f, up);
+                Vector3 u = Vector3.Cross(f, Vector3.Cross(up, f).normalized);
+                if ((q * Vector3.forward - f).magnitude > 1e-4f || (q * Vector3.up - u).magnitude > 1e-4f || Mathf.Abs(Quaternion.Dot(q, q) - 1f) > 1e-4f) bad++;
+                tested++;
+            }
+        }
+        Console.WriteLine("l=" + (bad == 0 && tested > 100 ? "ok" : "bad " + bad + " of " + tested));
+    }
+}
+"""
+    EXPECTED = ["a=1000,0,0", "b=30,60,90", "c=-20,15,15", "d=7,9,1140,8,11,3", "e=0,90,0", "f=25,100", "g=1,90,-90", "h=45,80", "i=30,50,1,4,1",
+                "j=1,0,3,1,1,3,360", "k=0,1000,0,1", "l=ok"]
+
+    def test_the_maths_gives_unitys_answers_on_dotnetanywhere(self):
+        corlib = unity_pack_hybrid.prepare_corlib()
+        dna = os.path.join(unity_pack_hybrid.build_dir(), "dna")
+        if not os.path.exists(dna):
+            unity_pack_hybrid._dna_run([])
+        work = tempfile.mkdtemp(prefix="upack-shim-")
+        self.addCleanup(shutil.rmtree, work, True)
+        src = os.path.join(work, "Check.cs")
+        with open(src, "w") as f:
+            f.write(self.PROGRAM)
+        exe = os.path.join(work, "Check.exe")
+        ok, msg = unity_pack_hybrid.compile_managed([unity_pack_hybrid.SHIM, src], exe, corlib)
+        self.assertTrue(ok, msg)
+        shutil.copy(corlib, work)
+        r = subprocess.run([dna, exe], capture_output=True, text=True, cwd=work, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout[-800:] + r.stderr[-800:])
+        lines = [l for l in r.stdout.splitlines() if "=" in l and not l.startswith("Total")]
+        self.assertEqual(lines, self.EXPECTED)
+
+    @needs_cc
+    def test_the_maths_matches_the_packers_own_c(self):
+        """a method gives the same answer managed as lowered: the shim's Mathf against the C unity_pack lowers the same calls to
+        (tools/unity_pack_runtime.py), over a sweep of inputs, as results scaled by 1000 and rounded"""
+        import tools.unity_pack_runtime as rt
+        funcs = [("Repeat", 2), ("PingPong", 2), ("DeltaAngle", 2), ("SmoothStep", 3), ("MoveTowards", 3), ("InverseLerp", 3),
+                 ("LerpUnclamped", 3), ("Clamp01", 1), ("Round", 1), ("Approximately", 2)]
+        two = [-725.5, -360.0, -10.0, -0.5, 0.0, 2.5, 180.0, 359.9, 725.5]
+        three = [-3.0, 0.0, 0.25, 1.0, 4.5]
+        sets = {1: [(a,) for a in two], 2: [(a, b) for a in two for b in two], 3: [(a, b, c) for a in three for b in three for c in three]}
+
+        def lit(v):
+            return repr(float(v)) + "f"
+        c_lines, cs_lines = [], []
+        for name, n in funcs:
+            for args in sets[n]:
+                if name in ("Repeat", "PingPong") and args[1] <= 0.0:
+                    continue                                    # (a length that is not positive: undefined, in Unity too)
+                if name == "InverseLerp" and args[0] == args[1]:
+                    continue
+                key = "%s%s" % (name, args)
+                call_c = "Mathf_%s(%s)" % (name, ", ".join(lit(a) for a in args))
+                call_cs = "Mathf.%s(%s)" % (name, ", ".join(lit(a) for a in args))
+                if name == "Approximately":
+                    c_lines.append('  printf("%s=%%ld\\n", (long)(%s != 0));' % (key, call_c))
+                    cs_lines.append('        Console.WriteLine("%s=" + (%s ? 1 : 0));' % (key, call_cs))
+                else:
+                    c_lines.append('  printf("%s=%%ld\\n", (long)floor((double)(%s) * 1000.0 + 0.5));' % (key, call_c))
+                    cs_lines.append('        Console.WriteLine("%s=" + (long)Math.Floor((double)(%s) * 1000.0 + 0.5));' % (key, call_cs))
+        helpers = rt.closure(["Mathf_" + n for n, _k in funcs])
+        c_src = ("#include <stdio.h>\n#include <math.h>\n" + "\n".join(rt.helper_c(h) for h in helpers)
+                 + "\nint main(void) {\n" + "\n".join(c_lines) + "\n  return 0;\n}\n")
+        cs_src = "using System;\nusing UnityEngine;\npublic class Sweep {\n    public static void Main() {\n" + "\n".join(cs_lines) + "\n    }\n}\n"
+        work = tempfile.mkdtemp(prefix="upack-shim-")
+        self.addCleanup(shutil.rmtree, work, True)
+        with open(os.path.join(work, "ref.c"), "w") as f:
+            f.write(c_src)
+        r = subprocess.run([_CC, "-O0", "-w", "-o", os.path.join(work, "ref"), os.path.join(work, "ref.c"), "-lm"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+        want = subprocess.run([os.path.join(work, "ref")], capture_output=True, text=True).stdout.splitlines()
+        corlib = unity_pack_hybrid.prepare_corlib()
+        dna = os.path.join(unity_pack_hybrid.build_dir(), "dna")
+        if not os.path.exists(dna):
+            unity_pack_hybrid._dna_run([])
+        with open(os.path.join(work, "Sweep.cs"), "w") as f:
+            f.write(cs_src)
+        exe = os.path.join(work, "Sweep.exe")
+        ok, msg = unity_pack_hybrid.compile_managed([unity_pack_hybrid.SHIM, os.path.join(work, "Sweep.cs")], exe, corlib)
+        self.assertTrue(ok, msg)
+        shutil.copy(corlib, work)
+        r = subprocess.run([dna, exe], capture_output=True, text=True, cwd=work, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout[-800:] + r.stderr[-800:])
+        got = [l for l in r.stdout.splitlines() if "=" in l and not l.startswith("Total")]
+        self.assertGreater(len(want), 150)
+        # (a result that differs by one scaled unit is float rounding between sinf-free C and the managed double path; more is a real difference)
+        bad = []
+        for w, g in zip(want, got):
+            kw, vw = w.rsplit("=", 1)
+            kg, vg = g.rsplit("=", 1)
+            if kw != kg or abs(int(vw) - int(vg)) > 1:
+                bad.append("%s  C:%s managed:%s" % (kw, vw, vg))
+        self.assertEqual(len(want), len(got))
+        self.assertEqual(bad, [], "the shim's Mathf differs from the C unity_pack lowers it to")
+
+
+class _PackHarness(unittest.TestCase):
+    """pack a one-script project, play it, probe values."""
 
     SCENE = (
         "%%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Spark\n  m_Component:\n"
@@ -1662,22 +1797,32 @@ class TestHybrid(unittest.TestCase):
             raise
         return out, err.getvalue()
 
-    def _play(self, out, frames=4):
+    def _play(self, out, frames=4, probe=None):
         """link the player (DotNetAnywhere in it, if the pack is hybrid) and run `frames` ticks from another directory: it must find its
-        managed assembly and corlib.dll beside itself, wherever it is started"""
+        managed assembly and corlib.dll beside itself, wherever it is started.  *probe* is a C float expression over engine.c's own
+        (static) functions, `Spark_get_pos_y(0)`, printed with %.4f after each tick (a list of them: comma-separated): the harness then
+        includes engine.c itself."""
         with open(os.path.join(out, "harness.c"), "w") as f:
-            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
-                    "int main(int argc, char **argv) { int f;\n"
-                    "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f;\n"
-                    "  for (f = 1; f <= %d; f++) engine_tick(); return 0; }\n" % frames)
+            if probe:
+                probes = [probe] if isinstance(probe, str) else list(probe)
+                f.write('#include <stdio.h>\n#include "engine.c"\n'
+                        "int main(int argc, char **argv) { int f;\n"
+                        "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f;\n"
+                        '  for (f = 1; f <= %d; f++) { engine_tick(); printf("%s\\n", %s); } return 0; }\n'
+                        % (frames, ",".join(["%.4f"] * len(probes)), ", ".join("(double)(%s)" % q for q in probes)))
+            else:
+                f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                        "int main(int argc, char **argv) { int f;\n"
+                        "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f;\n"
+                        "  for (f = 1; f <= %d; f++) engine_tick(); return 0; }\n" % frames)
 
         def run(cmd):
             r = subprocess.run(cmd, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         objs, libs = unity_pack_hybrid.link_inputs(out, _CC, run, lambda m: None)
         exe = os.path.join(out, "h")
-        run([_CC, "-O0", "-w", "-I", out, "-o", exe, os.path.join(out, "harness.c"),
-             os.path.join(out, "engine.c"), os.path.join(out, "data.c")] + objs + libs + ["-lm"])
+        run([_CC, "-O0", "-w", "-I", out, "-o", exe, os.path.join(out, "harness.c")]
+            + ([] if probe else [os.path.join(out, "engine.c")]) + [os.path.join(out, "data.c")] + objs + libs + ["-lm"])
         other = tempfile.mkdtemp(prefix="upack-hy-cwd-")
         self.addCleanup(shutil.rmtree, other, True)
         r = subprocess.run([exe, "-logFile", "-"], cwd=other, capture_output=True, text=True, timeout=60)
@@ -1686,6 +1831,17 @@ class TestHybrid(unittest.TestCase):
 
     def _script(self, members):
         return "using UnityEngine;\nusing System;\npublic class Spark : MonoBehaviour {\n" + members + "\n}\n"
+
+
+
+@needs_cc
+@needs_hybrid
+class TestHybrid(_PackHarness):
+    """--hybrid: a script method the packer cannot lower runs as managed code on DotNetAnywhere, from its own C# source, over the same packed state.
+
+    Without it such a method is an empty stub and a CS8000 warning (the player prints `total=0` below).  With it the method runs: it reads
+    what native code wrote and native code reads what it wrote.  And a class whose managed code cannot be built keeps its stub: --hybrid never
+    changes what a pack that worked did."""
 
     # Update is lowered to C; Tally has a lambda, which the lowering cannot take.  hp starts at 5 and Update takes one off first.
     TALLY = """
@@ -1703,12 +1859,147 @@ class TestHybrid(unittest.TestCase):
         total = sq(3) + sq(4);
     }"""
 
+    VEC = """
+    public float a; public float b;
+    Vector2 Base(Vector2 v) { return v + new Vector2(1, 1); }
+    void Update() {
+        Vector2 r = Twice(new Vector2(3, 4));
+        a = r.x; b = r.y;
+    }
+    Vector2 Twice(Vector2 v) {
+        Func<float, float> f = x => x * 2f;
+        Vector2 w = Base(v);
+        return new Vector2(f(w.x), f(w.y));
+    }"""
+
+    def test_vector2_crosses_the_bridge_both_ways(self):
+        """Twice is a stub (a lambda), run managed: a Vector2 goes in, one comes back, and it calls the lowered Base (a Vector2 each way)."""
+        out, err = self._pack(self._project(self._script(self.VEC)), hybrid=True)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 2, ["Spark_get_a(0)", "Spark_get_b(0)"]), ["8.0000,10.0000"] * 2)
+
     def test_a_stub_runs_as_managed_code_over_the_packed_state(self):
         out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True)
         self.assertNotIn("CS8000", err)
         self.assertIn("hybrid: 1 managed method(s)", err)
         # sq(3) + sq(4) = 25 + 2 * hp: native Update's hp, read by managed code; its total, read by native code
         self.assertEqual(self._play(out), ["hp=4 total=33", "hp=3 total=31", "hp=2 total=29", "hp=1 total=27"])
+
+    # --managed: every method of this class lowers to C; a selected class runs as managed code instead, and does the same
+    LOWERS = """
+    public int hp = 3;
+    public int total;
+    void Update() {
+        hp -= 1;
+        Bump();
+        Debug.Log("hp=" + hp + " total=" + total);
+    }
+    public void Bump() { total += hp * 2; }"""
+    LOWERS_OUT = ["hp=4 total=8", "hp=3 total=14", "hp=2 total=18", "hp=1 total=20"]
+
+    def test_managed_runs_a_class_that_lowers_fine_as_managed_code(self):
+        root = self._project(self._script(self.LOWERS))
+        plain, _err = self._pack(root)
+        self.assertEqual(self._play(plain), self.LOWERS_OUT)          # the lowered C: what the managed class has to do as well
+        self.assertFalse(os.path.exists(os.path.join(plain, "hybrid.managed.dll")))
+        for sel in ("*", {"Spark"}):
+            out, err = self._pack(root, managed=sel)
+            self.assertIn("hybrid: 2 managed method(s) in 1 class(es): Spark.Bump, Spark.Update", err)
+            self.assertTrue(os.path.exists(os.path.join(out, "hybrid.managed.dll")))
+            with open(os.path.join(out, "engine.c")) as f:
+                engine = f.read()
+            self.assertIn("ccs_b_Spark_Update", engine)               # the lowered body is gone: the function calls its managed twin
+            self.assertNotIn("hp -= 1", engine)
+            self.assertEqual(self._play(out), self.LOWERS_OUT)
+
+    # Bouncer of examples/unity_pack/SystemsScene: Time.time, Mathf.Sin and a Vector2 assigned to the (Vector3) position
+    BOUNCE = """
+    public float baseY;
+    public float amp;
+    public float speed;
+    void Update() {
+        transform.position = new Vector2(transform.position.x, baseY + Mathf.Sin(Time.time * speed) * amp);
+    }"""
+
+    def test_managed_class_reads_time_and_assigns_a_vector2_to_the_position(self):
+        root = self._project(self._script(self.BOUNCE), values="  baseY: 2\n  amp: 1.5\n  speed: 3\n")
+        probe = "Spark_get_pos_y(0)"
+        plain, _err = self._pack(root)
+        lowered = self._play(plain, 8, probe)
+        out, err = self._pack(root, managed="*")
+        self.assertIn("hybrid: 1 managed method(s) in 1 class(es): Spark.Update", err)
+        managed = self._play(out, 8, probe)
+        self.assertEqual(len(managed), 8)
+        self.assertGreater(len(set(managed)), 4)                      # it moves (a constant would pass the comparison below too)
+        for a, b in zip(lowered, managed):
+            self.assertAlmostEqual(float(a), float(b), places=3)
+
+    # static methods and overloads cross the boundary too (an overload is told apart by its C symbol)
+    STATICS = """
+    public int hp = 3;
+    public int total;
+    static int Sq(int x) { return x * x; }
+    static int Sq(int x, int y) { return x * x + y; }
+    void Add(int a) { total += a; }
+    void Add(int a, int b) { total += a + b; }
+    void Update() {
+        hp -= 1;
+        Add(Sq(hp));
+        Add(Sq(hp, 1), 0);
+        Debug.Log("hp=" + hp + " total=" + total);
+    }"""
+    STATICS_OUT = ["hp=4 total=33", "hp=3 total=52", "hp=2 total=61", "hp=1 total=64"]
+
+    def test_managed_takes_static_methods_and_overloads(self):
+        # (the packer does not lower a call to the class's own static `Sq(`: Update is a stub in a plain pack, so the expected output is by hand)
+        root = self._project(self._script(self.STATICS))
+        plain, err = self._pack(root)
+        self.assertIn("`Spark.Update` is not lowered yet", err)
+        # --hybrid: Update runs managed and calls the lowered statics and overloads across the boundary
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("hybrid: 1 managed method(s) in 1 class(es): Spark.Update", err)
+        self.assertEqual(self._play(out), self.STATICS_OUT)
+        # --managed: all five methods run managed (Update, Add x2, Sq x2)
+        out, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 5 managed method(s) in 1 class(es): Spark.Add x2, Spark.Sq x2, Spark.Update", err)
+        self.assertEqual(self._play(out), self.STATICS_OUT)
+
+    def test_managed_leaves_the_classes_it_does_not_name_lowered(self):
+        out, err = self._pack(self._project(self._script(self.LOWERS)), managed={"Other"})
+        self.assertIn("no script class Other", err)
+        for name in ("hybrid_glue.c", "hybrid.managed.dll", "hybrid.ffi.json"):
+            self.assertFalse(os.path.exists(os.path.join(out, name)), name)
+        self.assertEqual(self._play(out), self.LOWERS_OUT)
+
+    def test_managed_class_the_shim_cannot_build_stays_lowered(self):
+        # Random.InitState lowers to C (the packer owns the random state) but the managed UnityEngine has no Random: the class does not build
+        # managed, and is what a plain pack gives, with the reason printed
+        root = self._project(self._script(self.LOWERS.replace("total += hp * 2;", "Random.InitState(1); total += hp * 2;")))
+        plain, _err = self._pack(root)
+        self.assertEqual(self._play(plain), self.LOWERS_OUT)
+        out, err = self._pack(root, managed="*")
+        self.assertIn("managed: Spark stays lowered: the managed code does not compile", err)
+        self.assertIn("Random", err)
+        self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
+        self.assertEqual(self._play(out), self.LOWERS_OUT)
+
+    def test_managed_uses_roslyn_when_ccs_is_built_and_mcs_when_forced(self):
+        if unity_pack_hybrid.ccs_dll() is None or shutil.which("mcs") is None:
+            self.skipTest("needs both CCSharp (built) and mcs")
+        saved = os.environ.get("UNITY_PACK_MANAGED_COMPILER")
+        try:
+            os.environ.pop("UNITY_PACK_MANAGED_COMPILER", None)
+            self.assertEqual(unity_pack_hybrid.compiler_name(), "roslyn")
+            os.environ["UNITY_PACK_MANAGED_COMPILER"] = "mcs"
+            self.assertEqual(unity_pack_hybrid.compiler_name(), "mcs")
+            out, err = self._pack(self._project(self._script(self.LOWERS)), managed="*")
+            self.assertEqual(self._play(out), self.LOWERS_OUT)
+        finally:
+            if saved is None:
+                os.environ.pop("UNITY_PACK_MANAGED_COMPILER", None)
+            else:
+                os.environ["UNITY_PACK_MANAGED_COMPILER"] = saved
 
     def test_without_hybrid_it_is_still_a_stub(self):
         out, err = self._pack(self._project(self._script(self.TALLY)))
@@ -1832,6 +2123,78 @@ class TestHybrid(unittest.TestCase):
         self.assertIn("warning CS8000", err)
         self.assertIn("hybrid: DotNetAnywhere not found", err)
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
+
+
+def _euler_q(x, y, z):
+    """Unity's Quaternion.Euler(x, y, z) (degrees), worked independently of the packer: z applied first, then x, then y: the product qy*qx*qz, as (x, y, z, w)."""
+    import math
+    def ax(a, ix):
+        h = math.radians(a) / 2
+        q = [0.0, 0.0, 0.0, math.cos(h)]
+        q[ix] = math.sin(h)
+        return q
+    def mul(a, b):
+        return [a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+                a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+                a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+                a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]]
+    return mul(mul(ax(y, 1), ax(x, 0)), ax(z, 2))
+
+
+@needs_cc
+@needs_hybrid
+class TestRotation(_PackHarness):
+    """transform.rotation / eulerAngles in a managed class run over the engine's own rotation arrays, and agree with the lowered engine
+    and with Unity's ZXY Euler order."""
+
+    PROBE = ["_Spark_rot_x[0]", "_Spark_rot_y[0]", "_Spark_rot_z[0]", "_Spark_rot_w[0]"]
+
+    def _rows(self, out, frames):
+        return [[float(v) for v in r.split(",")] for r in self._play(out, frames, self.PROBE)]
+
+    def _same_rotation(self, a, b, tol=2e-3):
+        # (q and -q are one rotation; the probe prints %.4f)
+        dot = abs(sum(p * q for p, q in zip(a, b)))
+        self.assertGreater(dot, 1 - tol, "%s vs %s" % (a, b))
+
+    EULER_PLUS = """
+    public float angle;
+    void Update() {
+        angle += 15f;
+        transform.eulerAngles = new Vector3(10f, 20f, 30f);
+        transform.eulerAngles += new Vector3(0, 0, angle);
+    }"""
+
+    def test_euler_angles_plus_equals_follows_unitys_order(self):
+        out, _ = self._pack(self._project(self._script(self.EULER_PLUS)))
+        for f, row in enumerate(self._rows(out, 3), 1):
+            self._same_rotation(row, _euler_q(10, 20, 30 + 15 * f))
+
+    def test_managed_euler_angles_plus_equals_is_unitys(self):
+        out, err = self._pack(self._project(self._script(self.EULER_PLUS)), managed="*")
+        self.assertNotIn("stays lowered", err)
+        for f, row in enumerate(self._rows(out, 3), 1):
+            self._same_rotation(row, _euler_q(10, 20, 30 + 15 * f))
+
+    def test_managed_rotation_matches_unity_and_the_lowered_engine(self):
+        body = ("public float angle;\n    void Update() { angle += 15f; "
+                "transform.rotation = Quaternion.Euler(10f, 20f, angle); }")
+        root = self._project(self._script(body))
+        plain, _ = self._pack(root)
+        managed, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        low, mg = self._rows(plain, 4), self._rows(managed, 4)
+        for f, (a, b) in enumerate(zip(low, mg), 1):
+            self._same_rotation(a, b)
+            self._same_rotation(b, _euler_q(10, 20, 15 * f))
+
+    def test_a_class_with_no_rotation_storage_is_declined_not_broken(self):
+        engine = ("static float Spark_get_pos_x(unsigned i) { return 0; }\nstatic void Spark_set_pos_x(unsigned i, float v) {}\n"
+                  "static float Spark_get_pos_y(unsigned i) { return 0; }\nstatic void Spark_set_pos_y(unsigned i, float v) {}\n")
+        cand = {"sym": "Spark_Update", "name": "Update", "body": "transform.rotation = Quaternion.identity;"}
+        g = unity_pack_hybrid.ClassGen({"classes": []}, engine, {"name": "Spark", "fields": []}, [cand], [])
+        self.assertIn("rotation", g.problem or "")
+        self.assertEqual(g.src, "")
 
 
 class TestLayerMaskAwake(unittest.TestCase):
