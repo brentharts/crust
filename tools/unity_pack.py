@@ -6677,8 +6677,10 @@ def analyze_script(path, text=None, shallow=False):
     # A collision / trigger handler reads the other's GameObject from them.
     if re.search(r"\bOn(?:Trigger|Collision)(?:Enter|Stay|Exit)2D\s*\(", scan):
         apis.add("GameObject.SetActive")
-    # Reading activeSelf / activeInHierarchy needs the same active tables.
-    if re.search(r"\.\s*active(?:Self|InHierarchy)\b", scan):
+    # Reading activeSelf / activeInHierarchy needs the same active tables;
+    # `gameObject.layer`, the authored layer table.
+    if re.search(r"\.\s*active(?:Self|InHierarchy)\b|"
+                 r"(?<![\w.])gameObject\s*\.\s*layer\b", scan):
         apis.add("GameObject.SetActive")
     # transform.parent.gameObject.SetActive / anyRecv.gameObject.SetActive
     if re.search(r"\.\s*gameObject\s*\.\s*SetActive\s*\(", scan):
@@ -8584,6 +8586,9 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
              "Unity component handle still using `recv.gameObject`."),
             (r"\w+\.activeSelf\b",
              "Unity `activeSelf` on a receiver nothing lowered."),
+            (r"(?<![\w.])enabled\b",
+             "Behaviour `enabled` nothing lowered (a script writes it, or a "
+             "row was authored disabled)."),
             # ponytail: cpprust copies a string through a pointer shallowly
             (r"_engine_map_at_si_std_string\s*\(",
              "A string-valued Dictionary element (`d[key]`) is not lowered "
@@ -10178,6 +10183,33 @@ def _emit_engine_gameobject_tables(
     p("static int GameObject_CompareTag(int go, const char *t) {")
     p("    return strcmp(GameObject_tag(go), t ? t : \"\") == 0;")
     p("}")
+    gl = [int(l) for l in plan.get("go_layers") or []]
+    if gl:
+        # ponytail: authored layers only; a clone's (or a runtime
+        # `gameObject.layer =`) is not tracked, so reading one stops
+        p("static const unsigned char _engine_go_layer[%d] = { %s };"
+          % (len(gl), ", ".join(map(str, gl))))
+        p("static int GameObject_layer(int go) {")
+        p("    if (go < 0 || go >= %d) {" % len(gl))
+        p('        fprintf(stderr, "GameObject.layer of a GameObject crust'
+          ' has no authored layer for is not lowered; stopping rather than'
+          ' guessing it\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    return _engine_go_layer[go];")
+        p("}")
+    import tools.unity_pack_common as _cmm
+    if _cmm.SOURCE_LAYER_MATRIX:
+        p("static const unsigned _engine_layer_matrix[32] = { %s };"
+          % ", ".join("%du" % v for v in _cmm.SOURCE_LAYER_MATRIX))
+        p("static int Physics2D_GetLayerCollisionMask(int layer) {")
+        p("    if (layer < 0 || layer > 31) {")
+        p('        fprintf(stderr, "ArgumentOutOfRangeException: layer must be'
+          ' in the range 0 to 31\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    return (int)_engine_layer_matrix[layer];")
+        p("}")
     if plan.get("collider2d"):
         # defined with the colliders, after the scripts that call it
         p("static int _col2d_go(int ci);")
@@ -25039,6 +25071,18 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
            for m in re.finditer(r"(?<![\w.])([A-Za-z_][\w.<>\[\]]*)\s+i\s*"
                                 r"(?:[=;,)]|\bin\b)", cs2cpp._blank(body))):
         body = cs2cpp.code_sub(r"(?<![\w.])i\b", "_cs_i", body)
+    # `enabled` is the authored m_Enabled: crust runs every packed script
+    # enabled, so it is 1 where every row was authored enabled and no
+    # script writes it (a write is not lowered, its method stubs)
+    import tools.unity_pack_common as _cme
+    insts = cl.get("instances") or []
+    bases = plan.get("mb_bases") or {}
+    written = _cme.SOURCE_ENABLED_WRITTEN
+    if insts and all(int(o.get("mb_enabled", 1)) for o in insts) and not (
+            written & {"MonoBehaviour", "Behaviour"}
+            or any(_mb_is_a(cl["name"], w, bases) for w in written)):
+        body = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?enabled\b(?!\s*=(?!=))", "1", body)
     text = _trap_tmp_writes(body, plan, site)
     text = _own_string_params(text, site)
     text = _drop_iface_tick_loops(text, plan, site)
@@ -26060,6 +26104,11 @@ def _late_call_members(text, plan):
             text = _fill_defaults_after(text, _method_c_symbol(
                 _c_ident(cn), m["name"], m.get("args") or "", False), prms,
                 receiver=True)
+    if plan.get("go_layers"):
+        text = _call_suffix_sub(
+            text, gos | set(re.findall(r"\b_engine_go_of_\w+", text)),
+            r"(?:\s*\.\s*gameObject\b)?\s*\.\s*layer\b(?!\s*[-+*/|&^]?=(?!=))",
+            lambda call, mm: "GameObject_layer(%s)" % call)
     if plan.get("animators"):
         anims = {g for g in gos if any(
             "%s_get_%s" % (_c_ident(cn), f["name"]) == g
@@ -28627,10 +28676,29 @@ def pack(root, outdir, *args, **kwargs):
     _ia_serialized = _inp.serialized_actions(root)
     _common.SOURCE_LAYER_NAMES.clear()
     _common.SOURCE_LAYER_NAMES.update(_layer_names)
+    _common.SOURCE_LAYER_MATRIX[:] = _phys.read_layer_matrix(root) or []
+    _common.SOURCE_ENABLED_WRITTEN.clear()
+    for t in files.values():
+        scan = cs2cpp._blank(t)
+        if re.search(r"(?<![\w.])(?:this\s*\.\s*)?enabled\s*=(?!=)", scan):
+            _common.SOURCE_ENABLED_WRITTEN.update(
+                re.findall(r"\bclass\s+(\w+)", scan))
+        for m in re.finditer(r"(\w+)\s*(?:>\s*\(\s*\))?\s*\.\s*enabled\s*"
+                             r"=(?!=)", scan):
+            r = m.group(1)
+            gc = re.search(r"GetComponent\w*\s*<\s*(\w+)\s*>\s*\(\s*\)\s*\."
+                           r"\s*enabled\s*=(?!=)", scan[max(0, m.start() - 80):
+                                                        m.end()])
+            if gc:
+                _common.SOURCE_ENABLED_WRITTEN.add(gc.group(1))
+            _common.SOURCE_ENABLED_WRITTEN.update(re.findall(
+                r"(\w+)\s*(?:\[\s*\])?\s+%s\b" % re.escape(r), scan))
+    _has_remove = _phys.has_standard_remove(files.values())
     _n = [0]
     for fp in sorted(files):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
-        t = _phys.desugar_layers(t, _layer_names)
+        t = _phys.desugar_layers(t, _layer_names,
+                                 _common.SOURCE_LAYER_MATRIX, _has_remove)
         t = _inp.desugar_input_actions(t, _common.SOURCE_INPUT_ACTIONS,
                                        os.path.relpath(fp, root),
                                        _ia_serialized.get(os.path.abspath(fp)))

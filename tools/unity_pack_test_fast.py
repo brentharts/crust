@@ -1834,6 +1834,56 @@ class TestHybrid(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
 
 
+class TestLayerMaskAwake(unittest.TestCase):
+    """Slime Jump's Player.Awake: `enabled` of an authored-enabled script,
+    `Physics2D.GetLayerCollisionMask(gameObject.layer)` from the authored
+    matrix, and the LayerMaskExtensions `Remove` (an unknown name is bit 31,
+    `1 << -1`). Layer 4's word is 0x800000f0; less Water (4) and bit 31."""
+
+    @needs_cc
+    def test_mask_remove(self):
+        a = ("using UnityEngine;\nusing Extensions;\n"
+             "public class A : MonoBehaviour {\n    LayerMask m;\n"
+             "    void Start() {\n        if (!enabled) return;\n"
+             "        m = Physics2D.GetLayerCollisionMask(gameObject.layer);\n"
+             "        m = m.Remove(\"Water\", \"Nope\");\n"
+             "        Debug.Log(\"m \" + (int)m + \" \" + gameObject.layer);\n"
+             "    }\n}\n")
+        # Slime Jump's LayerMaskExtensions, the two methods used
+        ext = ("using UnityEngine;\nnamespace Extensions\n{\n"
+               "\tpublic static class LayerMaskExtensions\n\t{\n"
+               "\t\tpublic static LayerMask FromLayerNames (params string[] layerNames)\n"
+               "\t\t{\n\t\t\tLayerMask ret = (LayerMask) 0;\n"
+               "\t\t\tforeach (string name in layerNames)\n"
+               "\t\t\t\tret |= (1 << LayerMask.NameToLayer(name));\n"
+               "\t\t\treturn ret;\n\t\t}\n"
+               "\t\tpublic static LayerMask Remove (this LayerMask original, params string[] layerNames)\n"
+               "\t\t{\n\t\t\tLayerMask invertedOriginal = ~original;\n"
+               "\t\t\treturn ~(invertedOriginal | FromLayerNames(layerNames));\n"
+               "\t\t}\n\t}\n}\n")
+        root = project(self, {"A": a, "LayerMaskExtensions": ext}, [("A",)])
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(scene) as f:
+            text = f.read().replace("GameObject:\n", "GameObject:\n  m_Layer: 4\n")
+        with open(scene, "w") as f:
+            f.write(text)
+        os.makedirs(os.path.join(root, "ProjectSettings"))
+        with open(os.path.join(root, "ProjectSettings",
+                               "Physics2DSettings.asset"), "w") as f:
+            f.write("  m_LayerCollisionMatrix: %s\n"
+                    % ("ffffffff" * 4 + "f0000080" + "ffffffff" * 27))
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("m 224 4", out)
+
+    def test_written_enabled_refused(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    void Start() { if (!enabled) return; Debug.Log(\"on\"); }\n"
+             "    void OnDisable() { enabled = true; }\n}\n")
+        root = project(self, {"A": a}, [("A",)])
+        with self.assertRaises(unity_pack.PackError):
+            pack(self, root)
+
+
 def _run_rc(test, out, frames=1):
     """Like run_frames, but a stop is the result: (exit code, stdout,
     stderr)."""
