@@ -1967,6 +1967,27 @@ class TestPlayerAwakeItems(unittest.TestCase):
         self.assertNotIn("got", out)
 
 
+class TestChildColliderBody(unittest.TestCase):
+    """Slime Jump's player: its collider is on a child GameObject with no
+    Rigidbody2D, which Unity puts on the nearest ancestor's body -- left
+    static, the player fell through the floor."""
+
+    def test_nearest_ancestor_rb(self):
+        import tools.unity_pack_physics as phys
+        box = {"kind": "box", "enabled": 1}
+        plan = {"rigidbody2d": [{"owner_class": "P", "owner_inst": 0,
+                                 "body_type": 0}],
+                "classes": {
+                    "P": {"instances": [{"xf_id": "10"}]},
+                    "Mid": {"instances": [{"xf_id": "20", "father_id": "10"}]},
+                    "C": {"instances": [
+                        {"xf_id": "30", "father_id": "20", "collider2d": box},
+                        {"xf_id": "40", "collider2d": box}]}}}
+        cols = phys._build_collider2d_tables(plan)
+        self.assertEqual([(c["owner_inst"], c["rb2d"], c["body_type"])
+                          for c in cols], [(0, 0, 0), (1, -1, 2)])
+
+
 class TestUnpackedClassCall(unittest.TestCase):
     """`g.Use();` on a class crust packs no methods of (Slime Jump's
     `World.Instance.SetPieces()`, `fallerObject.Awake()`): Unity's NRE for

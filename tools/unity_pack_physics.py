@@ -434,6 +434,26 @@ def _build_collider2d_tables(plan):
     rb_of = {}
     for ri, r in enumerate(plan.get("rigidbody2d") or []):
         rb_of[(r["owner_class"], r["owner_inst"])] = ri
+    # Unity: a collider sits on the Rigidbody2D of its GameObject or of the
+    # nearest ancestor's (the glue offsets it from that body's origin)
+    xf_rb, father = {}, {}
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            x = str(o.get("xf_id") or 0)
+            if x == "0":
+                continue
+            father[x] = str(o.get("father_id") or 0)
+            if (cname, i) in rb_of:
+                xf_rb[x] = rb_of[(cname, i)]
+
+    def ancestor_rb(o):
+        x, seen = str(o.get("father_id") or 0), set()
+        while x != "0" and x not in seen:
+            if x in xf_rb:
+                return xf_rb[x]
+            seen.add(x)
+            x = father.get(x, "0")
+        return None
     for cname, cl in sorted(plan["classes"].items()):
         cid = class_ids[cname]
         for i, o in enumerate(cl.get("instances") or []):
@@ -453,6 +473,10 @@ def _build_collider2d_tables(plan):
             if not c or not c.get("enabled", 1):
                 continue
             rb_i = rb_of.get((cname, i))
+            if rb_i is None:
+                rb_i = xf_rb.get(str(o.get("xf_id") or 0))
+            if rb_i is None:
+                rb_i = ancestor_rb(o)
             body = 2  # static (no RB)
             if rb_i is not None:
                 body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)

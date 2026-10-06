@@ -15797,6 +15797,27 @@ def _emit_engine_colliders_2d(
         class_ids, col2d_list, collision2d_handlers, p, plan, want_col2d,
         want_collision2d_msgs, want_go_tables, want_destroy=False):
     """emit_engine: Collider2D centers and OnCollision*2D messages (physics is Box2D-Packed)."""
+    rbs = plan.get("rigidbody2d") or []
+    # a child collider on an ancestor's body (_build_collider2d_tables): its
+    # messages go to that Rigidbody2D's object too, as Unity's do
+    on_other_body = any(
+        0 <= int(c["rb2d"]) < len(rbs)
+        and (rbs[int(c["rb2d"])]["owner_class"],
+             rbs[int(c["rb2d"])]["owner_inst"])
+        != (c["owner_class"], c["owner_inst"])
+        for c in col2d_list or ())
+
+    def to_body_too(send):
+        if not on_other_body:
+            return
+        p("    {")
+        p("        int rb = _Collider2D_rb2d[ci_self];")
+        p("        if (rb >= 0 && (_Rigidbody2D_owner_class[rb] != oc")
+        p("            || (unsigned)_Rigidbody2D_owner_inst[rb] != oi))")
+        p("            %s(_Rigidbody2D_owner_class[rb]," % send)
+        p("                (unsigned)_Rigidbody2D_owner_inst[rb],"
+          " ci_other, kind);")
+        p("    }")
     if want_col2d and col2d_list:
         p("/* Authored BoxCollider2D / CircleCollider2D — centers for Box2D-Packed */")
         p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
@@ -16010,12 +16031,21 @@ def _emit_engine_colliders_2d(
                 _godot.emit_signal_dispatch(
                     p, plan, col2d_list, _c_ident,
                     bool(want_destroy and plan.get("go_names")), _guard)
+            p("static void _col2d_send_to(int oc, unsigned oi, int ci_other,"
+              " int kind);")
             p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
             p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
             p("    int oc = _Collider2D_owner_class[ci_self];")
             p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
             if contacts:
                 p("    _col2d_msg_self = ci_self;")
+            p("    _col2d_send_to(oc, oi, ci_other, kind);")
+            to_body_too("_col2d_send_to")
+            if godot_signals:
+                p("    if (kind != 1) _godot_signal(ci_self, ci_other, kind);")
+            p("}")
+            p("static void _col2d_send_to(int oc, unsigned oi, int ci_other,"
+              " int kind) {")
             p("    switch (oc) {")
             for cname in sorted(collision2d_handlers.keys()):
                 cid = class_ids.get(cname)
@@ -16043,8 +16073,7 @@ def _emit_engine_colliders_2d(
                 p("        break;")
             p("    default: break;")
             p("    }")
-            if godot_signals:
-                p("    if (kind != 1) _godot_signal(ci_self, ci_other, kind);")
+            p("    (void)oi; (void)ci_other; (void)kind;")
             p("}")
             p("")
             p("static void engine_physics_collide2d_messages(void) {")
@@ -16130,10 +16159,17 @@ def _emit_engine_colliders_2d(
                              "OnTriggerExit2D") if m in msgs]
             if t:
                 trig[cname] = t
+        p("static void _col2d_trigger_to(int oc, unsigned oi, int ci_other,"
+          " int kind);")
         p("static void _col2d_send_trigger(int ci_self, int ci_other, int kind) {")
         p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
         p("    int oc = _Collider2D_owner_class[ci_self];")
         p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+        p("    _col2d_trigger_to(oc, oi, ci_other, kind);")
+        to_body_too("_col2d_trigger_to")
+        p("}")
+        p("static void _col2d_trigger_to(int oc, unsigned oi, int ci_other,"
+          " int kind) {")
         p("    switch (oc) {")
         for cname in sorted(trig):
             cid = class_ids.get(cname)
@@ -16157,7 +16193,7 @@ def _emit_engine_colliders_2d(
             p("        break;")
         p("    default: break;")
         p("    }")
-        p("    (void)oi;")
+        p("    (void)oi; (void)ci_other; (void)kind;")
         p("}")
         p("static void engine_physics_trigger2d_messages(void) {")
         p("    int i, lo, hi;")
