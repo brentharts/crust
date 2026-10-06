@@ -111,13 +111,14 @@ def pack(test, root, strict=True):
     return out
 
 
-def run_frames(test, out, frames=1, body=""):
+def run_frames(test, out, frames=1, body="", pre=""):
     """Run the packed engine *frames* ticks at 60 fps (then *body*, C over
-    engine_draw.h) and return its stdout lines (Debug.Log included)."""
+    engine_draw.h; *pre*: C before main) and return its stdout lines
+    (Debug.Log included)."""
     src = os.path.join(out, "h.c")
     with open(src, "w") as f:
         f.write('#include <stdio.h>\n#include "engine_draw.h"\n'
-                "extern float Time_deltaTime;\n"
+                "extern float Time_deltaTime;\n" + pre +
                 "int main(int c, char **v) { int f;\n"
                 "  engine_apply_argv(c, v); Time_deltaTime = 1.f / 60.f;\n"
                 "  for (f = 0; f < %d; f++) engine_tick();\n  %s\n  return 0; }\n"
@@ -927,6 +928,512 @@ public class Mgr : MonoBehaviour {
         self.assertIn("embedded struct", str(cm.exception))
 
 
+class TestAnimatorStateMachine(unittest.TestCase):
+    """An Animator field runs its controller: `Play` switches state at the
+    animator update (after Update), `IsName` reads the current one, the
+    clip's float curve writes the script's field, and the exit-time
+    transition returns to the default state."""
+
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    public Animator anim;
+    public Vector2 multiplySize = Vector2.one;
+    int f;
+    void Update() {
+        f++;
+        if (f == 2) anim.Play("Squash");
+        if (f == 2 || f == 3 || f == 5 || f == 20)
+            Debug.Log("f" + f + " " + (anim.GetCurrentAnimatorStateInfo(0).IsName("Squash") ? 1 : 0) + " " + (int)(multiplySize.x * 100f + 0.5f));
+    }
+}
+"""
+    CTRL = """%YAML 1.1
+--- !u!91 &9100000
+AnimatorController:
+  m_Name: C
+  m_AnimatorParameters: []
+  m_AnimatorLayers:
+  - serializedVersion: 5
+    m_Name: Base Layer
+    m_StateMachine: {fileID: 1107000}
+    m_Mask: {fileID: 0}
+    m_BlendingMode: 0
+    m_SyncedLayerIndex: -1
+    m_DefaultWeight: 0
+--- !u!1107 &1107000
+AnimatorStateMachine:
+  m_Name: Base Layer
+  m_ChildStates:
+  - serializedVersion: 1
+    m_State: {fileID: 1102001}
+  - serializedVersion: 1
+    m_State: {fileID: 1102002}
+  m_ChildStateMachines: []
+  m_AnyStateTransitions: []
+  m_EntryTransitions: []
+  m_DefaultState: {fileID: 1102001}
+--- !u!1102 &1102001
+AnimatorState:
+  m_Name: Idle
+  m_Speed: 1
+  m_CycleOffset: 0
+  m_Transitions: []
+  m_Motion: {fileID: 0}
+--- !u!1102 &1102002
+AnimatorState:
+  m_Name: Squash
+  m_Speed: 1
+  m_CycleOffset: 0
+  m_Transitions:
+  - {fileID: 1101003}
+  m_Motion: {fileID: 7400000, guid: CLIPGUID, type: 2}
+--- !u!1101 &1101003
+AnimatorStateTransition:
+  m_Conditions: []
+  m_DstState: {fileID: 1102001}
+  m_Mute: 0
+  m_IsExit: 0
+  m_TransitionDuration: 0
+  m_TransitionOffset: 0
+  m_ExitTime: 1
+  m_HasExitTime: 1
+"""
+    CLIP = """%YAML 1.1
+--- !u!74 &7400000
+AnimationClip:
+  m_Name: Squash
+  m_PositionCurves: []
+  m_FloatCurves:
+  - serializedVersion: 2
+    curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: 1
+        inSlope: -5
+        outSlope: -5
+        weightedMode: 0
+      - serializedVersion: 3
+        time: 0.1
+        value: 0.5
+        inSlope: -5
+        outSlope: -5
+        weightedMode: 0
+    attribute: multiplySize.x
+    path: 
+    classID: 114
+  m_PPtrCurves: []
+  m_AnimationClipSettings:
+    m_StopTime: 0.1
+    m_LoopTime: 0
+"""
+    ANIMATOR = ("--- !u!95 &{fid}\nAnimator:\n  m_GameObject: {{fileID: {go}}}\n"
+                "  m_Enabled: 1\n  m_Controller: {{fileID: 9100000, guid: "
+                "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0, type: 2}}\n")
+
+    def _project(self, ctrl=None):
+        root = project(self, {"Mgr": self.MGR}, [
+            ("Mgr", self.ANIMATOR,
+             "  anim: {fileID: 103}\n  multiplySize: {x: 1, y: 1}\n")])
+        d = os.path.join(root, "Assets", "Animations")
+        os.makedirs(d)
+        for name, guid, text in (
+                ("C.controller", "c0" * 16,
+                 (ctrl or self.CTRL).replace("CLIPGUID", "d0" * 16)),
+                ("Squash.anim", "d0" * 16, self.CLIP)):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+            with open(os.path.join(d, name + ".meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+        return root
+
+    @needs_cc
+    def test_play_isname_curve_and_exit(self):
+        out = run_frames(self, pack(self, self._project()), 20)
+        # f2: Play is pending; f3/f5: Squash after 1 and 3 animator ticks
+        # (value 1 - 5t); f20: back in Idle through the exit transition
+        self.assertIn("f2 0 100", out)
+        self.assertIn("f3 1 92", out)
+        self.assertIn("f5 1 75", out)
+        self.assertTrue(any(l.startswith("f20 0 ") for l in out), out)
+
+    def test_parameters_are_refused(self):
+        ctrl = self.CTRL.replace(
+            "  m_AnimatorParameters: []\n",
+            "  m_AnimatorParameters:\n  - m_Name: Speed\n    m_Type: 1\n")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            pack(self, self._project(ctrl))
+        self.assertIn("parameters", str(cm.exception))
+
+
+class TestColliderBounds(unittest.TestCase):
+    """`Collider2D.bounds` of a field (Slime Jump's wall probe): the world
+    AABB of a rotated, offset box and of a capsule."""
+
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    public BoxCollider2D box;
+    public Collider2D cap;
+    int f;
+    void Update() {
+        f++; if (f > 1) return;
+        Vector2 c = (Vector2) box.bounds.center + Vector2.down * box.bounds.extents.y;
+        Debug.Log("box " + R(box.bounds.center.x) + " " + R(box.bounds.center.y) + " " + R(box.bounds.extents.x) + " " + R(box.bounds.max.y) + " " + R(box.bounds.size.x) + " " + R(c.y));
+        Debug.Log("cap " + R(cap.bounds.min.x) + " " + R(cap.bounds.extents.y));
+    }
+    static int R(float v) { return Mathf.RoundToInt(v * 100f); }
+}
+"""
+    BOX = ("--- !u!61 &{fid}\nBoxCollider2D:\n  m_GameObject: {{fileID: {go}}}\n"
+           "  m_Enabled: 1\n  m_Offset: {{x: 0.5, y: 0}}\n  m_Size: {{x: 2, y: 1}}\n")
+    CAP = ("--- !u!70 &{fid}\nCapsuleCollider2D:\n  m_GameObject: {{fileID: {go}}}\n"
+           "  m_Enabled: 1\n  m_Offset: {{x: 0, y: 0}}\n  m_Size: {{x: 1, y: 3}}\n"
+           "  m_Direction: 0\n")
+
+    @needs_cc
+    def test_box_and_capsule(self):
+        log = "using UnityEngine;\npublic class Log : MonoBehaviour { }\n"
+        root = project(self, {"Mgr": self.MGR, "Log": log}, [
+            ("Mgr", self.BOX, "  box: {fileID: 103}\n  cap: {fileID: 113}\n",
+             (0.0, 0.0, 0.70710678, 0.70710678)),
+            ("Log", self.CAP)])
+        # no Box2D in this harness: nothing moves
+        out = run_frames(self, pack(self, root), 1,
+                         pre="void engine_box2d_step(float dt) { (void)dt; }\n")
+        # turned 90 degrees: the 2 x 1 box offset (0.5, 0) is 1 x 2 at (0, 0.5)
+        self.assertIn("box 0 50 50 150 100 -50", out)
+        # the capsule at x = 1: 1 wide, 3 tall
+        self.assertIn("cap 50 150", out)
+
+
+class TestPrefabInstantiateAt(unittest.TestCase):
+    """`Instantiate(prefabField, pos, Quaternion.identity)` of an unplaced
+    prefab (Slime Jump's dust clouds): clones at *pos*; a destroyed clone's
+    slot is reused."""
+
+    @needs_cc
+    def test_clone_at_position(self):
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public Cloud prefab;\n    Vector2 at;\n    int f;\n"
+               "    void Update() {\n        f++;\n"
+               "        if (f <= 2) { at = new Vector2(f * 3, 2f); "
+               "Instantiate(prefab, at, Quaternion.identity); }\n    }\n}\n")
+        cloud = ("using UnityEngine;\npublic class Cloud : MonoBehaviour {\n"
+                 "    public float life;\n    float t;\n"
+                 "    void Start() { Debug.Log(\"cloud \" + Mathf.RoundToInt("
+                 "transform.position.x) + \" \" + Mathf.RoundToInt("
+                 "transform.position.y) + \" \" + Mathf.RoundToInt(life)); "
+                 "Destroy(gameObject, 0.04f); }\n"
+                 "    void Update() { t += Time.deltaTime; }\n"
+                 "    void OnDestroy() { Debug.Log(\"gone \" + "
+                 "Mathf.RoundToInt(t * 60f)); }\n}\n")
+        root = project(self, {"Cloud": cloud, "Mgr": mgr}, [
+            ("Mgr", None, "  prefab: {fileID: 12, guid: %032x, type: 3}\n"
+             % 99)])
+        with open(os.path.join(root, "Assets", "Cloud.prefab"), "w") as f:
+            f.write("%%YAML 1.1\n--- !u!1 &10\nGameObject:\n  m_Name: Cloud\n"
+                    "  m_Component:\n  - component: {fileID: 11}\n"
+                    "  - component: {fileID: 12}\n"
+                    "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_LocalPosition: {x: 7, y: 7, z: 0}\n"
+                    "--- !u!114 &12\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_Script: {fileID: 11500000, guid: %032x}\n"
+                    "  life: 5\n" % 1)
+        with open(os.path.join(root, "Assets", "Cloud.prefab.meta"), "w") as f:
+            f.write("guid: %032x\n" % 99)
+        out = run_frames(self, pack(self, root), 6)
+        self.assertEqual([l for l in out if l.startswith("cloud")],
+                         ["cloud 3 2 5", "cloud 6 2 5"])
+        # `Destroy(gameObject, 0.04f)`: gone after its 2nd or 3rd Update
+        gone = [l for l in out if l.startswith("gone")]
+        self.assertEqual(len(gone), 2, out)
+        self.assertTrue(all(l in ("gone 2", "gone 3") for l in gone), out)
+
+
+class TestSpriteRendererColor(unittest.TestCase):
+    """`sr.color = sr.color.SetAlpha(a)` through a SpriteRenderer field
+    (Slime Jump's dust cloud fade): the authored tint, then the set one."""
+
+    @needs_cc
+    def test_fade(self):
+        ext = ("using UnityEngine;\npublic static class ColorExtensions {\n"
+               "    public static Color SetAlpha(this Color c, float a) {\n"
+               "        return new Color(c.r, c.g, c.b, a);\n    }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public SpriteRenderer sr;\n    int f;\n"
+               "    void Update() {\n        f++;\n"
+               "        Debug.Log(\"a\" + f + \" \" + Mathf.RoundToInt("
+               "sr.color.a * 100f) + \" \" + Mathf.RoundToInt(sr.color.g * 100f));\n"
+               "        sr.color = sr.color.SetAlpha(0.25f);\n    }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Color: {{r: 1, g: 0.5, b: 1, a: 0.5}}\n"
+               "  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"ColorExtensions": ext, "Mgr": mgr}, [
+            ("Mgr", spr, "  sr: {fileID: 103}\n")])
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("a1 50 50", out)
+        self.assertIn("a2 25 50", out)
+
+
+class TestHandleEulerZ(unittest.TestCase):
+    """`t.eulerAngles += Vector3.forward * d` and `t.eulerAngles =
+    Vector3.zero` through a Transform field (Slime Jump's lasso swing)."""
+
+    @needs_cc
+    def test_step_and_reset(self):
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public Transform other;\n    int f;\n    void Update() {\n"
+               "        f++;\n        if (f <= 2) other.eulerAngles += Vector3.forward * 30f / 2f * 3f;\n"
+               "        if (f == 3) other.eulerAngles = Vector3.zero;\n    }\n}\n")
+        log = ("using UnityEngine;\npublic class Log : MonoBehaviour {\n"
+               "    int f;\n    void LateUpdate() {\n        f++;\n"
+               "        Debug.Log(\"z\" + f + \" \" + Mathf.RoundToInt(transform.eulerAngles.z));\n"
+               "    }\n}\n")
+        root = project(self, {"Mgr": mgr, "Log": log}, [
+            ("Mgr", None, "  other: {fileID: 111}\n"), ("Log",)])
+        out = run_frames(self, pack(self, root), 3)
+        for want in ("z1 45", "z2 90", "z3 0"):
+            self.assertIn(want, out)
+
+    @needs_cc
+    def test_through_singleton(self):
+        """`Hook.instance.trs.eulerAngles += ..` (`Lasso.instance.hookTrs`)."""
+        hook = ("using UnityEngine;\npublic class Hook : MonoBehaviour {\n"
+                "    public static Hook instance;\n    public Transform trs;\n"
+                "    void Awake() { instance = this; }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    int f;\n    void Update() {\n        f++;\n"
+               "        if (f <= 2) Hook.instance.trs.eulerAngles += "
+               "Vector3.forward * 30f;\n    }\n}\n")
+        log = ("using UnityEngine;\npublic class Log : MonoBehaviour {\n"
+               "    int f;\n    void LateUpdate() {\n        f++;\n"
+               "        Debug.Log(\"z\" + f + \" \" + Mathf.RoundToInt(transform.eulerAngles.z));\n"
+               "    }\n}\n")
+        root = project(self, {"Hook": hook, "Mgr": mgr, "Log": log}, [
+            ("Mgr",), ("Hook", None, "  trs: {fileID: 121}\n"), ("Log",)])
+        out = run_frames(self, pack(self, root), 2)
+        for want in ("z1 30", "z2 60"):
+            self.assertIn(want, out)
+
+
+class TestDropAchievementsSounds(unittest.TestCase):
+    """Slime Jump's StartJump: achievement and sound statements become `;`
+    (lines kept); a HandleAchieve whose result is read stays."""
+
+    def test_drop(self):
+        src = ("void StartJump () {\n"
+               "\tif (a) JumpAchievement.Instance.HandleAchieve ();\n"
+               "\tJumpAchievement.JumpCount ++;\n"
+               "\tAudioClip jumpSound = jumpSounds[Random.Range(0, 3)];\n"
+               "\tSoundEffect s = AudioManager.instance.MakeSoundEffect("
+               "jumpSound, Vector3.zero, v);\n"
+               "\ts.audioSource.pitch = r.Get(Random.value);\n"
+               "\ts.audioSource.spatialBlend = 0;\n"
+               "\tbool b = WinAchievement.Instance.HandleAchieve();\n}\n")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            out = unity_pack._desugar_drop_achievements_sounds(src, "P.cs")
+        self.assertEqual(out.count("\n"), src.count("\n"))
+        self.assertIn("if (a) ;", out)
+        for gone in ("JumpCount", "jumpSound", "audioSource", "SoundEffect"):
+            self.assertNotIn(gone, out)
+        self.assertIn("WinAchievement.Instance.HandleAchieve()", out)
+        self.assertIn("lines 2, 3, 4, 5, 6, 7", err.getvalue())
+
+
+class TestLocalNamedI(unittest.TestCase):
+    """`for (int i = 0; ..) speed += 1f;`: the packed instance index is `i`,
+    so the loop counter took its place and each pass bumped instance
+    0, 1 (A0 11, A1 22) instead of this one twice."""
+
+    @needs_cc
+    def test_loop_counter_i(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public float speed;\n    int f;\n"
+             "    void Update() { f++; if (f > 1) return;\n"
+             "        for (int i = 0; i < 2; i++) speed += 1f;\n"
+             "        Debug.Log(name + \" \" + speed); }\n}\n")
+        root = project(self, {"A": a}, [("A", None, "  speed: 10\n"),
+                                        ("A", None, "  speed: 20\n")])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("A0 12", out)
+        self.assertIn("A1 22", out)
+
+
+class TestStopSite(unittest.TestCase):
+    """A runtime stop in a helper (`SpriteRenderer.bounds` of a renderer
+    crust does not draw) names the C# call: script, line, column."""
+
+    @needs_cc
+    def test_helper_stop_has_site(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public SpriteRenderer sr;\n"
+             "    void Update() {\n"
+             "        float x = sr.bounds.extents.x;\n"
+             "        Debug.Log(\"x \" + x);\n    }\n}\n")
+        extra = ("--- !u!212 &{fid}\nSpriteRenderer:\n"
+                 "  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"A": a}, [("A", extra, "  sr: {fileID: 103}\n")])
+        out = pack(self, root)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f; engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe,
+                            os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 70, run.stderr[-2000:])
+        self.assertIn("SpriteRenderer.bounds", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:5:19)", run.stderr)
+
+
+class TestTwoScriptsOneGameObject(unittest.TestCase):
+    """Slime Jump's Player GO also carries AffectedByVortex: every script
+    on a GO was folded into the first one's object (fields merged, the
+    second had no row, `player.affectedByVortex` was null)."""
+
+    @needs_cc
+    def test_second_script_is_its_own_row(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public float speed;\n    public B b;\n    int f;\n"
+             "    void Update() { f++; if (f > 1) return;\n"
+             "        Debug.Log(\"s \" + speed + \" \" + b.speed + \" \" + "
+             "GetComponent<B>().speed); }\n}\n")
+        b = ("using UnityEngine;\npublic class B : MonoBehaviour {\n"
+             "    public float speed;\n"
+             "    void Start() { Debug.Log(\"b start \" + speed); }\n}\n")
+        extra = ("--- !u!114 &{fid}\nMonoBehaviour:\n"
+                 "  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_Script: {{fileID: 11500000, guid: %032x}}\n"
+                 "  speed: 7\n" % 2)
+        root = project(self, {"A": a, "B": b}, [
+            ("A", extra, "  speed: 3\n  b: {fileID: 103}\n")])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("b start 7", out)
+        self.assertIn("s 3 7 7", out)
+
+
+class TestNullFieldRead(unittest.TestCase):
+    """`other.v` through a null reference (Slime Jump's unset
+    `affectedByVortex.velocity`) read out of bounds; it is Unity's NRE.
+    This pack has no script unwinding, so it stops (exit 70) before the
+    `read` log."""
+
+    @needs_cc
+    def test_nre_stops(self):
+        o = ("using UnityEngine;\npublic class O : MonoBehaviour {\n"
+             "    public Vector2 v;\n}\n")
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public O other;\n    int f;\n"
+             "    void Update() {\n        f++;\n"
+             "        Debug.Log(\"tick \" + f);\n"
+             "        float x = other.v.x;\n"
+             "        Debug.Log(\"read \" + x);\n    }\n}\n")
+        root = project(self, {"O": o, "A": a}, [("A", None, "  other: {fileID: 0}\n"),
+                                                ("O",)])
+        out = pack(self, root)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f;\n"
+                    "  engine_tick(); engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe,
+                            os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 70, run.stderr[-2000:])
+        self.assertIn("NullReferenceException", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:8:19)", run.stderr)
+        self.assertIn("tick 1", run.stdout)
+        self.assertNotIn("read", run.stdout)
+
+
+class TestMethodGroupStub(unittest.TestCase):
+    """`Ev.Add(Show, t)` (Slime Jump's Achievement.OnAchieve) reached
+    crust as an undeclared `Show`; it is a CS8000 stub."""
+
+    def test_method_group(self):
+        ev = ("using UnityEngine;\nusing System;\npublic class Ev : MonoBehaviour {\n"
+              "    public static void Add(Action a, float t) { }\n}\n")
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    void Show() { }\n"
+             "    void Update() { Ev.Add(Show, Time.time); }\n}\n")
+        root = project(self, {"Ev": ev, "A": a}, [("A",)])
+        out = tempfile.mkdtemp(prefix="upf-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            unity_pack.pack(root, out, force=True)
+        self.assertIn("`A.Update` is not lowered yet (`Show`: Method group",
+                      err.getvalue())
+
+
+class TestVector2FieldAssign(unittest.TestCase):
+    """A Vector2 field store was `set_x(..); set_y(..);`: an unbraced
+    `if` / `else` around it did not compile (Slime Jump's `blasterLaunchVel
+    *= ..`), and `v = new Vector2(v.y, v.x)` read the new x for y."""
+
+    @needs_cc
+    def test_swap_and_unbraced_else(self):
+        src = ("using UnityEngine;\npublic class V : MonoBehaviour {\n"
+               "    public Vector2 vel = new Vector2(1f, 2f);\n"
+               "    bool flip = true;\n"
+               "    void Update() {\n"
+               "        if (flip)\n            vel = new Vector2(vel.y, vel.x);\n"
+               "        else\n            vel *= 2f;\n        flip = false;\n"
+               "        Debug.Log(\"v \" + Mathf.RoundToInt(vel.x) + \" \" + "
+               "Mathf.RoundToInt(vel.y));\n    }\n}\n")
+        root = project(self, {"V": src}, [("V", None, "  vel: {x: 1, y: 2}\n")])
+        out = run_frames(self, pack(self, root), 2)
+        self.assertIn("v 2 1", out)
+        self.assertIn("v 4 2", out)
+
+
+class TestSetWorldScaleOne(unittest.TestCase):
+    """`trs.SetWorldScale(Vector3.one.SetX(x))` on a Transform field and
+    `Hook.instance.trs.SetWorldScale(Vector3.one)` (Slime Jump's DoUpdate)."""
+
+    @needs_cc
+    def test_field_and_singleton(self):
+        ext = ("using UnityEngine;\npublic static class Extensions {\n"
+               "    public static Vector3 SetX(this Vector3 v, float x) "
+               "{ v.x = x; return v; }\n"
+               "    public static void SetWorldScale(this Transform t, Vector3 s)"
+               " { t.localScale = s; }\n}\n")
+        hook = ("using UnityEngine;\npublic class Hook : MonoBehaviour {\n"
+                "    public static Hook instance;\n    public Transform trs;\n"
+                "    void Awake() { instance = this; }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public Transform colliderTrs;\n    public float xSize = 2f;\n"
+               "    void Update() {\n"
+               "        colliderTrs.SetWorldScale(Vector3.one.SetX(xSize));\n"
+               "        Hook.instance.trs.SetWorldScale(Vector3.one);\n    }\n}\n")
+        log = ("using UnityEngine;\npublic class Log : MonoBehaviour {\n"
+               "    void LateUpdate() { Debug.Log(name + \" \" + Mathf.RoundToInt("
+               "transform.localScale.x * 10f) + \" \" + Mathf.RoundToInt("
+               "transform.localScale.y * 10f)); }\n}\n")
+        root = project(self, {"Extensions": ext, "Hook": hook, "Mgr": mgr,
+                              "Log": log}, [
+            ("Mgr", None, "  colliderTrs: {fileID: 121}\n  xSize: 2\n"),
+            ("Hook", None, "  trs: {fileID: 131}\n"), ("Log",), ("Log",)])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("Log2 20 10", out)
+        self.assertIn("Log3 10 10", out)
+
+
 class TestInheritedUpdatables(unittest.TestCase):
     """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
     `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class
@@ -1325,6 +1832,229 @@ class TestHybrid(unittest.TestCase):
         self.assertIn("warning CS8000", err)
         self.assertIn("hybrid: DotNetAnywhere not found", err)
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
+
+
+class TestLayerMaskAwake(unittest.TestCase):
+    """Slime Jump's Player.Awake: `enabled` of an authored-enabled script,
+    `Physics2D.GetLayerCollisionMask(gameObject.layer)` from the authored
+    matrix, and the LayerMaskExtensions `Remove` (an unknown name is bit 31,
+    `1 << -1`). Layer 4's word is 0x800000f0; less Water (4) and bit 31."""
+
+    @needs_cc
+    def test_mask_remove(self):
+        a = ("using UnityEngine;\nusing Extensions;\n"
+             "public class A : MonoBehaviour {\n    LayerMask m;\n"
+             "    void Start() {\n        if (!enabled) return;\n"
+             "        m = Physics2D.GetLayerCollisionMask(gameObject.layer);\n"
+             "        m = m.Remove(\"Water\", \"Nope\");\n"
+             "        Debug.Log(\"m \" + (int)m + \" \" + gameObject.layer);\n"
+             "    }\n}\n")
+        # Slime Jump's LayerMaskExtensions, the two methods used
+        ext = ("using UnityEngine;\nnamespace Extensions\n{\n"
+               "\tpublic static class LayerMaskExtensions\n\t{\n"
+               "\t\tpublic static LayerMask FromLayerNames (params string[] layerNames)\n"
+               "\t\t{\n\t\t\tLayerMask ret = (LayerMask) 0;\n"
+               "\t\t\tforeach (string name in layerNames)\n"
+               "\t\t\t\tret |= (1 << LayerMask.NameToLayer(name));\n"
+               "\t\t\treturn ret;\n\t\t}\n"
+               "\t\tpublic static LayerMask Remove (this LayerMask original, params string[] layerNames)\n"
+               "\t\t{\n\t\t\tLayerMask invertedOriginal = ~original;\n"
+               "\t\t\treturn ~(invertedOriginal | FromLayerNames(layerNames));\n"
+               "\t\t}\n\t}\n}\n")
+        root = project(self, {"A": a, "LayerMaskExtensions": ext}, [("A",)])
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(scene) as f:
+            text = f.read().replace("GameObject:\n", "GameObject:\n  m_Layer: 4\n")
+        with open(scene, "w") as f:
+            f.write(text)
+        os.makedirs(os.path.join(root, "ProjectSettings"))
+        with open(os.path.join(root, "ProjectSettings",
+                               "Physics2DSettings.asset"), "w") as f:
+            f.write("  m_LayerCollisionMatrix: %s\n"
+                    % ("ffffffff" * 4 + "f0000080" + "ffffffff" * 27))
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("m 224 4", out)
+
+    def test_written_enabled_refused(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    void Start() { if (!enabled) return; Debug.Log(\"on\"); }\n"
+             "    void OnDisable() { enabled = true; }\n}\n")
+        root = project(self, {"A": a}, [("A",)])
+        with self.assertRaises(unity_pack.PackError):
+            pack(self, root)
+
+
+def _run_rc(test, out, frames=1):
+    """Like run_frames, but a stop is the result: (exit code, stdout,
+    stderr)."""
+    src = os.path.join(out, "h.c")
+    with open(src, "w") as f:
+        f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                "int main(int c, char **v) { int f; engine_apply_argv(c, v);\n"
+                "  Time_deltaTime = 1.f / 60.f;\n"
+                "  for (f = 0; f < %d; f++) engine_tick(); return 0; }\n"
+                % frames)
+    exe = os.path.join(out, "h")
+    r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe, src,
+                        os.path.join(out, "engine.c"),
+                        os.path.join(out, "data.c"), "-lm"],
+                       capture_output=True, text=True)
+    test.assertEqual(r.returncode, 0, r.stderr[-2000:])
+    run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                         text=True, timeout=60)
+    return run.returncode, run.stdout, run.stderr
+
+
+class TestPlayerAwakeItems(unittest.TestCase):
+    """Slime Jump's Player.Awake item loop, over a `Gear` class: a field
+    array stored from GetComponentsInChildren<Gear>,
+    `item.gameObject.activeSelf` and `item.OnGain(this)` on a typed local.
+    The result holds bare Gear row indices, so finding a subclass stops
+    instead of misreading it. Named `Item` it is Slime Jump's item system,
+    out of scope: the store goes and the loop runs no pass."""
+
+    A = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+         "    public Transform itemsParent;\n    public int got;\n"
+         "    Item[] items;\n    void Awake() {\n"
+         "        items = itemsParent.GetComponentsInChildren<Item>();\n"
+         "        for (int i = 0; i < items.Length; i ++) {\n"
+         "            Item item = items[i];\n"
+         "            if (item.gameObject.activeSelf)\n"
+         "                item.OnGain (this);\n        }\n"
+         "        Debug.Log(\"got \" + got);\n    }\n}\n")
+    ITEM = ("using UnityEngine;\npublic class Item : MonoBehaviour {\n"
+            "    public int v;\n"
+            "    public virtual void OnGain (A a) { a.got += v; }\n}\n")
+
+    def _root(self, scripts, child):
+        root = project(self, scripts, [("A", None, "  itemsParent: {fileID: 101}\n"),
+                                       (child, None, "  v: 5\n")])
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            text = f.read().replace(
+                "Transform:\n  m_GameObject: {fileID: 110}\n",
+                "Transform:\n  m_GameObject: {fileID: 110}\n"
+                "  m_Father: {fileID: 101}\n")
+        with open(sc, "w") as f:
+            f.write(text)
+        return root
+
+    def _gear(self, extra=()):
+        s = {"A": self.A.replace("Item", "Gear"),
+             "Gear": self.ITEM.replace("Item", "Gear")}
+        s.update(extra)
+        return s
+
+    @needs_cc
+    def test_items_loop(self):
+        root = self._root(self._gear(), "Gear")
+        self.assertIn("got 5", run_frames(self, pack(self, root), 1))
+
+    @needs_cc
+    def test_item_system_dropped(self):
+        root = self._root({"A": self.A, "Item": self.ITEM}, "Item")
+        self.assertIn("got 0", run_frames(self, pack(self, root, False), 1))
+
+    @needs_cc
+    def test_subclass_found_stops(self):
+        b = ("using UnityEngine;\npublic class Blaster : Gear {\n"
+             "    public override void OnGain (A a) { a.got += 100; }\n}\n")
+        root = self._root(self._gear({"Blaster": b}), "Blaster")
+        rc, out, err = _run_rc(self, pack(self, root, strict=False))
+        self.assertEqual(rc, 70, out + err)
+        self.assertIn("GetComponentsInChildren<Gear> found a Blaster", err)
+        self.assertIn("A.Awake () (at Assets/Scripts/A.cs:7:", err)
+        self.assertNotIn("got", out)
+
+
+class TestChildColliderBody(unittest.TestCase):
+    """Slime Jump's player: its collider is on a child GameObject with no
+    Rigidbody2D, which Unity puts on the nearest ancestor's body -- left
+    static, the player fell through the floor."""
+
+    def test_nearest_ancestor_rb(self):
+        import tools.unity_pack_physics as phys
+        box = {"kind": "box", "enabled": 1}
+        plan = {"rigidbody2d": [{"owner_class": "P", "owner_inst": 0,
+                                 "body_type": 0}],
+                "classes": {
+                    "P": {"instances": [{"xf_id": "10"}]},
+                    "Mid": {"instances": [{"xf_id": "20", "father_id": "10"}]},
+                    "C": {"instances": [
+                        {"xf_id": "30", "father_id": "20", "collider2d": box},
+                        {"xf_id": "40", "collider2d": box}]}}}
+        cols = phys._build_collider2d_tables(plan)
+        self.assertEqual([(c["owner_inst"], c["rb2d"], c["body_type"])
+                          for c in cols], [(0, 0, 0), (1, -1, 2)])
+
+
+class TestSharedTransformRow(unittest.TestCase):
+    """Slime Jump's Player GameObject also carries a `Test` script: its
+    Graphics child followed the Test row, which nothing moves, so the
+    sprite hung at the spawn while the Rigidbody2D fell."""
+
+    def test_child_follows_rigidbody_row(self):
+        plan = {"classes": {
+            "Test": {"instances": [{"xf_id": "10"}]},
+            "Player": {"instances": [{"xf_id": "10", "rigidbody2d": {"body_type": 0}}],
+                       "fields": [{"name": "t", "ty": "Transform"}]},
+            "Graphics": {"instances": [{"xf_id": "20", "father_id": "10"}]}}}
+        plan["classes"]["Player"]["instances"][0]["object_refs"] = {"t": "10"}
+        unity_pack._attach_transform_parents(plan)
+        g = plan["classes"]["Graphics"]["instances"][0]
+        self.assertEqual((g["xf_parent_class"], g["xf_parent_inst"]),
+                         ("Player", 0))
+        unity_pack._resolve_transform_field_targets(plan)
+        self.assertEqual(plan["transform_field_targets"][("Player", "t")],
+                         [(1, 0, "Player")])
+
+
+class TestUnpackedClassCall(unittest.TestCase):
+    """`g.Use();` on a class crust packs no methods of (Slime Jump's
+    `World.Instance.SetPieces()`, `fallerObject.Awake()`): Unity's NRE for
+    a null receiver, else a stop at the call -- not a stubbed method."""
+
+    @needs_cc
+    def test_null_receiver_nre(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public Gadget g;\n    int f;\n"
+             "    void Update() {\n        f++; Debug.Log(\"tick \" + f);\n"
+             "        g.Use ();\n    }\n}\n")
+        g = ("using UnityEngine;\npublic class Gadget : MonoBehaviour {\n"
+             "    public void Use () { Debug.Log(\"used\"); }\n}\n")
+        root = project(self, {"A": a, "Gadget": g},
+                       [("A", None, "  g: {fileID: 0}\n")])
+        rc, out, err = _run_rc(self, pack(self, root, strict=False), 2)
+        self.assertIn("tick 1", out)
+        self.assertNotIn("used", out)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:9)", err)
+
+
+class TestSpriteSwapDropped(unittest.TestCase):
+    """`s = img.sprite;` (Player.Awake's toggle images): the pack draws
+    each Image with its authored sprite, so the statement goes with a
+    CS8000 warning -- but a null Image is still Unity's NRE, at its
+    column."""
+
+    @needs_cc
+    def test_null_image_nre(self):
+        a = ("using UnityEngine;\nusing UnityEngine.UI;\n"
+             "public class A : MonoBehaviour {\n"
+             "    public Image img;\n    Sprite s;\n"
+             "    void Update() {\n"
+             "        s = img.sprite;\n"
+             "        Debug.Log(\"after\");\n    }\n}\n")
+        root = project(self, {"A": a}, [("A", None, "  img: {fileID: 0}\n")])
+        err = io.StringIO()
+        out = tempfile.mkdtemp(prefix="upf-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            unity_pack.pack(root, out, force=True)
+        self.assertIn("A.cs(7,9): warning CS8000: sprite swaps", err.getvalue())
+        rc, so, se = _run_rc(self, out)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:13)", se)
+        self.assertNotIn("after", so)
 
 
 if __name__ == "__main__":

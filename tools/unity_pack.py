@@ -608,7 +608,7 @@ _REFUSED_ADDCOMPONENT = frozenset((
 # only ever used through the engine's GO-keyed helpers (`Transform_get_parent`,
 # `RectTransform_get_rect_height`, …), so the GO is the handle.
 _GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
-    ("Transform", "GameObject"))
+    ("Transform", "GameObject", "Animator", "SpriteRenderer"))
 
 # Every GameObject has a Transform (RectTransform is the uGUI subclass).
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
@@ -2555,6 +2555,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if fid == "0":
                 continue
             rec.setdefault("object_refs", {})[key] = fid
+        # another asset's object (a prefab's component): "fid@guid", which
+        # only an unplaced prefab's row answers to (its mb_ids)
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{fileID:\s*(-?\d+),\s*guid:\s*"
+                r"([0-9a-fA-F]+),\s*type:\s*\d+\}\s*$", block):
+            if not fm.group(1).startswith("m_") and fm.group(2) != "0":
+                rec.setdefault("object_refs", {})[fm.group(1)] = "%s@%s" % (
+                    fm.group(2), fm.group(3).lower())
         # Object ref arrays: name:\n  - {fileID: N} ... (0 = null slot).
         for fm in re.finditer(
                 r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- \{fileID:\s*-?\d+"
@@ -3099,7 +3107,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         animator = None
         audiosources = []
         rect = None
+        # Each further project script on this GO is its own object below:
+        # its fields and fileID are not the primary one's.
+        scripted = [k for k in kids if k.get("kind") == "MonoBehaviour"
+                    and k.get("guid") in (guid_to_script or {})]
+        prim = next((k for k in reversed(scripted) if k.get("ui_slider")),
+                    scripted[0] if scripted else None)
+        extra_mbs = [k for k in scripted if k is not prim]
         for k in kids:
+            if any(k is e for e in extra_mbs):
+                continue
             if k.get("kind") == "Transform":
                 xf = k
                 if k.get("rect"):
@@ -3209,7 +3226,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                                  "CapsuleCollider2D",
                                  "PolygonCollider2D") and k.get(
                     "collider2d"):
-                col2d = dict(k["collider2d"])
+                col2d = dict(k["collider2d"], file_id=k.get("file_id"))
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
                     "collider3d"):
                 col3d = dict(k["collider3d"])
@@ -3346,7 +3363,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             sprite["m01"] = m01
             sprite["m10"] = m10
             sprite["m11"] = m11
-        else:
+        # SpriteRenderer.color: an undrawn renderer (no sprite) has one too
+        spr_color = tuple(float(sprite.get(c, 1.0)) for c in "rgba") \
+            if sprite else None
+        if not (sprite and sprite.get("enabled", 1)
+                and sprite.get("has_sprite")):
             sprite = None
         class_name = None
         if script:
@@ -3558,11 +3579,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "object_ref_arrays": object_ref_arrays,
             "struct_values": struct_values,
             "mb_ids": mb_ids,
+            "mb_enabled": _mb_enabled((prim or {}).get("raw") or ""),
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
             "script": script,
             "class": class_name or _scriptless_packed_class(go.get("name")),
             "sprite": sprite,
+            "spr_color": spr_color,
             "canvas": canvas,
             "rect": rect,
             "ui_image": ui_image,
@@ -3596,8 +3619,45 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "collider2d": col2d,
             "collider3d": col3d,
             "anim_player": player,
+            "animator_controller": (animator or {}).get("controller_guid")
+            if (animator or {}).get("enabled", 1) else None,
             "audiosources": audiosources,
         })
+        for k in extra_mbs:
+            efields = dict(k.get("fields") or {})
+            for vk, (vx, vy) in (k.get("vec2_fields") or {}).items():
+                efields[vk + "_x"], efields[vk + "_y"] = vx, vy
+            for vk, (vx, vy, vz) in (k.get("vec3_fields") or {}).items():
+                efields[vk + "_x"], efields[vk + "_y"] = vx, vy
+                efields[vk + "_z"] = vz
+            try:
+                ecurves = _curves.parse_curve_fields(k.get("raw") or "")
+            except _curves.CurveError as e:
+                raise PackError("GameObject `%s`: an AnimationCurve field "
+                                "holds %s" % (go.get("name") or "?", e))
+            escript = guid_to_script[k["guid"]]
+            objects.append({
+                "name": go.get("name") or "obj", "pos": pos, "rot": rot,
+                "local_pos": local_pos, "local_rot": local_rot,
+                "local_scale": local_scale, "father_id": father_id,
+                "xf_id": xf_id, "child_ids": child_ids,
+                "go_id": go.get("file_id"), "active": active,
+                "fields": efields,
+                "str_fields": dict(k.get("str_fields") or {}),
+                "anim_curves": ecurves,
+                "object_refs": dict(k.get("object_refs") or {}),
+                "object_ref_arrays": dict(k.get("object_ref_arrays") or {}),
+                "struct_values": dict(k.get("struct_values") or {}),
+                "mb_ids": [str(k.get("file_id"))],
+                "mb_enabled": _mb_enabled(k.get("raw") or ""),
+                "comp_ids": [str(c.get("file_id")) for c in kids
+                             if c.get("file_id") is not None],
+                "script": escript, "class": _class_name_from_cs(escript),
+                "sprite": None, "canvas": None, "rect": rect,
+                "rigidbody2d": None, "rigidbody": None,
+                "collider2d": None, "collider3d": None, "anim_player": None,
+                "co_mb": True,
+            })
     # Stripped PrefabInstance Transforms are not joined via m_Component, but
     # scene children still m_Father them (e.g. button labels). Register those
     # xfs so activeInHierarchy can walk to inactive layout parents.
@@ -4628,7 +4688,32 @@ def _instantiate_budget(analyses, plan):
                     r"\(\s*this\b",
                     bodies):
                 budget[cname] = budget.get(cname, 0) + n
+            for t in _prefab_instantiate_fields(c, plan).values():
+                budget[t] = budget.get(t, 0) + n
     return budget
+
+
+_PREFAB_SPAWN_POOL = 64
+
+
+def _prefab_instantiate_fields(c, plan):
+    """{field: class} of `Instantiate(field, pos, Quaternion.identity)` in
+    class *c*, *field* a packed-class reference (an unplaced prefab's
+    dormant row)."""
+    classes = plan.get("classes") or {}
+    ftys = {f["name"]: f["ty"].split(".")[-1] for f in c.get("fields") or ()
+            if not f.get("static")}
+    bodies = cs2cpp._blank(
+        "\n".join(m.get("body") or "" for m in c.get("methods") or []))
+    out = {}
+    for m in re.finditer(
+            r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*"
+            r"\(\s*(?:this\s*\.\s*)?(\w+)\s*,[^,;]*,\s*Quaternion\s*\.\s*"
+            r"identity\s*\)", bodies):
+        t = ftys.get(m.group(1))
+        if t in classes and t not in _ADDABLE_BUILTINS:
+            out[m.group(1)] = t
+    return out
 
 
 def _new_budget(analyses, plan):
@@ -4985,6 +5070,12 @@ def _rewrite_instantiate(text, plan, this_class):
         elif len(args) == 2:
             src = args[0].strip()
             parent = _setparent_parent_expr(args[1], cl)
+        elif len(args) == 3:
+            call = _instantiate_at(args, plan, cl)
+            out.append(before)
+            out.append(call or text[m.start():after])
+            i = after
+            continue
         else:
             out.append(text[i:after])
             i = after
@@ -5014,6 +5105,31 @@ def _rewrite_instantiate(text, plan, this_class):
             out.append(call)
         i = after
     return "".join(out)
+
+
+def _instantiate_at(args, plan, cl):
+    """`Instantiate(prefabField, posField, Quaternion.identity)` of a packed
+    class whose prefab rows are unrotated → `Object_InstantiateAt_T`, or
+    None (left for the stub detector)."""
+    src = re.sub(r"^this\s*\.\s*", "", args[0].strip())
+    pos = args[1].strip()
+    t = _prefab_instantiate_fields(
+        {"fields": cl.get("fields"), "methods": [{"body": (
+            "Instantiate(%s, %s, %s)" % (src, pos, args[2].strip()))}]},
+        plan).get(src)
+    tcl = (plan.get("classes") or {}).get(t)
+    pty = {f["name"]: f["ty"].split(".")[-1] for f in cl.get("fields") or ()
+           }.get(re.sub(r"^this\s*\.\s*", "", pos))
+    if (not tcl or pty not in ("Vector2", "Vector3")
+            or not int((plan.get("instantiate_budget") or {}).get(t) or 0)
+            or not _class_has_position(tcl)
+            or any(abs(q - e) > 1e-6
+                   for o in tcl.get("instances") or ()
+                   for q, e in zip(o.get("rot") or (0, 0, 0, 1),
+                                   (0, 0, 0, 1)))):
+        return None
+    return "Object_InstantiateAt_%s(%s, %s.x, %s.y, %s)" % (
+        _c_ident(t), src, pos, pos, pos + ".z" if pty == "Vector3" else "0.f")
 
 
 def _gcic_go_expr(recv, cl, plan, locals_ty):
@@ -5399,6 +5515,26 @@ def _gcic_resolve_type(tname):
     return _GCIC_TYPE_ALIAS.get(tname, tname)
 
 
+def _xf_rows(plan):
+    """Transform fileID → the packed (class, inst) that stands for it.
+
+    Several MonoBehaviours on one GameObject each hold a position copy:
+    the Rigidbody's row is the one physics moves, else the first class by
+    name, as _engine_go_xf picks at runtime."""
+    xf_to, xf_rb = {}, set()
+    for cname in sorted(plan["classes"]):
+        for i, o in enumerate(plan["classes"][cname].get("instances") or []):
+            xid = o.get("xf_id")
+            if xid is None or str(xid) == "0":
+                continue
+            rb = bool(o.get("rigidbody2d") or o.get("rigidbody"))
+            if str(xid) not in xf_to or (rb and str(xid) not in xf_rb):
+                xf_to[str(xid)] = (cname, i)
+                if rb:
+                    xf_rb.add(str(xid))
+    return xf_to
+
+
 def _attach_transform_parents(plan):
     """Wire authored m_Father → packed parent for live world composition.
 
@@ -5409,12 +5545,7 @@ def _attach_transform_parents(plan):
     Main Camera under a packed body follows the same rule via Camera_main_pos_*.
     """
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    xf_to = {}
-    for cname, cl in plan["classes"].items():
-        for i, o in enumerate(cl.get("instances") or []):
-            xid = o.get("xf_id")
-            if xid is not None and str(xid) != "0":
-                xf_to[str(xid)] = (cname, i)
+    xf_to = _xf_rows(plan)
     any_parent = False
     for cname, cl in plan["classes"].items():
         for i, o in enumerate(cl.get("instances") or []):
@@ -5473,12 +5604,7 @@ def _resolve_transform_field_targets(plan):
     Player.graphicsTrs → Graphics Transform fileID → Graphics instance.
     """
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    xf_to = {}
-    for cname, cl in plan["classes"].items():
-        for i, o in enumerate(cl.get("instances") or []):
-            xid = o.get("xf_id")
-            if xid is not None and str(xid) != "0":
-                xf_to[str(xid)] = (cname, i)
+    xf_to = _xf_rows(plan)
     targets = {}
     scale_classes = set()
     for cname, cl in plan["classes"].items():
@@ -5581,18 +5707,26 @@ def _promote_handle_rot_classes(plan):
               for o in cl.get("instances") or []
               if o.get("go_index") is not None}
     live = set(plan.get("live_rot_classes") or [])
+    srcs = {}
     for cname, cl in plan["classes"].items():
         try:
             with open(cl.get("script_path") or "", encoding="utf-8",
                       errors="replace") as f:
-                src = cs2cpp._blank(f.read())
+                srcs[cname] = cs2cpp._blank(f.read())
         except OSError:
+            pass
+    # ponytail: a field is matched by name in any script (`Lasso.instance.
+    # hookTrs.eulerAngles` from Player.cs), so a same-named field elsewhere
+    # gets live rotation it may not need -- table space, not behaviour
+    rot_names = {n for src in srcs.values() for n in re.findall(
+        r"(?<![\w])(\w+)\s*\.\s*(?:rotation|eulerAngles)\b", src)}
+    for cname, cl in plan["classes"].items():
+        src = srcs.get(cname)
+        if src is None:
             continue
         names = set(re.findall(r"(?<![\w.])Transform(?:\[\])?\s+(\w+)\s*[;=,)]",
                                src))
-        used = {n for n in names if re.search(
-            r"(?<![\w.])%s\s*\.\s*(?:rotation|eulerAngles)\b" % re.escape(n),
-            src)}
+        used = names & rot_names
         if not used:
             continue
         plan["handle_rot"] = True
@@ -5618,25 +5752,40 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
         f["name"] for f in (cl.get("fields") or [])
         if f.get("ty") == "Transform"]
     vec2_fields = set(cl.get("vec2_fields") or [])
-    if not transform_fields:
+    # receivers: (pattern, owner class C name, field, owner index)
+    recvs = [(r"(?<![_\w.])%s" % re.escape(f), idn, f, "i")
+             for f in transform_fields]
+    classes = plan.get("classes") or {}
+    for other in sorted(set(plan.get("singleton_instance_types") or ())
+                        & set(classes)):
+        oidn = _c_ident(other)
+        if other not in text and oidn not in text:
+            continue
+        for f in classes[other].get("fields") or []:
+            if f.get("ty") == "Transform" and not f.get("static"):
+                recvs.append((
+                    r"(?:(?<![\w.])%s\s*\.\s*[Ii]nstance\s*\.\s*%s\b|"
+                    r"(?<![\w.])%s_get_%s\(\s*%s_Instance\(\)\s*\))" % (
+                        re.escape(other), re.escape(f["name"]), oidn,
+                        re.escape(f["name"]), oidn),
+                    oidn, f["name"], "%s_Instance()" % oidn))
+    if not recvs:
         return text
 
     out = []
     i = 0
     while i < len(text):
         found = None
-        for fname in transform_fields:
-            pat = (r"(?<![_\w])%s\s*\.\s*SetWorldScale\s*\("
-                   % re.escape(fname))
-            m = re.search(pat, text[i:])
+        for pat0, oidn, fname, ix in recvs:
+            m = re.search(pat0 + r"\s*\.\s*SetWorldScale\s*\(", text[i:])
             if not m:
                 continue
             if found is None or m.start() < found[0]:
-                found = (m.start(), m.end(), fname)
+                found = (m.start(), m.end(), fname, oidn, ix)
         if not found:
             out.append(text[i:])
             break
-        start_rel, end_rel, fname = found
+        start_rel, end_rel, fname, oidn, ix = found
         abs_start = i + start_rel
         abs_open = i + end_rel - 1
         out.append(text[i:abs_start])
@@ -5671,6 +5820,16 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
                 if len(parts) >= 3:
                     sx, sy, sz = parts[0], parts[1], parts[2]
         if sx is None:
+            # `Vector3.one[.SetX(e)]`
+            om = re.match(r"(?s)^(?:Vector[23]\s*\.\s*one|Vector2_make\(\s*1\.f"
+                          r"\s*,\s*1\.f\s*\))\s*(\.\s*SetX\s*\()?", arg_s)
+            if om and not om.group(1) and om.end() == len(arg_s):
+                sx, sy, sz = "1.f", "1.f", "1.f"
+            elif om and om.group(1):
+                ax = _match_call_args(arg_s, om.end() - 1)
+                if ax and not arg_s[ax[1]:].strip():
+                    sx, sy, sz = ax[0].strip(), "1.f", "1.f"
+        if sx is None:
             out.append(text[abs_start:after])
             i = after
             continue
@@ -5685,11 +5844,13 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
                         "%s_get_%s_y(i)" % (idn, vf), sz)
         out.append(
             "_engine_set_world_scale("
-            "_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i], "
+            "_%s_%s_target_class[%s], (unsigned)_%s_%s_target_inst[%s], "
             "(%s), (%s), (%s))" % (
-                idn, fname, idn, fname, sx, sy, sz))
+                oidn, fname, ix, oidn, fname, ix, sx, sy, sz))
         i = after
     text = "".join(out)
+    if not transform_fields:
+        return text
 
     # field.localScale = new Vector3(x, y, z): _engine_set_world_scale writes
     # the target's local scale table (the name is SetWorldScale's).
@@ -6061,10 +6222,56 @@ def _rewrite_static_ref_arrays(text, cl, plan):
 def _nre_at_expr(site, line):
     """C expr that raises Unity-style NullReferenceException at *line*."""
     return (
-        "_engine_null_reference_at(%s, %s, %s, %d)"
+        "_engine_null_reference_at(%s, %s, %s, %d, 0)"
         % (_c_string(site["class"]), _c_string(site["method"]),
            _c_string(site["path"]), int(line))
     )
+
+
+def _nre_line_sites(line, site, ln, syms):
+    """One emitted body line (C# line *ln*: the lowering keeps lines): an
+    instance accessor in *syms* called on a receiver other than `i` checks
+    it for null first (`_engine_nn`), and every NRE on the line reports
+    script, line and column. The column is the receiver's in the C# line
+    (`affectedByVortex` of `affectedByVortex.velocity.x`), else the
+    statement's first character.
+
+    ponytail: a line the lowering moved reports the line it landed on."""
+    src = (site.get("file_text") or "").split("\n")
+    cs = src[ln - 1] if 0 < ln <= len(src) else ""
+    first = len(cs) - len(cs.lstrip()) + 1
+
+    def col_of(member):
+        for mem in (member, re.sub(r"_[xyz]$", "", member)):
+            for m in re.finditer(r"((?:[A-Za-z_]\w*\s*(?:\(\s*\))?\s*\.\s*)+)"
+                                 r"%s\b" % re.escape(mem), cs):
+                return m.start(1) + 1
+        return first
+
+    head = "%s, %s, %s, %d" % (_c_string(site["class"]),
+                               _c_string(site["method"]),
+                               _c_string(site.get("path") or "<cs>"), ln)
+    # for `_site_stops`, once every helper is emitted
+    line = "%s /*@site %s @cs %s*/" % (line, head, cs.replace("*/", "* /"))
+    line = re.sub(r"_engine_null_reference_at\(\"[^\"]*\", \"[^\"]*\", "
+                  r"\"[^\"]*\", -?\d+, 0\)",
+                  lambda m: "_engine_null_reference_at(%s, %d)" % (head, first),
+                  line)
+    calls = [m for m in re.finditer(r"(?<![\w.])(\w+)\(", cs2cpp._blank(line))
+             if m.group(1) in syms]
+    for m in reversed(calls):
+        scan = cs2cpp._blank(line)
+        close = _match_close(scan, m.end() - 1, "(", ")")
+        if close is None:
+            continue
+        args = cs2cpp.split_call_args(line[m.end():close])
+        if not args or args[0].strip() == "i":
+            continue
+        a = m.end() + line[m.end():close].index(args[0])
+        b = a + len(args[0])
+        line = "%s_engine_nn(%s, %s, %d)%s" % (
+            line[:a], args[0], head, col_of(syms[m.group(1)]), line[b:])
+    return line
 
 
 def _rewrite_find_getcomponent(text, plan, this_class, site=None):
@@ -6367,6 +6574,11 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
                  scan):
         apis.add("transform.LookAt")
+    # (any `x.color =` in a script naming SpriteRenderer: the live table
+    # costs only memory when x is something else)
+    if "SpriteRenderer" in scan and re.search(
+            r"(?<![\w.])\w+\s*\.\s*color\s*=(?!=)", scan):
+        apis.add("SpriteRenderer.color")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
                  r"(?:eulerAngles\b|Translate\s*\()", scan):
         apis.add("transform.eulerAngles")
@@ -6475,8 +6687,10 @@ def analyze_script(path, text=None, shallow=False):
     # A collision / trigger handler reads the other's GameObject from them.
     if re.search(r"\bOn(?:Trigger|Collision)(?:Enter|Stay|Exit)2D\s*\(", scan):
         apis.add("GameObject.SetActive")
-    # Reading activeSelf / activeInHierarchy needs the same active tables.
-    if re.search(r"\.\s*active(?:Self|InHierarchy)\b", scan):
+    # Reading activeSelf / activeInHierarchy needs the same active tables;
+    # `gameObject.layer`, the authored layer table.
+    if re.search(r"\.\s*active(?:Self|InHierarchy)\b|"
+                 r"(?<![\w.])gameObject\s*\.\s*layer\b", scan):
         apis.add("GameObject.SetActive")
     # transform.parent.gameObject.SetActive / anyRecv.gameObject.SetActive
     if re.search(r"\.\s*gameObject\s*\.\s*SetActive\s*\(", scan):
@@ -6493,7 +6707,10 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])\w+\s*\.\s*DetachChildren\s*\(", scan) or any(
             re.search(r"(?<![.\w])%s\s*\.\s*(?:position\b(?!\s*\.\s*[xyz]\b)"
                       r"|rotation\b|eulerAngles\b)" % re.escape(n), scan)
-            for n in trs_names):
+            for n in trs_names) or re.search(
+                # another script's handle through its singleton
+                r"\.\s*[Ii]nstance\s*\.\s*\w+\s*\.\s*(?:rotation|eulerAngles)\b",
+                scan):
         apis.add("transform.SetParent")
     if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*GetSiblingIndex\s*\(",
@@ -7169,6 +7386,12 @@ def _default_arg_c(expr, ty=None):
         return "1"
     if e == "false":
         return "0"
+    fl = {"float.NegativeInfinity": "(-INFINITY)",
+          "float.PositiveInfinity": "INFINITY",
+          "float.MaxValue": "3.40282347e+38f",
+          "float.MinValue": "(-3.40282347e+38f)"}.get(re.sub(r"\s+", "", e))
+    if fl:
+        return fl
     if re.fullmatch(r'"(?:[^"\\\n]|\\.)*"', e):
         return e
     if e in ("null", "default") and ty and not ty.endswith("?"):
@@ -7244,8 +7467,10 @@ def _call_with_defaults(args, params):
     return ", ".join(out)
 
 
-def _fill_defaults_after(text, sym, params):
-    """Fill missing default arguments in every ``sym(...)`` call in *text*."""
+def _fill_defaults_after(text, sym, params, receiver=False):
+    """Fill missing default arguments in every ``sym(...)`` call in *text*
+    (*receiver*: an instance method's, whose first argument is the
+    receiver's index)."""
     if not any(prm.default is not None for prm in params):
         return text
     out = []
@@ -7259,7 +7484,15 @@ def _fill_defaults_after(text, sym, params):
         args, end = _match_call_args(text, open_i)
         if end <= open_i:
             break
-        new_args = _call_with_defaults(args, params)
+        if receiver:
+            parts = cs2cpp.split_call_args(args) if args.strip() else []
+            new_args = args if not parts else ", ".join(
+                [parts[0]] + ([_call_with_defaults(", ".join(parts[1:]),
+                                                   params)]
+                              if len(parts) > 1 or params else []))
+            new_args = cs2cpp.lower_float_literals(new_args.rstrip(", "))
+        else:
+            new_args = _call_with_defaults(args, params)
         out.append(text[pos:open_i + 1])
         out.append(new_args)
         out.append(")")
@@ -7957,9 +8190,9 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 r"([^;]+);"
                 % (re.escape(ocname), re.escape(vf)),
                 lambda m, o=oidn, f=vf, ix=inst: (
-                    "%s_set_%s_x(%s, Vector2_x(%s)); "
-                    "%s_set_%s_y(%s, Vector2_y(%s));"
-                    % (o, f, ix, m.group(1), o, f, ix, m.group(1))),
+                    "{ Vector2 _v2 = (%s); %s_set_%s_x(%s, _v2.x); "
+                    "%s_set_%s_y(%s, _v2.y); }"
+                    % (m.group(1), o, f, ix, o, f, ix)),
                 text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
@@ -8027,7 +8260,12 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 continue
             text = cs2cpp.code_sub(pat + r"\s*\.\s*Length\b",
                                    "(int)%s.size()" % alias, text)
-            text = bind + "\n" + cs2cpp.code_sub(pat, alias, text)
+            # a whole-array store goes to the row: cpprust cannot assign
+            # through the reference
+            text = cs2cpp.code_sub(pat + r"(?=\s*=(?!=))", "%s_%s[%s]" % (
+                oidn, fname, "i" if ocname == this else inst), text)
+            # same line: the body's lines stay the C# lines (NRE sites)
+            text = bind + " " + cs2cpp.code_sub(pat, alias, text)
         # Other.Instance / Other.instance — including Other.Instance.unknownField
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
@@ -8363,6 +8601,9 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
              "Unity component handle still using `recv.gameObject`."),
             (r"\w+\.activeSelf\b",
              "Unity `activeSelf` on a receiver nothing lowered."),
+            (r"(?<![\w.])enabled\b",
+             "Behaviour `enabled` nothing lowered (a script writes it, or a "
+             "row was authored disabled)."),
             # ponytail: cpprust copies a string through a pointer shallowly
             (r"_engine_map_at_si_std_string\s*\(",
              "A string-valued Dictionary element (`d[key]`) is not lowered "
@@ -8816,6 +9057,9 @@ def plan_layouts(objects, analyses, two_d=None):
                 # to the handle case below, as an index into a class named
                 # `string`, and never declared at all.
                 continue
+            elif ty in _COLLIDER2D_FIELD_TYPES:
+                # a row of the collider table (GetComponent<Collider2D>'s)
+                members.append((fname, "uint32_t", 32, "idx:" + ty))
             else:
                 # Foreign MonoBehaviour → index into that class's array, as
                 # wide as *that* class's index: the owner's could be
@@ -9954,6 +10198,33 @@ def _emit_engine_gameobject_tables(
     p("static int GameObject_CompareTag(int go, const char *t) {")
     p("    return strcmp(GameObject_tag(go), t ? t : \"\") == 0;")
     p("}")
+    gl = [int(l) for l in plan.get("go_layers") or []]
+    if gl:
+        # ponytail: authored layers only; a clone's (or a runtime
+        # `gameObject.layer =`) is not tracked, so reading one stops
+        p("static const unsigned char _engine_go_layer[%d] = { %s };"
+          % (len(gl), ", ".join(map(str, gl))))
+        p("static int GameObject_layer(int go) {")
+        p("    if (go < 0 || go >= %d) {" % len(gl))
+        p('        fprintf(stderr, "GameObject.layer of a GameObject crust'
+          ' has no authored layer for is not lowered; stopping rather than'
+          ' guessing it\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    return _engine_go_layer[go];")
+        p("}")
+    import tools.unity_pack_common as _cmm
+    if _cmm.SOURCE_LAYER_MATRIX:
+        p("static const unsigned _engine_layer_matrix[32] = { %s };"
+          % ", ".join("%du" % v for v in _cmm.SOURCE_LAYER_MATRIX))
+        p("static int Physics2D_GetLayerCollisionMask(int layer) {")
+        p("    if (layer < 0 || layer > 31) {")
+        p('        fprintf(stderr, "ArgumentOutOfRangeException: layer must be'
+          ' in the range 0 to 31\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    return (int)_engine_layer_matrix[layer];")
+        p("}")
     if plan.get("collider2d"):
         # defined with the colliders, after the scripts that call it
         p("static int _col2d_go(int ci);")
@@ -9962,10 +10233,13 @@ def _emit_engine_gameobject_tables(
     p("static int _engine_in_script = 0;")
     p("static void _engine_null_reference_at(")
     p("    const char *cls, const char *method,")
-    p("    const char *path, int line) {")
+    p("    const char *path, int line, int col) {")
     p("    fprintf(stderr, \"NullReferenceException: Object reference "
       "not set to an instance of an object\\n\");")
-    p("    if (cls && method && path && path[0] && line > 0)")
+    p("    if (cls && method && path && path[0] && line > 0 && col > 0)")
+    p("        fprintf(stderr, \"%s.%s () (at %s:%d:%d)\\n\",")
+    p("                cls, method, path, line, col);")
+    p("    else if (cls && method && path && path[0] && line > 0)")
     p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
     p("                cls, method, path, line);")
     p("    else if (cls && method)")
@@ -9973,7 +10247,11 @@ def _emit_engine_gameobject_tables(
     p("    if (_engine_in_script)")
     p("        longjmp(_engine_script_jmp, 1);")
     p("}")
-    p("")
+    p(_NRE_GUARDS % ("_engine_null_reference_at(cls, method, path, line, col);"
+                     "\n        exit(70);",
+                     "_engine_null_reference_at(0, 0, 0, 0, 0);\n"
+                     "        exit(70);"))
+    plan["_nre_ix"] = True
     if want_add_any:
         p("static void _engine_cant_add_component("
           "const char *comp, int go) {")
@@ -10193,7 +10471,7 @@ def _emit_engine_gameobject_tables(
         if bud <= 0:
             bud = 1
         idn = _c_ident(type_name)
-        go_n = max(1, len(go_names))
+        go_n = max(1, len(go_names) + go_spawn_budget)
         authored = authored_names or set()
         init_vals = []
         for i, _n in enumerate(go_names if go_names else [""]):
@@ -10204,11 +10482,25 @@ def _emit_engine_gameobject_tables(
         p("static int _%s_live = 0;" % idn)
         p("static const int _%s_cap = %d;" % (idn, bud))
         p("static int _%s_owner_go[%d];" % (idn, bud))
-        p("static int GameObject_GetComponent_%s(int go) {" % idn)
-        p("    if (go < 0 || go >= _engine_go_count) return -1;")
-        p("    return _engine_go_%s[go];" % idn)
-        p("}")
-        p("static int GameObject_AddComponent_%s(int go) {" % idn)
+        # a GO-handle type's value is its GameObject, as its fields' are
+        handle = type_name in _GO_HANDLE_FIELD_TYPES
+        if handle:
+            p("static int GameObject_AddComponent_%s_row(int go);" % idn)
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go] >= 0 ? go : -1;" % idn)
+            p("}")
+            p("static int GameObject_AddComponent_%s(int go) {" % idn)
+            p("    return GameObject_AddComponent_%s_row(go) >= 0 ? go : -1;"
+              % idn)
+            p("}")
+        else:
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go];" % idn)
+            p("}")
+        sfx = "_row" if handle else ""
+        p("static int GameObject_AddComponent_%s%s(int go) {" % (idn, sfx))
         p("    int ex;")
         p("    if (go < 0 || go >= _engine_go_count) return -1;")
         p("    ex = _engine_go_%s[go];" % idn)
@@ -10230,9 +10522,15 @@ def _emit_engine_gameobject_tables(
         p("static char _%s_tostring_buf[256];" % idn)
         p("static const char *%s_ToString(int ci) {" % idn)
         p("    int n, go;")
-        p("    if (ci < 0 || ci >= _%s_live) return \"null\";" % idn)
-        p("    go = _%s_owner_go[ci];" % idn)
-        p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+        if handle:
+            p("    go = ci;")
+            p("    if (go < 0 || go >= _engine_go_count || _engine_go_%s[go] < 0)"
+              % idn)
+            p("        return \"null\";")
+        else:
+            p("    if (ci < 0 || ci >= _%s_live) return \"null\";" % idn)
+            p("    go = _%s_owner_go[ci];" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
         p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
           % (idn, idn))
         p("                 \"%%s (%s)\", _engine_go_name[go]);"
@@ -10255,7 +10553,7 @@ def _emit_engine_gameobject_tables(
         go_n_sr = max(1, len(go_names) + go_spawn_budget)
         init_vals = []
         for i, _n in enumerate(go_names if go_names else []):
-            init_vals.append("0" if i in go_has_sprite else "-1")
+            init_vals.append(str(i) if i in go_has_sprite else "-1")
         for _pad in range(go_spawn_budget):
             init_vals.append("-1")
         if not init_vals:
@@ -13124,6 +13422,8 @@ def _emit_engine_instantiate(
                 p("    go = _engine_go_count;")
                 p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
+            if plan.get("_spr_color_cap"):
+                p("    _engine_spr_clone(go, _engine_%s_go_of[src]);" % idn)
             if _multi_scene(plan):
                 p("    _engine_go_scene[go] = _engine_scene_active;")
             if want_ui:
@@ -13202,6 +13502,38 @@ def _emit_engine_instantiate(
             p("    return ex;")
             p("}")
             p("")
+            if cname in (plan.get("prefab_spawn") or ()) \
+                    and _class_has_position(cl):
+                # ponytail: the clone's Awake ran at the prefab's position
+                three = (cl.get("soa_dims")
+                         or (2 if cl.get("two_d") else 3)) != 2
+                for ax in "xyz" if three else "xy":
+                    p("static void %s_set_pos_%s(unsigned i, float v);"
+                      % (idn, ax))
+                p("static int Object_InstantiateAt_%s(int src, float x, "
+                  "float y, float z) {" % idn)
+                p("    int c;")
+                p("    if (src < 0) {")
+                p("        fprintf(stderr, \"ArgumentException: The Object you"
+                  " want to instantiate is null.\\n\");")
+                p("        exit(70);")
+                p("    }")
+                p("    c = Object_Instantiate_%s(src, -1);" % idn)
+                p("    if (c < 0) {")
+                p("        fprintf(stderr, \"Instantiate: more than %d live "
+                  "%s clones; raise [MaxInstances(N)]\\n\");"
+                  % (cap - int(cl["n"]), cname))
+                p("        exit(70);")
+                p("    }")
+                p("    %s_set_pos_x((unsigned)c, x);" % idn)
+                p("    %s_set_pos_y((unsigned)c, y);" % idn)
+                if three:
+                    p("    %s_set_pos_z((unsigned)c, z);" % idn)
+                else:
+                    p("    (void)z;")
+                p("    return c;")
+                p("}")
+                p("")
             if not mb_add:
                 p("static char _%s_tostring_buf[256];" % idn)
                 p("static const char *%s_ToString(int ci) {" % idn)
@@ -13276,11 +13608,23 @@ def _emit_engine_get_components_in_children(
             if tname == "RectTransform":
                 p("        out.push_back(go);")
             elif collectors:
-                # Unity polymorphism: Weapon finds Blaster : Weapon, etc.
+                # Unity polymorphism: Weapon finds Blaster : Weapon, etc. --
+                # but the result holds bare row indices its users read as
+                # Weapon rows, so finding a subclass stops.
+                # ponytail: needs class-tagged references to go further
                 for cname in collectors:
                     cidn = _c_ident(cname)
                     p("        ci = GameObject_GetComponent_%s(go);" % cidn)
-                    p("        if (ci >= 0) out.push_back(ci);")
+                    if cname == tname:
+                        p("        if (ci >= 0) out.push_back(ci);")
+                        continue
+                    p("        if (ci >= 0) {")
+                    p("            fprintf(stderr, \"GetComponentsInChildren<%s>"
+                      " found a %s: crust holds it as a %s row index only;"
+                      " stopping rather than misreading it\\n\");"
+                      % (tname, cname, tname))
+                    p("            exit(70);")
+                    p("        }")
             else:
                 p("        ci = GameObject_GetComponent_%s(go);" % idn)
                 p("        if (ci >= 0) out.push_back(ci);")
@@ -13316,6 +13660,11 @@ def _emit_engine_find_object_of_type(
                 p("        if (_engine_go_destroyed[go]) continue;")
             if _multi_scene(plan):
                 p("        if (!_engine_go_in_loaded_scene(go)) continue;")
+            asset = plan.get("go_asset_active")
+            if want_ui and asset:
+                # an unplaced prefab is an asset: never found
+                p("        if (go < %d && _engine_go_asset_active[go] >= 0)"
+                  " continue;" % len(asset))
             p("        ci = _engine_go_%s[go];" % idn)
             p("        if (ci < 0) continue;")
             if want_ui:
@@ -13768,14 +14117,57 @@ def _emit_engine_static_collections(_emitted_coll, p, plan):
     return _emitted_coll
 
 
+# `_engine_nn(r, site)`: a receiver the body checks, with its C# site;
+# `_engine_nre_ix(i)`: the `_AT` backstop, a null nothing checked first.
+# %s: what each does on null (raise and unwind, or report and stop).
+_NRE_GUARDS = """static int _engine_nn(int r, const char *cls, const char *method,
+                      const char *path, int line, int col) {
+    if (r < 0) {
+        %s
+    }
+    return r;
+}
+static unsigned _engine_nre_ix(unsigned i) {
+    if (i == 4294967295u) {
+        %s
+    }
+    return i;
+}
+"""
+
+_NRE_REPORT = ('fprintf(stderr, "NullReferenceException: Object reference '
+               'not set to an instance of an object\\n");')
+
+
+def _at_macro(idn, plan):
+    pre = ""
+    if not plan.get("_nre_ix"):
+        # no GameObject tables: no script unwinding to skip the method with
+        plan["_nre_ix"] = True
+        pre = _NRE_GUARDS % (
+            _NRE_REPORT + '\n        fprintf(stderr, "%s.%s () (at %s:%d:%d)'
+            '\\n", cls, method, path, line, col);\n        exit(70);',
+            _NRE_REPORT + "\n        exit(70);")
+    return pre + "#define %s_AT(i) (_%s_inst_array[_engine_nre_ix(i)])" % (
+        idn, idn)
+
+
 def _emit_engine_class_groups(
         class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
         want_go_tables):
     """emit_engine: Per-class groups: instance arrays, accessors, statics and script methods."""
+    nn_syms = {}
+    for _cn, _cl in plan["classes"].items():
+        _members = [m[0] for m in _cl.get("members") or []]
+        if _cl.get("soa_dims"):
+            _members += ["pos_x", "pos_y", "pos_z"]
+        for _mn in _members:
+            for _acc in ("get", "set"):
+                nn_syms["%s_%s_%s" % (_c_ident(_cn), _acc, _mn)] = _mn
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
-        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (idn, idn))
+        p(_at_macro(idn, plan))
         p("")
         # Position accessors: SoA table or AoS fields.
         if cl.get("soa_dims"):
@@ -13902,6 +14294,15 @@ def _emit_engine_class_groups(
                 body, args_str=m.get("args") or "", emitted_params=emitted,
                 known_types=_engine_types_declared(lines) | {"fastring"},
                 properties=class_properties.get(cname) or ())
+            if why is None:
+                bscan = cs2cpp._blank(body)
+                for _c, om in (plan.get("_methods_by") or {}).get(cname, ()):
+                    mg = re.search(r"(?<![\w.])%s\b(?!\s*\()"
+                                   % re.escape(om["name"]), bscan)
+                    if mg:
+                        why = ("Method group passed as a delegate nothing "
+                               "lowered", om["name"])
+                        break
             # MB methods always emit as `static void`. A non-void C# return
             # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
             # still leaves `return 1;` and crust refuses CS0000.
@@ -13999,9 +14400,10 @@ def _emit_engine_class_groups(
                         else "Vector2_make(0.f, 0.f)" if rty == "Vector2"
                         else "0"))
             else:
-                for line in body.split("\n"):
+                for j, line in enumerate(body.split("\n")):
                     if line.strip():
-                        p("    " + line.rstrip())
+                        p("    " + _nre_line_sites(
+                            line.rstrip(), site, cs_line + j, nn_syms))
             p("}")
             p("")
 
@@ -14085,7 +14487,14 @@ def _emit_engine_class_groups(
         has_enable, has_disable, has_destroy = (
             _has("OnEnable"), _has("OnDisable"), _has("OnDestroy"))
         p("/* awoken (1), started (2), enabled (4): per instance */")
-        p("static unsigned char _%s_life[%d];" % (idn, cap))
+        # an unplaced prefab's row only answers Instantiate: "awoken" but
+        # never enabled, so no tick wakes or runs it
+        dormant = [k for k, o in enumerate(cl.get("instances") or [])
+                   if o.get("prefab_asset")]
+        p("static unsigned char _%s_life[%d]%s;" % (idn, cap, (
+            " = { %s }" % ", ".join("1" if k in dormant else "0"
+                                    for k in range(max(dormant) + 1))
+            if dormant else "")))
         # ponytail: `enabled` reads "enabled and active" (Unity's stays true
         # on an inactive GameObject); a per-row enabled bit if that matters
         p("static int %s_get_enabled(unsigned i) { return (_%s_life[i] & 4)"
@@ -14375,6 +14784,66 @@ def _spawnable(plan, cname):
     authored instances (a sprite's draw row) are per instance."""
     return (cname in (plan.get("godot_spawn") or {})
             or _mb_pool_extra(plan, cname) > 0)
+
+
+def _emit_sprite_color_tables(p, plan, cap):
+    """`SpriteRenderer.color` by GameObject: the authored tint of each a
+    class instance draws, whether it has one, and whether a script set it
+    (the draw list then takes it, `engine_collect_draws`)."""
+    col = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            sp, gi = o.get("spr_color"), o.get("go_index")
+            if sp and gi is not None and 0 <= int(gi) < cap:
+                col[int(gi)] = sp
+    plan["_spr_color_cap"] = cap
+    top = max(col) + 1 if col else 0
+    tint = sorted((g, c) for g, c in col.items() if c != (1.0, 1.0, 1.0, 1.0))
+    p("/* SpriteRenderer.color per GameObject; _has: it has one; _set: a"
+      " script wrote it (else the authored tint: white, or _tint's) */")
+    p("static float _engine_spr_col[%d][4];" % cap)
+    p("static unsigned char _engine_spr_has[%d]%s;" % (cap, (" = { %s }" % (
+        ", ".join("1" if g in col else "0" for g in range(top)))) if top else ""))
+    p("static unsigned char _engine_spr_set[%d];" % cap)
+    p("static const int _engine_spr_tint_go[%d] = { %s };" % (
+        max(1, len(tint)), ", ".join(str(g) for g, _c in tint) or "-1"))
+    p("static const float _engine_spr_tint[%d][4] = { %s };" % (
+        max(1, len(tint)), ", ".join("{ %s }" % ", ".join(
+            "%rf" % v for v in c) for _g, c in tint) or "{ 1.f, 1.f, 1.f, 1.f }"))
+    p("static int _engine_spr_go(int go) {")
+    p("    if (go < 0 || go >= %d || !_engine_spr_has[go]) {" % cap)
+    p('        fprintf(stderr, "NullReferenceException: Object reference not'
+      ' set to an instance of an object (SpriteRenderer.color)\\n");')
+    p("        exit(70);")
+    p("    }")
+    p("    return go;")
+    p("}")
+    p("static float SpriteRenderer_color(int go, int k) {")
+    p("    int t;")
+    p("    go = _engine_spr_go(go);")
+    p("    if (_engine_spr_set[go]) return _engine_spr_col[go][k];")
+    p("    for (t = 0; t < %d; t = t + 1)" % len(tint))
+    p("        if (_engine_spr_tint_go[t] == go) return _engine_spr_tint[t][k];")
+    p("    return 1.f;")
+    p("}")
+    p("static void SpriteRenderer_set_color(int go, float r, float g, float b,"
+      " float a) {")
+    p("    go = _engine_spr_go(go);")
+    p("    _engine_spr_col[go][0] = r; _engine_spr_col[go][1] = g;")
+    p("    _engine_spr_col[go][2] = b; _engine_spr_col[go][3] = a;")
+    p("    _engine_spr_set[go] = 1;")
+    p("}")
+    # a clone's tint is its source's, kept as set (its row has no authored)
+    p("static void _engine_spr_clone(int go, int src) {")
+    p("    int k;")
+    p("    if (go < 0 || go >= %d) return;" % cap)
+    p("    _engine_spr_has[go] = src >= 0 && src < %d && _engine_spr_has[src];"
+      % cap)
+    p("    _engine_spr_set[go] = _engine_spr_has[go];")
+    p("    for (k = 0; k < 4 && _engine_spr_has[go]; k = k + 1)")
+    p("        _engine_spr_col[go][k] = SpriteRenderer_color(src, k);")
+    p("}")
+    p("")
 
 
 def _emit_spawn_sprite_rows(p, plan):
@@ -15155,6 +15624,15 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    }")
     p("    (void)inst;")
     p("}")
+    p("/* t.eulerAngles += Vector3.forward * deg: Unity's Euler is Y*X*Z, so")
+    p("   a z step is q * Euler(0, 0, deg), whatever x and y are. */")
+    p("static void Transform_rotate_z(int go, float deg) {")
+    p("    Quaternion q = Transform_get_rotation(go), r;")
+    p("    float h = deg * 0.00872664626f, s = sinf(h), c = cosf(h);")
+    p("    r.x = q.x * c + q.y * s; r.y = q.y * c - q.x * s;")
+    p("    r.z = q.z * c + q.w * s; r.w = q.w * c - q.z * s;")
+    p("    Transform_set_rotation(go, r);")
+    p("}")
     p("/* a.eulerAngles == b.eulerAngles: Unity Vector3 == (1e-5 epsilon). */")
     p("static int Transform_eulerAngles_eq(int a, int b) {")
     p("    Quaternion qa = Transform_get_rotation(a);")
@@ -15329,6 +15807,27 @@ def _emit_engine_colliders_2d(
         class_ids, col2d_list, collision2d_handlers, p, plan, want_col2d,
         want_collision2d_msgs, want_go_tables, want_destroy=False):
     """emit_engine: Collider2D centers and OnCollision*2D messages (physics is Box2D-Packed)."""
+    rbs = plan.get("rigidbody2d") or []
+    # a child collider on an ancestor's body (_build_collider2d_tables): its
+    # messages go to that Rigidbody2D's object too, as Unity's do
+    on_other_body = any(
+        0 <= int(c["rb2d"]) < len(rbs)
+        and (rbs[int(c["rb2d"])]["owner_class"],
+             rbs[int(c["rb2d"])]["owner_inst"])
+        != (c["owner_class"], c["owner_inst"])
+        for c in col2d_list or ())
+
+    def to_body_too(send):
+        if not on_other_body:
+            return
+        p("    {")
+        p("        int rb = _Collider2D_rb2d[ci_self];")
+        p("        if (rb >= 0 && (_Rigidbody2D_owner_class[rb] != oc")
+        p("            || (unsigned)_Rigidbody2D_owner_inst[rb] != oi))")
+        p("            %s(_Rigidbody2D_owner_class[rb]," % send)
+        p("                (unsigned)_Rigidbody2D_owner_inst[rb],"
+          " ci_other, kind);")
+        p("    }")
     if want_col2d and col2d_list:
         p("/* Authored BoxCollider2D / CircleCollider2D — centers for Box2D-Packed */")
         p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
@@ -15542,12 +16041,21 @@ def _emit_engine_colliders_2d(
                 _godot.emit_signal_dispatch(
                     p, plan, col2d_list, _c_ident,
                     bool(want_destroy and plan.get("go_names")), _guard)
+            p("static void _col2d_send_to(int oc, unsigned oi, int ci_other,"
+              " int kind);")
             p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
             p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
             p("    int oc = _Collider2D_owner_class[ci_self];")
             p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
             if contacts:
                 p("    _col2d_msg_self = ci_self;")
+            p("    _col2d_send_to(oc, oi, ci_other, kind);")
+            to_body_too("_col2d_send_to")
+            if godot_signals:
+                p("    if (kind != 1) _godot_signal(ci_self, ci_other, kind);")
+            p("}")
+            p("static void _col2d_send_to(int oc, unsigned oi, int ci_other,"
+              " int kind) {")
             p("    switch (oc) {")
             for cname in sorted(collision2d_handlers.keys()):
                 cid = class_ids.get(cname)
@@ -15575,8 +16083,7 @@ def _emit_engine_colliders_2d(
                 p("        break;")
             p("    default: break;")
             p("    }")
-            if godot_signals:
-                p("    if (kind != 1) _godot_signal(ci_self, ci_other, kind);")
+            p("    (void)oi; (void)ci_other; (void)kind;")
             p("}")
             p("")
             p("static void engine_physics_collide2d_messages(void) {")
@@ -15662,10 +16169,17 @@ def _emit_engine_colliders_2d(
                              "OnTriggerExit2D") if m in msgs]
             if t:
                 trig[cname] = t
+        p("static void _col2d_trigger_to(int oc, unsigned oi, int ci_other,"
+          " int kind);")
         p("static void _col2d_send_trigger(int ci_self, int ci_other, int kind) {")
         p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
         p("    int oc = _Collider2D_owner_class[ci_self];")
         p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+        p("    _col2d_trigger_to(oc, oi, ci_other, kind);")
+        to_body_too("_col2d_trigger_to")
+        p("}")
+        p("static void _col2d_trigger_to(int oc, unsigned oi, int ci_other,"
+          " int kind) {")
         p("    switch (oc) {")
         for cname in sorted(trig):
             cid = class_ids.get(cname)
@@ -15689,7 +16203,7 @@ def _emit_engine_colliders_2d(
             p("        break;")
         p("    default: break;")
         p("    }")
-        p("    (void)oi;")
+        p("    (void)oi; (void)ci_other; (void)kind;")
         p("}")
         p("static void engine_physics_trigger2d_messages(void) {")
         p("    int i, lo, hi;")
@@ -16631,7 +17145,12 @@ def _emit_engine_box2d_exports(
         plan["_live_destroy"] = bool(
             plan.get("_want_destroy") and plan.get("_go_of_fn")
             and (plan.get("collider2d") or plan.get("rigidbody2d")))
-        if plan["_live_destroy"]:
+        # An inactive GameObject's colliders are out of the simulation too
+        # (a child collider on an inactive object stayed on its parent's body)
+        plan["_live_active"] = bool(
+            plan.get("_want_active") and plan.get("_go_of_fn")
+            and (plan.get("collider2d") or plan.get("rigidbody2d")))
+        if plan["_live_destroy"] or plan["_live_active"]:
             plan["physics2d_live"] = True
         if plan.get("physics2d_live"):
             p("/* Whether a body's GameObject is in the simulation (active, in a")
@@ -16645,7 +17164,7 @@ def _emit_engine_box2d_exports(
             p("    }")
             p("}")
             live = []
-            if _multi_scene(plan):
+            if _multi_scene(plan) or plan.get("_live_active"):
                 live.append("_engine_go_active_in_hierarchy(go)")
             if plan.get("_live_destroy"):
                 live.append("!_engine_go_destroyed[go]")
@@ -17415,6 +17934,7 @@ def _emit_engine_class_draws(
 def emit_engine(plan, analyses, used_apis):
     lines = []
     p = lines.append
+    plan.pop("_nre_ix", None)
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
@@ -17556,6 +18076,8 @@ def emit_engine(plan, analyses, used_apis):
                or _multi_scene(plan))
     plan["physics2d_live"] = _multi_scene(plan)
     plan["_want_destroy"] = bool(want_destroy)
+    plan["_want_active"] = bool(
+        "GameObject.SetActive" in used_apis or authored_inactive)
     rt_apis = (
         "rectTransform.anchoredPosition" in used_apis
         or "rectTransform.sizeDelta" in used_apis)
@@ -17593,7 +18115,7 @@ def emit_engine(plan, analyses, used_apis):
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
     if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
-            or want_transform_matrix or want_quat_angle
+            or plan.get("animators") or want_transform_matrix or want_quat_angle
             or _plan_needs_vector2(plan, used_apis)):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
@@ -17605,7 +18127,8 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
             or want_app_open_url or plan.get("player_prefs")
-            or "GodotPrint" in used_apis or not plan.get("strict")):
+            or "GodotPrint" in used_apis or not plan.get("strict")
+            or plan.get("animators")):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -17660,7 +18183,8 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
             or want_app_open_url or plan.get("player_prefs")
-            or want_str_plus or not plan.get("strict")):
+            or want_str_plus or not plan.get("strict")
+            or plan.get("animators")):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -18385,8 +18909,11 @@ def emit_engine(plan, analyses, used_apis):
                     go_cap_d, ", ".join(str(v) for v in gcls)))
                 p("static unsigned _godot_go_inst[%d] = { %s };" % (
                     go_cap_d, ", ".join("%du" % v for v in ginst)))
+        # seconds till a `Destroy(go, t)`; 0 = none
+        p("static float _engine_go_doom[%d];" % go_cap_d)
         p("static void Object_Destroy(int go) {")
         p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;" % go_cap_d)
+        p("    _engine_go_doom[go] = 0.f;")
         if tree:
             p("    {")
             p("        int c = _godot_go_child[go];")
@@ -18398,6 +18925,23 @@ def emit_engine(plan, analyses, used_apis):
         if want_go_tables:
             p("    _engine_go_message(go, 2); /* OnDisable, OnDestroy */")
         p("    _engine_go_destroyed[go] = 1;")
+        p("}")
+        p("")
+        p("static void Object_DestroyAfter(int go, float t) {")
+        p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;"
+          % go_cap_d)
+        p("    if (t <= 0.f) Object_Destroy(go);")
+        p("    else _engine_go_doom[go] = t;")
+        p("}")
+        # ponytail: O(GameObjects) per frame, and the doomed object goes
+        # at the start of the frame its time runs out (Unity: the end)
+        p("static void _engine_go_doom_tick(float dt) {")
+        p("    int go;")
+        p("    for (go = 0; go < %d; go = go + 1)" % go_cap_d)
+        p("        if (_engine_go_doom[go] > 0.f) {")
+        p("            _engine_go_doom[go] = _engine_go_doom[go] - dt;")
+        p("            if (_engine_go_doom[go] <= 0.f) Object_Destroy(go);")
+        p("        }")
         p("}")
         p("")
     _emit_engine_debug_log(p, plan, want_log)
@@ -18525,6 +19069,10 @@ def emit_engine(plan, analyses, used_apis):
         for _root in sorted({t["nodes"][0]["class"]
                              for t in plan.get("godot_templates") or []}):
             p("static int _godot_spawn_%s(int src);" % _c_ident(_root))
+    plan["_spr_color_cap"] = 0
+    if "SpriteRenderer.color" in used_apis and plan.get("go_names"):
+        _emit_sprite_color_tables(p, plan, max(
+            1, len(plan.get("go_names") or []) + go_spawn_budget))
     _emit_spawn_sprite_rows(p, plan)
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
     _emit_engine_instantiate(
@@ -18637,7 +19185,11 @@ def emit_engine(plan, analyses, used_apis):
             p("            _%s_scale_y[ti] = sy;" % idn)
             p("        }")
             p("        break;")
-        p("    default: break;")
+        p("    default:")
+        p('        fprintf(stderr, "SetWorldScale / localScale of a Transform'
+          ' whose scale crust does not keep live is not lowered; stopping'
+          ' rather than skipping it\\n");')
+        p("        exit(70);")
         p("    }")
         p("}")
         p("static float _engine_get_local_scale(int tc, unsigned ti, int y) {")
@@ -18839,7 +19391,7 @@ def emit_engine(plan, analyses, used_apis):
                     _handle_targets.add(_other)
     for _other in sorted(_handle_targets):
         _oidn = _c_ident(_other)
-        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (_oidn, _oidn))
+        p(_at_macro(_oidn, plan))
     if _handle_targets:
         p("")
 
@@ -18930,9 +19482,11 @@ def emit_engine(plan, analyses, used_apis):
         _godot.emit_custom_decls(p, plan, _c_ident)
         if plan.get("godot_spawn"):
             _emit_godot_spawn_decls(p, plan)
+    _emit_animator_protos(p, plan)
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
+    _emit_animator_runtime(p, plan)
     if plan.get("godot_custom"):
         _godot.emit_custom_dispatch(p, plan, _c_ident, want_go_tables)
     _parts.emit_sim(p, plan, class_ids, _c_ident, _class_has_position)
@@ -19144,6 +19698,8 @@ def emit_engine(plan, analyses, used_apis):
         p("    _godot_input_latch();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
+    if plan.get("_destroy_after"):
+        p("    _engine_go_doom_tick(Time_deltaTime);")
     if want_ui:
         p("    engine_ui_tick();")
     for cname in sorted(plan["classes"]):
@@ -19174,6 +19730,8 @@ def emit_engine(plan, analyses, used_apis):
     # LateUpdate -- the animation ran before Update, LateUpdate never
     if want_anim and anim_players:
         p("    engine_animation_tick();")
+    if plan.get("animators"):
+        p("    engine_animator_tick();")
     for cname in sorted(plan["classes"]):
         p("    %s_LateTick();" % _c_ident(cname))
     if plan.get("particles"):
@@ -19269,6 +19827,18 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_collect(out, &n, max);")
     if plan.get("lines"):
         p("    _lr_collect(out, &n, max);")
+    if plan.get("_spr_color_cap"):
+        p("    {")
+        p("        int r;")
+        p("        for (r = 0; r < n; r = r + 1)")
+        p("            if (out[r].go >= 0 && out[r].go < %d"
+          " && _engine_spr_set[out[r].go]) {" % plan["_spr_color_cap"])
+        p("                out[r].r = _engine_spr_col[out[r].go][0];")
+        p("                out[r].g = _engine_spr_col[out[r].go][1];")
+        p("                out[r].b = _engine_spr_col[out[r].go][2];")
+        p("                out[r].a = _engine_spr_col[out[r].go][3];")
+        p("            }")
+        p("    }")
     # The main camera's culling mask (Slime Jump hides its World Map layer).
     # ponytail: authored GOs' layers only -- a spawned object or a runtime
     # `gameObject.layer =` is always drawn; a live layer table if needed
@@ -19297,6 +19867,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    return n;")
     p("}")
     p("")
+    _emit_bounds(p, plan)
     if _want_gpu_sprites:
         import tools.unity_pack_gpu2d as _gpu
         p(_gpu.HEADER.split("int engine_atlas_side")[0])   # the typedef
@@ -19352,7 +19923,98 @@ def emit_engine(plan, analyses, used_apis):
     p("")
     if _multi_scene(plan):
         _emit_engine_scene_apply(lines, plan, class_ids)
-    return _fill_accessor_prototypes("\n".join(lines) + "\n")
+    return _site_stops(_fill_accessor_prototypes("\n".join(lines) + "\n"))
+
+
+_SITE_MARK = re.compile(r" /\*@site (.*?) @cs (.*?)\*/$", re.M)
+
+
+def _site_stops(text):
+    """A runtime helper that stops the player (`exit(70)`: a refusal, an
+    out-of-range index) says where in the C# it was called, as Unity's
+    trace does: each call from a script body records its site first
+    (`(_engine_at(site), helper(..))`), and the helper prints it before it
+    exits. The column is the call's member in the C# line (`bounds` of
+    `collider.bounds.min`), else the statement's first character.
+
+    ponytail: the site is the last script call that recorded one; a helper
+    the engine itself calls (the tick, physics) reports that stale site."""
+    lines = text.split("\n")
+    defs = {}  # name -> (first line, last line) of a multi-line definition
+    k = 0
+    while k < len(lines):
+        m = re.match(r"static [^;=]*?\b(\w+)\(", lines[k])
+        j = k
+        while m and j < min(k + 3, len(lines) - 1) and not re.search(
+                r"\)\s*\{\s*$", lines[j]) and ";" not in lines[j]:
+            j += 1
+        if m and re.search(r"\)\s*\{\s*$", lines[j]) and ";" not in "".join(
+                lines[k:j + 1]):
+            e = j + 1
+            while e < len(lines) and lines[e] != "}":
+                e += 1
+            defs[m.group(1)] = (k, e)
+            k = e
+        k += 1
+    stops = {n for n, (a, b) in defs.items()
+             if n not in ("_engine_nn", "_engine_nre_ix")
+             and any("exit(70)" in l for l in lines[a:b])}
+
+    def col_for(cs, name):
+        for part in reversed(name.split("_")):
+            if not part or part in ("get", "set", "T"):
+                continue
+            for mm in re.finditer(
+                    r"((?:[A-Za-z_]\w*\s*(?:\(\s*\))?\s*\.\s*)*)\b%s\b"
+                    % re.escape(part), cs, re.I):
+                return mm.start() + 1
+        return len(cs) - len(cs.lstrip()) + 1
+
+    for k, line in enumerate(lines):
+        mk = _SITE_MARK.search(line)
+        if not mk:
+            continue
+        head, cs = mk.group(1), mk.group(2)
+        line = line[:mk.start()]
+        calls = [m for m in re.finditer(r"(?<![\w.])(\w+)\(",
+                                        cs2cpp._blank(line))
+                 if m.group(1) in stops]
+        for m in reversed(calls):
+            close = _match_close(cs2cpp._blank(line), m.end() - 1, "(", ")")
+            if close is None:
+                continue
+            line = "%s(_engine_at(%s, %d), %s)%s" % (
+                line[:m.start()], head, col_for(cs, m.group(1)),
+                line[m.start():close + 1], line[close + 1:])
+        lines[k] = line
+    if stops:
+        # the stopping helpers print the recorded site before they exit
+        for n in stops:
+            a, b = defs[n]
+            for j in range(a + 1, b):
+                lines[j] = lines[j].replace(
+                    "exit(70);", "_engine_site_print(); exit(70);")
+        first = next((j for j, l in enumerate(lines)
+                      if l.startswith("static ")), 0)
+        lines[first:first] = _SITE_RUNTIME.rstrip("\n").split("\n")
+    return "\n".join(lines)
+
+
+_SITE_RUNTIME = """static const char *_engine_site_cls, *_engine_site_method, *_engine_site_path;
+static int _engine_site_line, _engine_site_col;
+static int _engine_at(const char *cls, const char *method, const char *path,
+                      int line, int col) {
+    _engine_site_cls = cls; _engine_site_method = method;
+    _engine_site_path = path; _engine_site_line = line; _engine_site_col = col;
+    return 0;
+}
+static void _engine_site_print(void) {
+    if (_engine_site_cls)
+        fprintf(stderr, "%s.%s () (at %s:%d:%d)\\n", _engine_site_cls,
+                _engine_site_method, _engine_site_path, _engine_site_line,
+                _engine_site_col);
+}
+"""
 
 
 def emit_engine_draw_h():
@@ -19662,6 +20324,21 @@ def _go_handle_receivers(text, cl, plan):
                                                re.escape(on)),
                 "%s_get_%s(%s)" % (_c_ident(other), on, hname),
                 oty.get(on)))
+    # `Other.instance.trs` of a singleton (`Lasso.instance.hookTrs`), as
+    # written or once the singleton pass made it the accessor
+    singles = set(plan.get("singleton_instance_types") or ()) | set(
+        plan.get("findobject_types") or ())
+    for other in sorted(singles & set(classes)):
+        ocl, oidn = classes[other], _c_ident(other)
+        if other not in text and oidn not in text:
+            continue
+        oty = {f["name"]: f.get("ty") for f in ocl.get("fields") or []}
+        for on, _t2, _b2, ok in ocl.get("members") or []:
+            if ok == "go" and on in text:
+                expr = "%s_get_%s(%s_Instance())" % (oidn, on, oidn)
+                out.append((r"(?:(?<![\w.])%s\s*\.\s*[Ii]nstance\s*\.\s*%s\b"
+                            r"|%s)" % (re.escape(other), re.escape(on),
+                                       re.escape(expr)), expr, oty.get(on)))
     named = {n: field_ty.get(n) for n, _t, _b, k in cl.get("members") or []
              if k == "go"}
     decl = r"(?<![\w.])(%s)\s+(\w+)\s*[=;]" % "|".join(
@@ -19757,6 +20434,7 @@ _TRANSFORM_HANDLE_PROTOS = {
         "static void Transform_set_rotation(int go, Quaternion q);",
     "Transform_eulerAngles_eq":
         "static int Transform_eulerAngles_eq(int a, int b);",
+    "Transform_rotate_z": "static void Transform_rotate_z(int go, float deg);",
 }
 
 
@@ -19785,6 +20463,15 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
                lambda m: "%sTransform_eulerAngles_eq(%s, %s)" % (
                    "!" if m.group(2) == "!=" else "", e(m.group(1)),
                    e(m.group(3))), text)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*\+=\s*Vector3\s*\.\s*forward\s*\*"
+               r"\s*([^;]+);" % alt,
+               lambda m: "Transform_rotate_z(%s, (%s));" % (
+                   e(m.group(1)), m.group(2).strip()), text)
+    text = sub(r"(%s)\s*\.\s*eulerAngles\s*=(?!=)\s*(?:Vector[23]\s*\.\s*zero|"
+               r"Vector2_make\(\s*0\.f\s*,\s*0\.f\s*\))\s*;" % alt,
+               lambda m: "{ Quaternion _q0; _q0.x = 0.f; _q0.y = 0.f; "
+               "_q0.z = 0.f; _q0.w = 1.f; Transform_set_rotation(%s, _q0); }"
+               % e(m.group(1)), text)
     text = sub(r"(%s)\s*\.\s*rotation\s*=(?!=)\s*([^;]+);" % alt,
                lambda m: "Transform_set_rotation(%s, %s);" % (
                    e(m.group(1)), m.group(2).strip()), text)
@@ -22924,6 +23611,8 @@ def _lower_reference_game_objects(text, cl, plan, site):
         text = cs2cpp.code_sub(
             r"(?<![\w.])(?:Object\s*\.\s*)?Destroy\s*\(\s*" + q[len(
                 r"(?<![\w.])"):] + r"\s*\)", "Object_Destroy(%s)" % go, text)
+        text = cs2cpp.code_sub(q + r"\s*\.\s*activeSelf\b(?!\s*[.=])",
+                               "GameObject_activeSelf(%s)" % go, text)
         text = cs2cpp.code_sub(q + r"\b(?!\s*\.)", go, text)
     return text
 
@@ -23955,6 +24644,122 @@ def _desugar_destroy_immediate(text):
     return text
 
 
+_ACH_SOUND_STMTS = re.compile(
+    r"(?<![\w.])\w*Achievement\s*\.\s*[Ii]nstance\s*\.\s*HandleAchieve\s*"
+    r"\(\s*\)\s*;"
+    r"|(?<![\w.])\w*Achievement\s*\.\s*[A-Z]\w*\s*"
+    r"(?:\+\+|--|[-+*/]?=(?!=)[^;{}]*)\s*;"
+    r"|(?<![\w.])(?:SoundEffect\s+(\w+)\s*=\s*)?AudioManager\s*\.\s*"
+    r"[Ii]nstance\s*\.\s*MakeSoundEffect\s*\(\s*(\w+)?[^;{}]*\)\s*;")
+
+
+def _desugar_drop_achievements_sounds(text, where):
+    """Achievement bookkeeping (`XAchievement.Instance.HandleAchieve();`,
+    `XAchievement.Stat ++ / += e;`) and one-shot sounds
+    (`SoundEffect s = AudioManager.instance.MakeSoundEffect(..);` with its
+    `s.audioSource.p = e;` settings, and an `AudioClip` local only that call
+    read) are dropped with a warning. Each statement becomes `;` so an
+    unbraced `if` keeps its body; lines stay put. A use the pattern does not
+    cover (HandleAchieve's result read, the SoundEffect used again) is left
+    alone and still reports CS8000.
+
+    ponytail: no achievements, stats, saves or sound effects; RNG draws in
+    the dropped pitch expressions go too (crust's Random is not Unity's
+    stream anyway). Upgrade: lower SaveAndLoadManager / EventManager /
+    AudioManager for real."""
+    scan = cs2cpp._blank(text)
+    spans, clips = [], []
+    for m in _ACH_SOUND_STMTS.finditer(scan):
+        before = scan[:m.start()].rstrip()
+        if not (before[-1:] in ";{})" or re.search(r"\belse$", before)):
+            continue
+        spans.append((m.start(), m.end()))
+        if m.group(2):
+            clips.append(m.group(2))
+        if m.group(1):
+            k = m.end()
+            sub = re.compile(r"\s*%s\s*\.\s*audioSource\s*\.\s*\w+\s*"
+                             r"=(?!=)[^;{}]*;" % re.escape(m.group(1)))
+            while True:
+                m2 = sub.match(scan, k)
+                if not m2:
+                    break
+                spans.append((k, m2.end()))
+                k = m2.end()
+    if not spans:
+        return text
+    def blank(t, a, b):
+        a += len(t[a:b]) - len(t[a:b].lstrip())
+        return t[:a] + ";" + re.sub(r"[^\n]", " ", t[a + 1:b]) + t[b:]
+    for a, b in spans:
+        text, scan = blank(text, a, b), blank(scan, a, b)
+    for v in clips:
+        d = re.search(r"(?<![\w.])AudioClip\s+%s\s*=[^;{}]*;" % re.escape(v),
+                      scan)
+        if d and len(re.findall(r"\b%s\b" % re.escape(v), scan)) == 1:
+            spans.append(d.span())
+            text, scan = blank(text, *d.span()), blank(scan, *d.span())
+    sys.stderr.write(
+        "unity_pack: warning: %s: lines %s: achievement / sound-effect "
+        "statements are dropped (no achievements, stats or sounds)\n"
+        % (where, ", ".join(str(n) for n in sorted(
+            {text.count("\n", 0, a + len(scan[a:b]) - len(scan[a:b].lstrip()))
+             + 1 for a, b in spans}))))
+    return text
+
+
+def _item_gain_types(files):
+    """Slime Jump's item system: an `Item` class with a virtual `OnGain`,
+    and every class under it."""
+    if not any(re.search(r"\bclass\s+Item\b[^{]*\{[\s\S]*?\bvirtual\s+void"
+                         r"\s+OnGain\s*\(", t) for t in files):
+        return set()
+    bases = {}
+    for t in files:
+        for c, b in re.findall(r"\bclass\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*(\w+)",
+                               t):
+            bases.setdefault(b, set()).add(c)
+    out, todo = set(), ["Item"]
+    while todo:
+        c = todo.pop()
+        if c not in out:
+            out.add(c)
+            todo.extend(bases.get(c, ()))
+    return out
+
+
+def _desugar_drop_item_gains(text, where, item_types):
+    """`items = x.GetComponentsInChildren<Item>();` for the item system
+    (`_item_gain_types`: lasso, blaster and useable items, out of scope) is
+    dropped with a warning, so the arrays stay empty and the `OnGain` loops
+    over them run no pass. The statement becomes `;`; lines stay put.
+
+    ponytail: the player gains no items. Upgrade: class-tagged references
+    with a virtual OnGain dispatch."""
+    if not item_types or "GetComponentsInChildren" not in text:
+        return text
+    scan = cs2cpp._blank(text)
+    pat = re.compile(
+        r"(?<![\w.])(?:this\s*\.\s*)?\w+\s*=\s*(?:\w+\s*\.\s*)?"
+        r"GetComponentsInChildren\s*<\s*(?:%s)\s*>\s*\([^;{}]*\)\s*;"
+        % "|".join(re.escape(t) for t in sorted(item_types)))
+    lines = []
+    for m in reversed(list(pat.finditer(scan))):
+        before = scan[:m.start()].rstrip()
+        if not (before[-1:] in ";{})" or re.search(r"\belse$", before)):
+            continue
+        lines.append(text.count("\n", 0, m.start()) + 1)
+        text = (text[:m.start()] + ";" + re.sub(
+            r"[^\n]", " ", text[m.start() + 1:m.end()]) + text[m.end():])
+    if lines:
+        sys.stderr.write(
+            "unity_pack: warning: %s: lines %s: item GetComponentsInChildren "
+            "stores are dropped (lasso / blaster / items are not lowered; "
+            "the arrays stay empty)\n"
+            % (where, ", ".join(str(n) for n in sorted(lines))))
+    return text
+
+
 def _match_close(scan, k, o, c):
     depth = 0
     while k < len(scan):
@@ -24386,8 +25191,29 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = _trap_tmp_writes(_drop_shader_params(body, plan, site), plan,
-                            site)
+    # first: their warnings point into the source by offset
+    body = _trap_shallow_calls(_drop_sprite_swaps(
+        _drop_shader_params(body, plan, site), plan, site), plan, site)
+    # the packed instance index is `i`: a C# local of that name (a loop
+    # counter) would take its place in every field access below
+    if any(m.group(1) not in ("return", "else", "case", "goto", "throw",
+                              "yield", "await", "new", "in", "out", "ref")
+           for m in re.finditer(r"(?<![\w.])([A-Za-z_][\w.<>\[\]]*)\s+i\s*"
+                                r"(?:[=;,)]|\bin\b)", cs2cpp._blank(body))):
+        body = cs2cpp.code_sub(r"(?<![\w.])i\b", "_cs_i", body)
+    # `enabled` is the authored m_Enabled: crust runs every packed script
+    # enabled, so it is 1 where every row was authored enabled and no
+    # script writes it (a write is not lowered, its method stubs)
+    import tools.unity_pack_common as _cme
+    insts = cl.get("instances") or []
+    bases = plan.get("mb_bases") or {}
+    written = _cme.SOURCE_ENABLED_WRITTEN
+    if insts and all(int(o.get("mb_enabled", 1)) for o in insts) and not (
+            written & {"MonoBehaviour", "Behaviour"}
+            or any(_mb_is_a(cl["name"], w, bases) for w in written)):
+        body = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?enabled\b(?!\s*=(?!=))", "1", body)
+    text = _trap_tmp_writes(body, plan, site)
     text = _own_string_params(text, site)
     text = _drop_iface_tick_loops(text, plan, site)
     # before `gameObject` is lowered: the terrain calls take it as written
@@ -24441,6 +25267,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 text)
         text = cs2cpp.code_sub(r"(?<![\w.])__sprite_fx\s*\(", "engine_set_sprite_effect(",
                                text)
+    if "__nre(" in text:
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])__nre\s*\(", "(void)_engine_nn(-1, %s, %s, %s, " % (
+                _c_string(site.get("class") or cl["name"]),
+                _c_string(site.get("method") or ""),
+                _c_string(site.get("path") or "")), text)
     # (before the null comparisons: `gp == null` is the connected flag)
     text = _lower_gamepad(text)
     if collision2d_param:
@@ -24717,6 +25549,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(",
         "Object_Destroy(",
         text)
+    if plan.get("go_names"):
+        for m in reversed(list(re.finditer(r"\bObject_Destroy\s*\(", text))):
+            got = _match_call_args(text, m.end() - 1)
+            if got and len(_split_call_args(got[0])) == 2:
+                plan["_destroy_after"] = True
+                text = text[:m.start()] + "Object_DestroyAfter" + \
+                    text[m.start() + len("Object_Destroy"):]
     text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = cs2cpp.code_sub(
@@ -24852,8 +25691,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=(?!=)\s*(.+?)\s*;" % re.escape(vf),
             lambda m, name=vf: (
-                "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
-                % (idn, name, m.group(1), idn, name, m.group(1))),
+                "{ Vector2 _v2 = (%s); %s_set_%s_x(i, _v2.x); "
+                "%s_set_%s_y(i, _v2.y); }"
+                % (m.group(1), idn, name, idn, name)),
             text)
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
@@ -24882,10 +25722,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\s*=\s*(.+?)\s*;" % re.escape(vf),
                 lambda m, o=oidn, f=vf: (
-                    "%s_set_%s_x(%s, Vector2_x(%s)); "
-                    "%s_set_%s_y(%s, Vector2_y(%s));"
-                    % (o, f, m.group(1), m.group(2),
-                       o, f, m.group(1), m.group(2))),
+                    "{ Vector2 _v2 = (%s); %s_set_%s_x(%s, _v2.x); "
+                    "%s_set_%s_y(%s, _v2.y); }"
+                    % (m.group(2), o, f, m.group(1), o, f, m.group(1))),
                 text)
             # recv.transform.localPosition = recv.vf (before bare-field read).
             text = cs2cpp.code_sub(
@@ -25135,6 +25974,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _own_string_locals(text, string_idents, int_idents,
                               _string_store_names(plan) | string_arrays | _sl,
                               arrays=string_arrays | _sl)
+    text = _lower_bounds(text, plan, site)
     # Vector2 operators (a + b, v * s, -v, v += w, ==) as the engine's
     # component-wise helpers: C has no operators on the struct.
     text = _vec.lower_vector2_ops(
@@ -25172,17 +26012,87 @@ def _trap_tmp_writes(body, plan, site):
     at = int(site.get("body_abs") or 0)
 
     def trap(m):
-        line = ft.count("\n", 0, at + m.start()) + 1 if ft else 0
+        off = _body_src_off(ft, at, body, m.start()) if ft else 0
+        line = ft.count("\n", 0, off) + 1 if ft else 0
         api = "TMP_Text.%s" % m.group(1)
         if ft:
             sys.stderr.write(_cs_diag(
-                path, ft, at + m.start(), "CS8000",
+                path, ft, off, "CS8000",
                 "`%s` writes are not lowered (text is baked at pack time);"
                 " the statement stops the player if it runs" % api,
                 kind="warning") + "\n")
         return "_engine_unlowered_at(%s, %s, %d);" % (
             _c_string(api), _c_string(path), line)
     return pat.sub(trap, body)
+
+
+def _body_src_off(ft, at, body, pos):
+    """Offset in the file text *ft* of position *pos* of a method *body*
+    that starts at *at*: the rewrites before keep newlines, so the line is
+    exact, the column the rewritten line's."""
+    k = body.count("\n", 0, pos)
+    if not k:
+        return at + pos
+    ls = at
+    for _ in range(k):
+        ls = ft.index("\n", ls) + 1
+    return ls + pos - (body.rfind("\n", 0, pos) + 1)
+
+
+def _trap_shallow_calls(body, plan, site):
+    """`recv.M(..);` on a class crust packs no methods of (SHALLOW_METHODS:
+    only in prefabs nothing spawns, or nowhere) -- a local or field of it, or
+    its `Instance` -- keeps Unity's NullReferenceException, then stops the
+    player with its C# line if it runs. A CS8000 warning names it; under
+    strict it is left for the stub.
+
+    ponytail: a receiver is typed by name across the file (one type per
+    name), and the arguments are not evaluated before the stop."""
+    import tools.unity_pack_common as _cm
+    if plan.get("strict") or not site or not _cm.SHALLOW_METHODS:
+        return body
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    if not ft:
+        return body
+    path = site.get("path") or "<cs>"
+    decl = cs2cpp._blank(ft)
+    for cname, methods in sorted(_cm.SHALLOW_METHODS.items()):
+        if not methods or cname not in decl:
+            continue
+        recvs = [re.escape(v) for v in sorted(set(re.findall(
+            r"(?<![\w.])%s\s+(\w+)\s*[;=,)]" % re.escape(cname), decl)))]
+        recvs.append(r"%s\s*\.\s*[Ii]nstance" % re.escape(cname))
+        pat = re.compile(
+            r"(?<![\w.])(?:this\s*\.\s*)?(?P<r>%s)\s*\.\s*(?P<m>%s)\s*"
+            r"\((?:[^();]|\([^();]*\))*\)\s*;" % (
+                "|".join(recvs), "|".join(re.escape(m) for m in methods)))
+        scan = cs2cpp._blank(body)
+        out, last = [], 0
+        for m in pat.finditer(scan):
+            prev = scan[:m.start()].rstrip()
+            if prev and prev[-1] not in ";{})" and not re.search(
+                    r"\belse$", prev):
+                continue
+            off = _body_src_off(ft, at, body, m.start("r"))
+            ln = ft.count("\n", 0, off) + 1
+            col = off - (ft.rfind("\n", 0, off) + 1) + 1
+            api = "%s.%s" % (cname, m.group("m"))
+            sys.stderr.write(_cs_diag(
+                path, ft, _body_src_off(ft, at, body, m.start()), "CS8000",
+                "`%s` is not lowered (crust packs no %s methods: only in "
+                "prefabs nothing spawns, or nowhere); the statement stops "
+                "the player if it runs" % (api, cname),
+                kind="warning") + "\n")
+            out.append(body[last:m.start()])
+            out.append("{ if (%s == null) __nre(%d, %d); "
+                       "_engine_unlowered_at(%s, %s, %d); }%s" % (
+                           body[m.start("r"):m.end("r")], ln, col,
+                           _c_string(api), _c_string(path), ln,
+                           "\n" * body.count("\n", m.start(), m.end())))
+            last = m.end()
+        body = "".join(out) + body[last:]
+    return body
 
 
 def _drop_shader_params(body, plan, site):
@@ -25219,8 +26129,58 @@ def _drop_shader_params(body, plan, site):
     return body
 
 
-def _call_suffix_sub(text, funcs, suffix, build):
-    """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match)."""
+def _drop_sprite_swaps(body, plan, site):
+    """`s = img.sprite;` / `img.sprite = s;` swap an Image's or
+    SpriteRenderer's sprite, and the pack draws each with its authored one:
+    the statement goes with a CS8000 warning, keeping the receiver's
+    NullReferenceException (`__nre(line, col)`, made `_engine_nn` once
+    lowered). Kept -- to stub -- under strict."""
+    if plan.get("strict") or not site or ".sprite" not in body:
+        return body
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    if not ft:
+        return body
+    decl = cs2cpp._blank(ft)
+    recvs = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*(?:UI\s*\.\s*)?)?"
+                           r"(?:Image|SpriteRenderer)\s+(\w+)\s*[;=,]", decl))
+    sprites = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Sprite\s+"
+                             r"(\w+)\s*[;=,]", decl))
+    if not recvs or not sprites:
+        return body
+    alt = lambda names: "|".join(re.escape(n) for n in sorted(
+        names, key=len, reverse=True))
+    th = r"(?:this\s*\.\s*)?"
+    pat = re.compile(
+        r"%s(?:(?:%s)\s*=\s*%s(?P<r1>%s)\s*\.\s*sprite|%s(?P<r2>%s)\s*\.\s*"
+        r"sprite\s*=\s*%s(?:%s))\s*;" % (th, alt(sprites), th, alt(recvs),
+                                         th, alt(recvs), th, alt(sprites)))
+    scan = cs2cpp._blank(body)
+    out, last = [], 0
+    for m in pat.finditer(scan):
+        prev = scan[:m.start()].rstrip()
+        if prev and prev[-1] not in ";{})" and not re.search(r"\belse$", prev):
+            continue
+        g = "r1" if m.group("r1") else "r2"
+        off = _body_src_off(ft, at, body, m.start(g))
+        ln = ft.count("\n", 0, off) + 1
+        col = off - (ft.rfind("\n", 0, off) + 1) + 1
+        sys.stderr.write(_cs_diag(
+            site.get("path") or "<cs>", ft,
+            _body_src_off(ft, at, body, m.start()), "CS8000",
+            "sprite swaps are not drawn by the pack (each draws its authored "
+            "sprite); the statement is dropped", kind="warning") + "\n")
+        out.append(body[last:m.start()])
+        out.append("{ if (%s == null) __nre(%d, %d); }%s" % (
+            m.group(g), ln, col, "\n" * body.count("\n", m.start(), m.end())))
+        last = m.end()
+    return "".join(out) + body[last:]
+
+
+def _call_suffix_sub(text, funcs, suffix, build, args=False):
+    """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match);
+    with *args*, a *suffix* ending in `(` (a method of the result) is
+    consumed with its arguments, *build*(call, match, [args])."""
     if not funcs:
         return text
     pat = re.compile(r"(?<![\w.])(%s)\s*\(" % "|".join(
@@ -25236,8 +26196,17 @@ def _call_suffix_sub(text, funcs, suffix, build):
         mm = re.match(suffix, text[after:])
         if not mm:
             continue
+        end = after + mm.end()
+        if args:
+            inner = _match_call_args(text, end - 1)
+            if not inner:
+                continue
+            out += [text[pos:m.start()], build(
+                text[m.start():after], mm, _split_top_args(inner[0]))]
+            pos = inner[1]
+            continue
         out += [text[pos:m.start()], build(text[m.start():after], mm)]
-        pos = after + mm.end()
+        pos = end
     return "".join(out) + text[pos:] if out else text
 
 
@@ -25256,14 +26225,223 @@ def _late_call_members(text, plan):
            for f in c.get("fields") or []
            if f.get("ty") in _GO_HANDLE_FIELD_TYPES
            and not f.get("static") and not f.get("const")}
+    for cn, methods in (plan.get("_methods_by") or {}).items():
+        for _c, m in methods:
+            prms = cs2cpp.parse_params(m.get("args") or "")
+            if m.get("static") or not any(
+                    prm.default is not None for prm in prms):
+                continue
+            text = _fill_defaults_after(text, _method_c_symbol(
+                _c_ident(cn), m["name"], m.get("args") or "", False), prms,
+                receiver=True)
+    if plan.get("go_layers"):
+        text = _call_suffix_sub(
+            text, gos | set(re.findall(r"\b_engine_go_of_\w+", text)),
+            r"(?:\s*\.\s*gameObject\b)?\s*\.\s*layer\b(?!\s*[-+*/|&^]?=(?!=))",
+            lambda call, mm: "GameObject_layer(%s)" % call)
+    if plan.get("animators"):
+        anims = {g for g in gos if any(
+            "%s_get_%s" % (_c_ident(cn), f["name"]) == g
+            and f.get("ty") == "Animator"
+            for cn, c in plan["classes"].items()
+            for f in c.get("fields") or [])}
+        text = _call_suffix_sub(
+            text, anims, r"\s*\.\s*Play\s*\(",
+            lambda call, mm, a: "Animator_Play(%s)" % ", ".join(
+                [call] + a + ["-1", "-INFINITY"][len(a) - 1:]), True)
+        text = _call_suffix_sub(
+            text, anims, r"\s*\.\s*GetCurrentAnimatorStateInfo\s*\(",
+            lambda call, mm, a: "_Animator_StateInfo(%s)" % ", ".join(
+                [call] + a), True)
+        text = _call_suffix_sub(
+            text, {"_Animator_StateInfo"}, r"\s*\.\s*IsName\s*\(",
+            lambda call, mm, a: "Animator_IsName(%s)" % ", ".join(
+                [call[call.index("(") + 1:-1]] + a), True)
     return _call_suffix_sub(
         text, gos,
-        r"\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
-        r"(?!\s*\.)",
-        lambda call, mm: (
-            "GameObject_activeSelf(%s)" % call if mm.group(1) == "activeSelf"
-            else "GameObject_SetActive(%s, " % call if mm.group(1)
-            else call))
+        r"(?:\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
+        r"|\s*\.\s*(activeSelf\b|SetActive\s*\())(?!\s*\.)",
+        lambda call, mm: (lambda g: (
+            "GameObject_activeSelf(%s)" % call if g == "activeSelf"
+            else "GameObject_SetActive(%s, " % call if g
+            else call))(mm.group(1) or mm.group(2)))
+
+
+_COLLIDER2D_FIELD_TYPES = frozenset((
+    "Collider2D", "BoxCollider2D", "CircleCollider2D", "CapsuleCollider2D",
+    "PolygonCollider2D"))
+
+
+def _lower_bounds(text, plan, site=None):
+    """`c.bounds.center|extents|size|min|max[.x|.y]` of a Collider2D field
+    (a collider row) or a SpriteRenderer field (a GO): the world AABB, by
+    `Collider2D_bounds` / `SpriteRenderer_bounds` (`_emit_bounds`). A
+    whole vector is the Vector2 C has; `.z` is left to the stub check."""
+    funcs = {}
+    for cn, c in (plan.get("classes") or {}).items():
+        for f in c.get("fields") or []:
+            if f.get("static") or f.get("const"):
+                continue
+            if f.get("ty") in _COLLIDER2D_FIELD_TYPES:
+                funcs["%s_get_%s" % (_c_ident(cn), f["name"])] = \
+                    "Collider2D_bounds"
+            elif f.get("ty") == "SpriteRenderer":
+                funcs["%s_get_%s" % (_c_ident(cn), f["name"])] = \
+                    "SpriteRenderer_bounds"
+    sprs = {k for k, v in funcs.items() if v == "SpriteRenderer_bounds"}
+    if sprs and plan.get("_spr_color_cap") and ".color" in text:
+        # `r.color.r|g|b|a` and `r.color = new Color(r, g, b[, a]);`
+        # (the inlined extension wraps both in parentheses)
+        text = re.sub(r"\(\s*((?:%s)\s*\([^()]*\)\s*\.\s*color)\s*\)" % "|".join(
+            map(re.escape, sorted(sprs))), r"\1", text)
+        for m in reversed(list(re.finditer(
+                r"\.\s*color\s*=(?!=)\s*(\()\s*new\s+(?:UnityEngine\s*\.\s*)?"
+                r"Color\s*\(", text))):
+            got = _match_call_args(text, m.start(1))
+            if got and _match_call_args(text, m.end() - 1)[1] == got[1] - 1:
+                text = (text[:m.start(1)] + text[m.start(1) + 1:got[1] - 1]
+                        + text[got[1]:])
+        text = _call_suffix_sub(
+            text, sprs, r"\s*\.\s*color\s*\.\s*([rgba])\b"
+            r"(?!\s*(?:\.|\(|[-+*/]?=(?!=)))",
+            lambda call, mm: "SpriteRenderer_color(%s, %d)" % (
+                call, "rgba".index(mm.group(1))))
+        text = _call_suffix_sub(
+            text, sprs, r"\s*\.\s*color\s*=(?!=)\s*new\s+"
+            r"(?:UnityEngine\s*\.\s*)?Color\s*\(",
+            lambda call, mm, a: "SpriteRenderer_set_color(%s, %s)" % (
+                call, ", ".join(a + ["1.f"] if len(a) == 3 else a))
+            if len(a) in (3, 4) else call + mm.group(0) + ", ".join(a) + ")",
+            args=True)
+    if not funcs or ".bounds" not in text:
+        return text
+    used = set()
+
+    def build(call, mm):
+        fn = funcs[call[:call.index("(")].strip()]
+        used.add(fn)
+
+        def a(k):
+            return "%s(%s, %d)" % (fn, call, k)
+        part, ax = mm.group(1), mm.group(2)
+        val = {
+            "center": lambda k: a(k),
+            "extents": lambda k: a(k + 2),
+            "size": lambda k: "(2.f * %s)" % a(k + 2),
+            "min": lambda k: "(%s - %s)" % (a(k), a(k + 2)),
+            "max": lambda k: "(%s + %s)" % (a(k), a(k + 2)),
+        }[part]
+        if ax:
+            return val("xy".index(ax))
+        return "Vector2_make(%s, %s)" % (val(0), val(1))
+    text = _call_suffix_sub(
+        text, set(funcs),
+        r"\s*\.\s*bounds\s*\.\s*(center|extents|size|min|max)\b"
+        r"(?:\s*\.\s*([xy])\b)?(?!\s*(?:\.|\(|[-+*/]?=(?!=)))", build)
+    plan.setdefault("_bounds_used", set()).update(used)
+    if site is not None:
+        for fn in used:
+            site.setdefault("protos", set()).add(
+                "static float %s(int h, int what);" % fn)
+    return text
+
+
+def _emit_bounds(p, plan):
+    """The runtime of `_lower_bounds` (what: 0/1 the center's x/y, 2/3 the
+    extents'), after the draw list."""
+    used = plan.get("_bounds_used") or ()
+    if "Collider2D_bounds" in used:
+        # ponytail: the shape's own AABB; Box2D pads a polygon by its skin
+        # radius (b2_polygonRadius), which Unity's bounds may include
+        p("static float Collider2D_bounds(int ci, int what) {")
+        if plan.get("collider2d"):
+            p("    float cx, cy, c, s, hw, hh, r, l, ex, ey;")
+            p("    int kind;")
+            p("    if (ci < 0 || ci >= _Collider2D_count) {")
+            p('        fprintf(stderr, "NullReferenceException: Object reference'
+              ' not set to an instance of an object (Collider2D.bounds)\\n");')
+            p("        exit(70);")
+            p("    }")
+            p("    kind = _Collider2D_kind[ci];")
+            if plan.get("physics2d_polygons"):
+                # vertices are relative to the collider's center; the
+                # rotated AABB need not be centered on it
+                p("    if (kind == 4) {")
+                p("        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;")
+                p("        int k, n = _Collider2D_tri_count[ci] * 3;")
+                p("        const float *v = &_Collider2D_tri_xy["
+                  "_Collider2D_tri_start[ci] * 6];")
+                p("        c = _Collider2D_cos[ci]; s = _Collider2D_sin[ci];")
+                p("        for (k = 0; k < n; k = k + 1) {")
+                p("            float wx = c * v[2 * k] - s * v[2 * k + 1];")
+                p("            float wy = s * v[2 * k] + c * v[2 * k + 1];")
+                p("            if (wx < x0) x0 = wx;")
+                p("            if (wx > x1) x1 = wx;")
+                p("            if (wy < y0) y0 = wy;")
+                p("            if (wy > y1) y1 = wy;")
+                p("        }")
+                p("        if (n == 0) { x0 = x1 = y0 = y1 = 0.f; }")
+                p("        _col2d_center(ci, &cx, &cy);")
+                p("        if (what == 0) return cx + 0.5f * (x0 + x1);")
+                p("        if (what == 1) return cy + 0.5f * (y0 + y1);")
+                p("        return what == 2 ? 0.5f * (x1 - x0) : 0.5f * (y1 - y0);")
+                p("    }")
+            p("    if (kind != 0 && kind != 1 && kind != 2 && kind != 3) {")
+            p('        fprintf(stderr, "Collider2D.bounds of a polygon or terrain'
+              ' collider is not lowered by crust; stopping rather than'
+              ' skipping it\\n");')
+            p("        exit(70);")
+            p("    }")
+            p("    _col2d_center(ci, &cx, &cy);")
+            p("    if (what == 0) return cx;")
+            p("    if (what == 1) return cy;")
+            p("    c = fabsf(_Collider2D_cos[ci]); s = fabsf(_Collider2D_sin[ci]);")
+            p("    hw = _Collider2D_hw[ci]; hh = _Collider2D_hh[ci];")
+            p("    if (kind == 1) { ex = hw; ey = hw; }")
+            p("    else if (kind == 2) {")
+            p("        r = hw; l = hh - hw; if (l < 0.f) l = 0.f;")
+            p("        ex = s * l + r; ey = c * l + r;")
+            p("    } else if (kind == 3) {")
+            p("        r = hh; l = hw - hh; if (l < 0.f) l = 0.f;")
+            p("        ex = c * l + r; ey = s * l + r;")
+            p("    } else { ex = c * hw + s * hh; ey = s * hw + c * hh; }")
+            p("    return what == 2 ? ex : ey;")
+        else:
+            p('    (void)ci; (void)what;')
+            p('    fprintf(stderr, "NullReferenceException: Object reference'
+              ' not set to an instance of an object (Collider2D.bounds)\\n");')
+            p("    exit(70);")
+            p("    return 0.f;")
+        p("}")
+    if "SpriteRenderer_bounds" in used:
+        cap = 4096
+        # ponytail: the drawn quad of the GO, found by collecting every
+        # draw (O(draws) a call); Unity's Sprite.bounds is the sprite's rect
+        # and pivot, which is that quad
+        p("static float SpriteRenderer_bounds(int go, int what) {")
+        p("    static EngineDraw d[%d];" % cap)
+        p("    int n, k;")
+        p("    if (go < 0) {")
+        p('        fprintf(stderr, "NullReferenceException: Object reference'
+          ' not set to an instance of an object (SpriteRenderer.bounds)\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    n = engine_collect_draws(d, %d);" % cap)
+        p("    for (k = 0; k < n; k = k + 1)")
+        p("        if (d[k].go == go) {")
+        p("            if (what == 0) return d[k].x;")
+        p("            if (what == 1) return d[k].y;")
+        p("            if (what == 2) return fabsf(d[k].m00) * d[k].half_w"
+          " + fabsf(d[k].m01) * d[k].half_h;")
+        p("            return fabsf(d[k].m10) * d[k].half_w"
+          " + fabsf(d[k].m11) * d[k].half_h;")
+        p("        }")
+        p('    fprintf(stderr, "SpriteRenderer.bounds of GameObject %d, which'
+          ' crust does not draw, is not lowered; stopping rather than'
+          ' skipping it\\n", go);')
+        p("    exit(70);")
+        p("    return 0.f;")
+        p("}")
 
 
 def _vector2_methods(plan):
@@ -26008,6 +27186,15 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:AudioSource":
                     parts.append(str(_audiosource_field_init_index(
                         plan, o, name)))
+                elif str(kind)[4:] in _COLLIDER2D_FIELD_TYPES:
+                    # a collider the table does not hold (a second one on
+                    # its GameObject) is null, not another collider
+                    fid = str((o.get("object_refs") or {}).get(name))
+                    row = next((ci for ci, c in enumerate(
+                        plan.get("collider2d") or [])
+                        if str(c.get("file_id")) == fid), None)
+                    parts.append(str(row) if row is not None
+                                 else "%du" % _idx_null(bits))
                 elif str(kind).startswith("idx:"):
                     # The scene's reference, by the referenced script
                     # component's fileID; one the scene leaves empty (or that
@@ -26454,6 +27641,8 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets,
                 pi + 1, len(prefabs), os.path.basename(path)))
         copies = [(si, _prefab_instance_text(raw, inst))
                   for si, inst in placed.get(os.path.realpath(path), [])]
+        pguid = next((g for g, ap in (assets or {}).items()
+                      if os.path.realpath(ap) == os.path.realpath(path)), None)
         for si, text in copies or [(None, raw)]:
             objs, _l, _c, _h = parse_unity_yaml(
                 text, guid_to_script=guids, asset_guids=assets)
@@ -26464,6 +27653,10 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets,
                     else:
                         # an asset Instantiate copies, not a live object
                         o["prefab_asset"] = True
+                        if pguid:
+                            o["mb_ids"] = list(o.get("mb_ids") or []) + [
+                                "%s@%s" % (mb, pguid)
+                                for mb in o.get("mb_ids") or []]
                     out.append(o)
     return out
 
@@ -26586,6 +27779,8 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     *objects* is extended in place with prefab instances. Returns analyses.
     """
+    import tools.unity_pack_common as _common
+    _common.SHALLOW_METHODS.clear()
     if _godot.is_godot_project(root):
         return _godot.analyze_scripts(root, objects, analyze_script)
     _godot.GODOT_ROOT[0] = None
@@ -26647,20 +27842,30 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             scenes=_unity_scenes_to_pack(root, asset_guids=assets))
         objects.extend(prefab_objs)
         _attach_sprite_textures(prefab_objs, assets)
+        # a prefab a script Instantiates runs: its clones need its methods
+        spawned = set()
+        for a in analyses:
+            for c in a.get("classes") or []:
+                spawned |= set(_prefab_instantiate_fields(
+                    c, {"classes": dict.fromkeys(missing)}).values())
         for t in missing:
             sp = typename_map[t]
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
                 continue
             a = analyze_script(sp)
-            if all(not c.get("bases") for c in a.get("classes") or []):
+            if t in spawned or all(
+                    not c.get("bases") for c in a.get("classes") or []):
                 # a plain [Serializable] value (no component): its methods
                 # are what the objects embedding it call
                 analyses.append(a)
                 continue
+            full = {c["name"]: {m["name"] for m in c.get("methods") or []}
+                    for c in a.get("classes") or []}
             a = analyze_script(sp, shallow=True)
             a["shallow"] = True
             for c in a.get("classes") or []:
                 c["methods"] = []
+                _common.SHALLOW_METHODS[c["name"]] = full.get(c["name"], set())
             a["apis"] = set()
             a["getcomponent_types"] = set()
             a["getcomponentsinchildren_types"] = set()
@@ -26695,6 +27900,25 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
                 "literals": [],
             })
             have.add(o["class"])
+    # a project class with no rows (nothing packs its methods; a base class
+    # is analyzed only for its subclasses): its method names, for the trap
+    rows = {o["class"] for o in objects}
+    for t, sp in sorted(typename_map.items()):
+        if t in rows or t in _common.SHALLOW_METHODS:
+            continue
+        try:
+            with open(sp, encoding="utf-8", errors="replace") as f:
+                src = cs2cpp._blank(f.read())
+        except OSError:
+            continue
+        # no base: a plain value, its methods lowered where it is embedded
+        if not re.search(r"\bclass\s+%s\b\s*(?:<[^>{]*>)?\s*:" % re.escape(t),
+                         src):
+            continue
+        _common.SHALLOW_METHODS[t] = {
+            n for n in re.findall(r"[\w>\]]\s+(\w+)\s*\([^;{}]*\)\s*\{", src)
+            if n not in ("if", "while", "for", "foreach", "switch", "catch",
+                         "using", "lock", "fixed")}
     return analyses
 
 
@@ -27197,7 +28421,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 6
+_SCENE_CACHE_VERSION = 9
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -27582,14 +28806,36 @@ def pack(root, outdir, *args, **kwargs):
     _ia_serialized = _inp.serialized_actions(root)
     _common.SOURCE_LAYER_NAMES.clear()
     _common.SOURCE_LAYER_NAMES.update(_layer_names)
+    _common.SOURCE_LAYER_MATRIX[:] = _phys.read_layer_matrix(root) or []
+    _common.SOURCE_ENABLED_WRITTEN.clear()
+    for t in files.values():
+        scan = cs2cpp._blank(t)
+        if re.search(r"(?<![\w.])(?:this\s*\.\s*)?enabled\s*=(?!=)", scan):
+            _common.SOURCE_ENABLED_WRITTEN.update(
+                re.findall(r"\bclass\s+(\w+)", scan))
+        for m in re.finditer(r"(\w+)\s*(?:>\s*\(\s*\))?\s*\.\s*enabled\s*"
+                             r"=(?!=)", scan):
+            r = m.group(1)
+            gc = re.search(r"GetComponent\w*\s*<\s*(\w+)\s*>\s*\(\s*\)\s*\."
+                           r"\s*enabled\s*=(?!=)", scan[max(0, m.start() - 80):
+                                                        m.end()])
+            if gc:
+                _common.SOURCE_ENABLED_WRITTEN.add(gc.group(1))
+            _common.SOURCE_ENABLED_WRITTEN.update(re.findall(
+                r"(\w+)\s*(?:\[\s*\])?\s+%s\b" % re.escape(r), scan))
+    _has_remove = _phys.has_standard_remove(files.values())
+    _items = _item_gain_types(files.values())
     _n = [0]
     for fp in sorted(files):
         t = _coll.desugar_collections(overlay.get(fp, files[fp]), _n)
-        t = _phys.desugar_layers(t, _layer_names)
+        t = _phys.desugar_layers(t, _layer_names,
+                                 _common.SOURCE_LAYER_MATRIX, _has_remove)
         t = _inp.desugar_input_actions(t, _common.SOURCE_INPUT_ACTIONS,
                                        os.path.relpath(fp, root),
                                        _ia_serialized.get(os.path.abspath(fp)))
         t = _desugar_destroy_immediate(t)
+        t = _desugar_drop_achievements_sounds(t, os.path.relpath(fp, root))
+        t = _desugar_drop_item_gains(t, os.path.relpath(fp, root), _items)
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
@@ -27772,6 +29018,18 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         plan["addcomponent_budget"]["Rigidbody2D"] = int(
             plan["addcomponent_budget"].get("Rigidbody2D") or 0) + _jadd
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
+    # a prefab Instantiate'd from a field reuses destroyed clones' slots;
+    # ponytail: at most _PREFAB_SPAWN_POOL live clones, the next one stops
+    # the program (`_rewrite_instantiate`) -- raise it, or [MaxInstances(N)]
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c["name"] not in plan["classes"]:
+                continue
+            for _t in _prefab_instantiate_fields(c, plan).values():
+                plan.setdefault("prefab_spawn", set()).add(_t)
+                _tc = plan["classes"][_t]
+                if _tc.get("max_instances") is None:
+                    _tc["max_instances"] = int(_tc["n"]) + _PREFAB_SPAWN_POOL
     if plan.get("godot"):
         # Godot's PackedScene.Instantiate: a template root's class spawns,
         # [MaxInstances(N)] or a default number of spare rows
@@ -27840,8 +29098,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         # every texture is in the table (see below)
         plan["_gpu_batch"] = True
     _ensure_texture_guids(
-        plan["textures"], _anim_sprite_guids(objects),
-        asset_guids)
+        plan["textures"], _anim_sprite_guids(objects)
+        + _animator_sprite_guids(objects, asset_guids), asset_guids)
     # a MeshRenderer's material's _MainTex (tools/unity_pack_mesh.py)
     for _o in objects:
         _md = _o.get("mesh_draw")
@@ -27979,6 +29237,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         for c in plan["collider2d"])
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
+    plan["animators"] = _build_animator_tables(plan, asset_guids, {
+        (cn, f["name"]): f.get("ty") for cn, c in plan["classes"].items()
+        for f in c.get("fields") or []})
     # a clip's rotation / scale curves need their owners' live tables
     plan["live_rot_classes"] = sorted(set(plan.get("live_rot_classes") or [])
                                       | set(plan.get("anim_rot_classes") or []))

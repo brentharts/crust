@@ -244,6 +244,14 @@ SOURCE_API_HINTS = set()
 #: The project's layer names ({index: name}), read by pack() from
 #: ProjectSettings/TagManager.asset.
 SOURCE_LAYER_NAMES = {}
+# Physics2DSettings' layer collision matrix: 32 masks, [] without one.
+SOURCE_LAYER_MATRIX = []
+# Types some script writes `enabled` of (`x.enabled = ..`): their `enabled`
+# is not the authored constant.
+SOURCE_ENABLED_WRITTEN = set()
+# Classes crust packs no methods of (only in prefabs nothing spawns, or not
+# packed at all): {class: its method names}.
+SHALLOW_METHODS = {}
 
 #: The code-defined InputActions pack() found (tools/unity_pack_input.py).
 SOURCE_INPUT_ACTIONS = []

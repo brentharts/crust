@@ -434,6 +434,26 @@ def _build_collider2d_tables(plan):
     rb_of = {}
     for ri, r in enumerate(plan.get("rigidbody2d") or []):
         rb_of[(r["owner_class"], r["owner_inst"])] = ri
+    # Unity: a collider sits on the Rigidbody2D of its GameObject or of the
+    # nearest ancestor's (the glue offsets it from that body's origin)
+    xf_rb, father = {}, {}
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            x = str(o.get("xf_id") or 0)
+            if x == "0":
+                continue
+            father[x] = str(o.get("father_id") or 0)
+            if (cname, i) in rb_of:
+                xf_rb[x] = rb_of[(cname, i)]
+
+    def ancestor_rb(o):
+        x, seen = str(o.get("father_id") or 0), set()
+        while x != "0" and x not in seen:
+            if x in xf_rb:
+                return xf_rb[x]
+            seen.add(x)
+            x = father.get(x, "0")
+        return None
     for cname, cl in sorted(plan["classes"].items()):
         cid = class_ids[cname]
         for i, o in enumerate(cl.get("instances") or []):
@@ -453,6 +473,10 @@ def _build_collider2d_tables(plan):
             if not c or not c.get("enabled", 1):
                 continue
             rb_i = rb_of.get((cname, i))
+            if rb_i is None:
+                rb_i = xf_rb.get(str(o.get("xf_id") or 0))
+            if rb_i is None:
+                rb_i = ancestor_rb(o)
             body = 2  # static (no RB)
             if rb_i is not None:
                 body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
@@ -472,6 +496,7 @@ def _build_collider2d_tables(plan):
             cols.append({
                 "tris": c.get("tris") or [],
                 "name": o.get("name") or "obj",
+                "file_id": c.get("file_id"),
                 "owner_class": cname,
                 "owner_class_id": cid,
                 "owner_inst": i,
@@ -830,7 +855,46 @@ def read_layer_names(root):
     return names
 
 
-def desugar_layers(text, layer_names):
+def read_layer_matrix(root):
+    """ProjectSettings/Physics2DSettings.asset `m_LayerCollisionMatrix`:
+    32 little-endian uint32 words, word k the layers k collides with
+    (`Physics2D.GetLayerCollisionMask(k)`); None without one."""
+    path = os.path.join(root or "", "ProjectSettings", "Physics2DSettings.asset")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = re.search(r"m_LayerCollisionMatrix:\s*([0-9a-fA-F]{256})",
+                          f.read())
+    except OSError:
+        return None
+    if not m:
+        return None
+    raw = bytes.fromhex(m.group(1))
+    return [int.from_bytes(raw[4 * k:4 * k + 4], "little") for k in range(32)]
+
+
+def has_standard_remove(texts):
+    """True when the project's `LayerMask.Remove(params string[])` extension
+    is the LayerMaskExtensions one: `~(~mask | FromLayerNames(..))`, with
+    `FromLayerNames` OR-ing `1 << NameToLayer(name)`. Any other body is the
+    project's own and is left for the lowering to refuse."""
+    def body(name, sig, text):
+        m = re.search(r"static\s+LayerMask\s+%s\s*\(%s\)\s*(\{[^{}]*\})"
+                      % (name, sig), text)
+        return m and re.sub(r"\s+", "", m.group(m.lastindex))
+    for t in texts:
+        rm = body("Remove", r"\s*this\s+LayerMask\s+(\w+)\s*,\s*params\s+"
+                  r"string\s*\[\s*\]\s*(\w+)\s*", t)
+        fl = body("FromLayerNames", r"\s*params\s+string\s*\[\s*\]\s*\w+\s*", t)
+        if rm and fl and re.fullmatch(
+                r"\{LayerMask(\w+)=~\w+;return~\(\1\|FromLayerNames\(\w+\)\);\}",
+                rm) and re.fullmatch(
+                r"\{LayerMask(\w+)=\(LayerMask\)0;foreach\(string(\w+)in\w+\)"
+                r"\1\|=\(1<<LayerMask\.NameToLayer\(\2\)\);return\1;\}", fl):
+            return True
+    return False
+
+
+def desugar_layers(text, layer_names, matrix=None, has_remove=False):
     """LayerMask as the int it is: `LayerMask` declarations are `int`,
     `mask.value` is `mask`, and `LayerMask.GetMask("A", ..)` /
     `NameToLayer("A")` are constants from the project's layer names (an
@@ -838,12 +902,31 @@ def desugar_layers(text, layer_names):
     `RaycastHit2D[] hits = Physics2D.RaycastAll(..)` -- are lists, so
     `foreach` and `hits[i]` are the list's; `.Length` is `.Count`."""
     import tools.cs2cpp as cs2cpp
+    if matrix:
+        text = re.sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Physics2D\s*\.\s*"
+                      r"GetLayerCollisionMask\s*\(",
+                      "Physics2D_GetLayerCollisionMask(", text)
     if "LayerMask" not in text and "All(" not in text:
         return text
     by_name = {v: k for k, v in layer_names.items()}
 
     def lits(args):
         return re.findall(r'"((?:[^"\\]|\\.)*)"', args)
+
+    # The project's `mask.Remove("A", ..)` extension (LayerMaskExtensions):
+    # `~(~mask | FromLayerNames(..))`, where an unknown name is
+    # `1 << NameToLayer` = `1 << -1`, which C# masks to bit 31.
+    masks0 = set(re.findall(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*)?LayerMask\s+(\w+)",
+        cs2cpp._blank(text)))
+    if masks0 and has_remove:
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(%s)\s*\.\s*Remove\s*\(((?:\s*\"(?:[^\"\\]|\\.)*\"\s*,?)+)\)"
+            % "|".join(re.escape(n) for n in sorted(masks0, key=len,
+                                                     reverse=True)),
+            lambda m: "((int)((unsigned)%s & ~%du))" % (m.group(1), sum(
+                1 << (by_name.get(n, -1) & 31) for n in set(lits(m.group(2))))),
+            text)
     text = re.sub(
         r"(?<![\w.])(?:UnityEngine\s*\.\s*)?LayerMask\s*\.\s*GetMask\s*\(([^()]*)\)",
         lambda m: str(sum(1 << by_name[n] for n in set(lits(m.group(1)))
