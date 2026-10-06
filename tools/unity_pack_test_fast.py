@@ -1217,6 +1217,30 @@ class TestHandleEulerZ(unittest.TestCase):
             self.assertIn(want, out)
 
 
+class TestDropAchievementsSounds(unittest.TestCase):
+    """Slime Jump's StartJump: achievement and sound statements become `;`
+    (lines kept); a HandleAchieve whose result is read stays."""
+
+    def test_drop(self):
+        src = ("void StartJump () {\n"
+               "\tif (a) JumpAchievement.Instance.HandleAchieve ();\n"
+               "\tJumpAchievement.JumpCount ++;\n"
+               "\tAudioClip jumpSound = jumpSounds[Random.Range(0, 3)];\n"
+               "\tSoundEffect s = AudioManager.instance.MakeSoundEffect("
+               "jumpSound, Vector3.zero, v);\n"
+               "\ts.audioSource.pitch = r.Get(Random.value);\n"
+               "\ts.audioSource.spatialBlend = 0;\n"
+               "\tbool b = WinAchievement.Instance.HandleAchieve();\n}\n")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            out = unity_pack._desugar_drop_achievements_sounds(src, "P.cs")
+        self.assertEqual(out.count("\n"), src.count("\n"))
+        self.assertIn("if (a) ;", out)
+        for gone in ("JumpCount", "jumpSound", "audioSource", "SoundEffect"):
+            self.assertNotIn(gone, out)
+        self.assertIn("WinAchievement.Instance.HandleAchieve()", out)
+        self.assertIn("lines 2, 3, 4, 5, 6, 7", err.getvalue())
+
+
 class TestLocalNamedI(unittest.TestCase):
     """`for (int i = 0; ..) speed += 1f;`: the packed instance index is `i`,
     so the loop counter took its place and each pass bumped instance

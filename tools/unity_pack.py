@@ -24535,6 +24535,70 @@ def _desugar_destroy_immediate(text):
     return text
 
 
+_ACH_SOUND_STMTS = re.compile(
+    r"(?<![\w.])\w*Achievement\s*\.\s*[Ii]nstance\s*\.\s*HandleAchieve\s*"
+    r"\(\s*\)\s*;"
+    r"|(?<![\w.])\w*Achievement\s*\.\s*[A-Z]\w*\s*"
+    r"(?:\+\+|--|[-+*/]?=(?!=)[^;{}]*)\s*;"
+    r"|(?<![\w.])(?:SoundEffect\s+(\w+)\s*=\s*)?AudioManager\s*\.\s*"
+    r"[Ii]nstance\s*\.\s*MakeSoundEffect\s*\(\s*(\w+)?[^;{}]*\)\s*;")
+
+
+def _desugar_drop_achievements_sounds(text, where):
+    """Achievement bookkeeping (`XAchievement.Instance.HandleAchieve();`,
+    `XAchievement.Stat ++ / += e;`) and one-shot sounds
+    (`SoundEffect s = AudioManager.instance.MakeSoundEffect(..);` with its
+    `s.audioSource.p = e;` settings, and an `AudioClip` local only that call
+    read) are dropped with a warning. Each statement becomes `;` so an
+    unbraced `if` keeps its body; lines stay put. A use the pattern does not
+    cover (HandleAchieve's result read, the SoundEffect used again) is left
+    alone and still reports CS8000.
+
+    ponytail: no achievements, stats, saves or sound effects; RNG draws in
+    the dropped pitch expressions go too (crust's Random is not Unity's
+    stream anyway). Upgrade: lower SaveAndLoadManager / EventManager /
+    AudioManager for real."""
+    scan = cs2cpp._blank(text)
+    spans, clips = [], []
+    for m in _ACH_SOUND_STMTS.finditer(scan):
+        before = scan[:m.start()].rstrip()
+        if not (before[-1:] in ";{})" or re.search(r"\belse$", before)):
+            continue
+        spans.append((m.start(), m.end()))
+        if m.group(2):
+            clips.append(m.group(2))
+        if m.group(1):
+            k = m.end()
+            sub = re.compile(r"\s*%s\s*\.\s*audioSource\s*\.\s*\w+\s*"
+                             r"=(?!=)[^;{}]*;" % re.escape(m.group(1)))
+            while True:
+                m2 = sub.match(scan, k)
+                if not m2:
+                    break
+                spans.append((k, m2.end()))
+                k = m2.end()
+    if not spans:
+        return text
+    def blank(t, a, b):
+        a += len(t[a:b]) - len(t[a:b].lstrip())
+        return t[:a] + ";" + re.sub(r"[^\n]", " ", t[a + 1:b]) + t[b:]
+    for a, b in spans:
+        text, scan = blank(text, a, b), blank(scan, a, b)
+    for v in clips:
+        d = re.search(r"(?<![\w.])AudioClip\s+%s\s*=[^;{}]*;" % re.escape(v),
+                      scan)
+        if d and len(re.findall(r"\b%s\b" % re.escape(v), scan)) == 1:
+            spans.append(d.span())
+            text, scan = blank(text, *d.span()), blank(scan, *d.span())
+    sys.stderr.write(
+        "unity_pack: warning: %s: lines %s: achievement / sound-effect "
+        "statements are dropped (no achievements, stats or sounds)\n"
+        % (where, ", ".join(str(n) for n in sorted(
+            {text.count("\n", 0, a + len(scan[a:b]) - len(scan[a:b].lstrip()))
+             + 1 for a, b in spans}))))
+    return text
+
+
 def _match_close(scan, k, o, c):
     depth = 0
     while k < len(scan):
@@ -28428,6 +28492,7 @@ def pack(root, outdir, *args, **kwargs):
                                        os.path.relpath(fp, root),
                                        _ia_serialized.get(os.path.abspath(fp)))
         t = _desugar_destroy_immediate(t)
+        t = _desugar_drop_achievements_sounds(t, os.path.relpath(fp, root))
         t = _coll.desugar_bytes(t)
         t = _coll.desugar_multidim(t)
         t = _coll.desugar_list_foreach(t, _n)
