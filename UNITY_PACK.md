@@ -210,7 +210,51 @@ python3 tools/unity_pack.py <project> --strict   # a stub is an error
 python3 tools/unity_pack_test_fast.py            # newer fixes' tests, ~seconds
 python3 tools/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
 python3 tools/unity_pack.py <project> --coost PATH   # coost checkout (string locals)
+python3 tools/unity_pack.py <project> --hybrid       # a method that cannot be lowered runs managed
+python3 tools/unity_pack.py <project> --managed      # every script class runs managed
+python3 tools/unity_pack.py <project> --managed=Player,Ball   # only these
 ```
+
+### Managed code on DotNetAnywhere (`--hybrid`, `--managed`)
+
+Lowering all of C# to C is the hard part of the packer. `--hybrid` keeps the C#
+of a method the packer cannot lower and runs it on
+[DotNetAnywhere](https://github.com/crustos/DotNetAnywhere) (DNA), a small
+.NET runtime in C that is linked into the player; without it that method is an
+empty stub and a `CS8000` warning. `--managed` (which implies `--hybrid`) goes
+further and moves **whole classes**: a selected class's methods run as managed
+C# even when they lower fine, and the lowered C of each becomes a call to its
+managed twin. A class whose managed code cannot be built (a Unity member the
+managed shim lacks, a field the engine keeps no accessor for) is not touched:
+it keeps its lowered C and the reason is printed (`managed: Foo stays
+lowered: ...`), so `--managed` never makes a pack that worked worse.
+
+State is held once, natively: the managed class is a handle on the object's
+index, and its fields are properties over the same packed arrays the lowered
+code uses (`tools/unity_pack_hybrid.py`, the managed `UnityEngine` is
+`tools/unity_pack_managed/UnityShim.cs`). Instance and static methods and
+overloads cross the boundary, with number and bool parameters and returns;
+`transform.position` (2D classes read z as 0), `transform.rotation` /
+`eulerAngles` / `Rotate` / `LookAt` (over the engine's rotation arrays; a class
+with none is declined at pack time) and the `Time` members the
+engine declares (`deltaTime`, `time`, `fixedDeltaTime`, ...) are the engine's
+own. The managed `UnityEngine` also has the plain-math types, written to
+Unity's definitions and checked against hand-worked Unity answers on DNA
+(`TestManagedShim`): `Mathf`, `Vector2/3/4`, `Vector2Int` / `Vector3Int`,
+`Quaternion` (ZXY Euler, `LookRotation`, `Slerp`, ...), `Color`, `Rect`,
+`Bounds`. `Vector2` parameters and returns cross the boundary (as two floats, and a
+two-float result slot). Not yet: `Vector3` (the packer itself has no value for
+it) / object parameters and returns, and the engine-backed parts of UnityEngine (Transform
+hierarchy, `Camera`, `RenderSettings`, `Input`, physics): a class
+that needs one stays lowered, with the missing member in the message.
+
+The managed C# is compiled with Roslyn through
+[CCSharp](https://github.com/crustos/CCSharp)'s compiler when it is built
+beside this repository (`python3 build.py compiler` there; needs the .NET SDK
+and `dotnet`), else with mono's `mcs`. `UNITY_PACK_MANAGED_COMPILER=mcs` or
+`=roslyn` forces one; `CCS_HOME` / `CCS_DLL` point at CCSharp elsewhere. DNA
+is expected at `../DotNetAnywhere` (or `DNA_HOME`) and its corlib is built
+with `mcs`, so `mono-mcs` is needed either way.
 
 The linked player is `gles3_window.c` (OpenGL ES 3.1) when `pkg-config
 glfw3` succeeds — `gles2_window.c` with `UNITY_PACK_GLES2=1`, for hardware
