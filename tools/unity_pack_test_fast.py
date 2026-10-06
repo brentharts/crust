@@ -1834,5 +1834,53 @@ class TestHybrid(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
 
 
+def _run_rc(test, out, frames=1):
+    """Like run_frames, but a stop is the result: (exit code, stdout,
+    stderr)."""
+    src = os.path.join(out, "h.c")
+    with open(src, "w") as f:
+        f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                "int main(int c, char **v) { int f; engine_apply_argv(c, v);\n"
+                "  Time_deltaTime = 1.f / 60.f;\n"
+                "  for (f = 0; f < %d; f++) engine_tick(); return 0; }\n"
+                % frames)
+    exe = os.path.join(out, "h")
+    r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe, src,
+                        os.path.join(out, "engine.c"),
+                        os.path.join(out, "data.c"), "-lm"],
+                       capture_output=True, text=True)
+    test.assertEqual(r.returncode, 0, r.stderr[-2000:])
+    run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                         text=True, timeout=60)
+    return run.returncode, run.stdout, run.stderr
+
+
+class TestSpriteSwapDropped(unittest.TestCase):
+    """`s = img.sprite;` (Player.Awake's toggle images): the pack draws
+    each Image with its authored sprite, so the statement goes with a
+    CS8000 warning -- but a null Image is still Unity's NRE, at its
+    column."""
+
+    @needs_cc
+    def test_null_image_nre(self):
+        a = ("using UnityEngine;\nusing UnityEngine.UI;\n"
+             "public class A : MonoBehaviour {\n"
+             "    public Image img;\n    Sprite s;\n"
+             "    void Update() {\n"
+             "        s = img.sprite;\n"
+             "        Debug.Log(\"after\");\n    }\n}\n")
+        root = project(self, {"A": a}, [("A", None, "  img: {fileID: 0}\n")])
+        err = io.StringIO()
+        out = tempfile.mkdtemp(prefix="upf-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            unity_pack.pack(root, out, force=True)
+        self.assertIn("A.cs(7,9): warning CS8000: sprite swaps", err.getvalue())
+        rc, so, se = _run_rc(self, out)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:13)", se)
+        self.assertNotIn("after", so)
+
+
 if __name__ == "__main__":
     unittest.main()

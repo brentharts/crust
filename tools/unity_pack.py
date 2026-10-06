@@ -25030,7 +25030,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    body = _drop_shader_params(body, plan, site)
+    # first: their warnings point into the source by offset
+    body = _drop_sprite_swaps(_drop_shader_params(body, plan, site), plan, site)
     # the packed instance index is `i`: a C# local of that name (a loop
     # counter) would take its place in every field access below
     if any(m.group(1) not in ("return", "else", "case", "goto", "throw",
@@ -25837,17 +25838,31 @@ def _trap_tmp_writes(body, plan, site):
     at = int(site.get("body_abs") or 0)
 
     def trap(m):
-        line = ft.count("\n", 0, at + m.start()) + 1 if ft else 0
+        off = _body_src_off(ft, at, body, m.start()) if ft else 0
+        line = ft.count("\n", 0, off) + 1 if ft else 0
         api = "TMP_Text.%s" % m.group(1)
         if ft:
             sys.stderr.write(_cs_diag(
-                path, ft, at + m.start(), "CS8000",
+                path, ft, off, "CS8000",
                 "`%s` writes are not lowered (text is baked at pack time);"
                 " the statement stops the player if it runs" % api,
                 kind="warning") + "\n")
         return "_engine_unlowered_at(%s, %s, %d);" % (
             _c_string(api), _c_string(path), line)
     return pat.sub(trap, body)
+
+
+def _body_src_off(ft, at, body, pos):
+    """Offset in the file text *ft* of position *pos* of a method *body*
+    that starts at *at*: the rewrites before keep newlines, so the line is
+    exact, the column the rewritten line's."""
+    k = body.count("\n", 0, pos)
+    if not k:
+        return at + pos
+    ls = at
+    for _ in range(k):
+        ls = ft.index("\n", ls) + 1
+    return ls + pos - (body.rfind("\n", 0, pos) + 1)
 
 
 def _drop_shader_params(body, plan, site):
@@ -25882,6 +25897,54 @@ def _drop_shader_params(body, plan, site):
                     " statement is dropped", kind="warning") + "\n")
             body = body[:s] + re.sub(r"[^\n]", " ", body[s:e]) + body[e:]
     return body
+
+
+def _drop_sprite_swaps(body, plan, site):
+    """`s = img.sprite;` / `img.sprite = s;` swap an Image's or
+    SpriteRenderer's sprite, and the pack draws each with its authored one:
+    the statement goes with a CS8000 warning, keeping the receiver's
+    NullReferenceException (`__nre(line, col)`, made `_engine_nn` once
+    lowered). Kept -- to stub -- under strict."""
+    if plan.get("strict") or not site or ".sprite" not in body:
+        return body
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    if not ft:
+        return body
+    decl = cs2cpp._blank(ft)
+    recvs = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*(?:UI\s*\.\s*)?)?"
+                           r"(?:Image|SpriteRenderer)\s+(\w+)\s*[;=,]", decl))
+    sprites = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Sprite\s+"
+                             r"(\w+)\s*[;=,]", decl))
+    if not recvs or not sprites:
+        return body
+    alt = lambda names: "|".join(re.escape(n) for n in sorted(
+        names, key=len, reverse=True))
+    th = r"(?:this\s*\.\s*)?"
+    pat = re.compile(
+        r"%s(?:(?:%s)\s*=\s*%s(?P<r1>%s)\s*\.\s*sprite|%s(?P<r2>%s)\s*\.\s*"
+        r"sprite\s*=\s*%s(?:%s))\s*;" % (th, alt(sprites), th, alt(recvs),
+                                         th, alt(recvs), th, alt(sprites)))
+    scan = cs2cpp._blank(body)
+    out, last = [], 0
+    for m in pat.finditer(scan):
+        prev = scan[:m.start()].rstrip()
+        if prev and prev[-1] not in ";{})" and not re.search(r"\belse$", prev):
+            continue
+        g = "r1" if m.group("r1") else "r2"
+        off = _body_src_off(ft, at, body, m.start(g))
+        ln = ft.count("\n", 0, off) + 1
+        col = off - (ft.rfind("\n", 0, off) + 1) + 1
+        sys.stderr.write(_cs_diag(
+            site.get("path") or "<cs>", ft,
+            _body_src_off(ft, at, body, m.start()), "CS8000",
+            "sprite swaps are not drawn by the pack (each draws its authored "
+            "sprite); the statement is dropped", kind="warning") + "\n")
+        out.append(body[last:m.start()])
+        out.append("{ if (%s == null) __nre(%d, %d); }%s" % (
+            m.group(g), ln, col, "\n" * body.count("\n", m.start(), m.end())))
+        last = m.end()
+    return "".join(out) + body[last:]
 
 
 def _call_suffix_sub(text, funcs, suffix, build, args=False):
