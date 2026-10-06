@@ -1107,6 +1107,50 @@ public class Mgr : MonoBehaviour {
         self.assertIn("cap 50 150", out)
 
 
+class TestPrefabInstantiateAt(unittest.TestCase):
+    """`Instantiate(prefabField, pos, Quaternion.identity)` of an unplaced
+    prefab (Slime Jump's dust clouds): clones at *pos*; a destroyed clone's
+    slot is reused."""
+
+    @needs_cc
+    def test_clone_at_position(self):
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public Cloud prefab;\n    Vector2 at;\n    int f;\n"
+               "    void Update() {\n        f++;\n"
+               "        if (f <= 2) { at = new Vector2(f * 3, 2f); "
+               "Instantiate(prefab, at, Quaternion.identity); }\n    }\n}\n")
+        cloud = ("using UnityEngine;\npublic class Cloud : MonoBehaviour {\n"
+                 "    public float life;\n    float t;\n"
+                 "    void Start() { Debug.Log(\"cloud \" + Mathf.RoundToInt("
+                 "transform.position.x) + \" \" + Mathf.RoundToInt("
+                 "transform.position.y) + \" \" + Mathf.RoundToInt(life)); "
+                 "Destroy(gameObject, 0.04f); }\n"
+                 "    void Update() { t += Time.deltaTime; }\n"
+                 "    void OnDestroy() { Debug.Log(\"gone \" + "
+                 "Mathf.RoundToInt(t * 60f)); }\n}\n")
+        root = project(self, {"Cloud": cloud, "Mgr": mgr}, [
+            ("Mgr", None, "  prefab: {fileID: 12, guid: %032x, type: 3}\n"
+             % 99)])
+        with open(os.path.join(root, "Assets", "Cloud.prefab"), "w") as f:
+            f.write("%%YAML 1.1\n--- !u!1 &10\nGameObject:\n  m_Name: Cloud\n"
+                    "  m_Component:\n  - component: {fileID: 11}\n"
+                    "  - component: {fileID: 12}\n"
+                    "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_LocalPosition: {x: 7, y: 7, z: 0}\n"
+                    "--- !u!114 &12\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_Script: {fileID: 11500000, guid: %032x}\n"
+                    "  life: 5\n" % 1)
+        with open(os.path.join(root, "Assets", "Cloud.prefab.meta"), "w") as f:
+            f.write("guid: %032x\n" % 99)
+        out = run_frames(self, pack(self, root), 6)
+        self.assertEqual([l for l in out if l.startswith("cloud")],
+                         ["cloud 3 2 5", "cloud 6 2 5"])
+        # `Destroy(gameObject, 0.04f)`: gone after its 2nd or 3rd Update
+        gone = [l for l in out if l.startswith("gone")]
+        self.assertEqual(len(gone), 2, out)
+        self.assertTrue(all(l in ("gone 2", "gone 3") for l in gone), out)
+
+
 class TestSpriteRendererColor(unittest.TestCase):
     """`sr.color = sr.color.SetAlpha(a)` through a SpriteRenderer field
     (Slime Jump's dust cloud fade): the authored tint, then the set one."""

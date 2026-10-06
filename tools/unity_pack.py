@@ -2555,6 +2555,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if fid == "0":
                 continue
             rec.setdefault("object_refs", {})[key] = fid
+        # another asset's object (a prefab's component): "fid@guid", which
+        # only an unplaced prefab's row answers to (its mb_ids)
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{fileID:\s*(-?\d+),\s*guid:\s*"
+                r"([0-9a-fA-F]+),\s*type:\s*\d+\}\s*$", block):
+            if not fm.group(1).startswith("m_") and fm.group(2) != "0":
+                rec.setdefault("object_refs", {})[fm.group(1)] = "%s@%s" % (
+                    fm.group(2), fm.group(3).lower())
         # Object ref arrays: name:\n  - {fileID: N} ... (0 = null slot).
         for fm in re.finditer(
                 r"(?m)^\s{2}(\w+):[ \t]*\n((?:\s{2}- \{fileID:\s*-?\d+"
@@ -4680,7 +4688,32 @@ def _instantiate_budget(analyses, plan):
                     r"\(\s*this\b",
                     bodies):
                 budget[cname] = budget.get(cname, 0) + n
+            for t in _prefab_instantiate_fields(c, plan).values():
+                budget[t] = budget.get(t, 0) + n
     return budget
+
+
+_PREFAB_SPAWN_POOL = 64
+
+
+def _prefab_instantiate_fields(c, plan):
+    """{field: class} of `Instantiate(field, pos, Quaternion.identity)` in
+    class *c*, *field* a packed-class reference (an unplaced prefab's
+    dormant row)."""
+    classes = plan.get("classes") or {}
+    ftys = {f["name"]: f["ty"].split(".")[-1] for f in c.get("fields") or ()
+            if not f.get("static")}
+    bodies = cs2cpp._blank(
+        "\n".join(m.get("body") or "" for m in c.get("methods") or []))
+    out = {}
+    for m in re.finditer(
+            r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*"
+            r"\(\s*(?:this\s*\.\s*)?(\w+)\s*,[^,;]*,\s*Quaternion\s*\.\s*"
+            r"identity\s*\)", bodies):
+        t = ftys.get(m.group(1))
+        if t in classes and t not in _ADDABLE_BUILTINS:
+            out[m.group(1)] = t
+    return out
 
 
 def _new_budget(analyses, plan):
@@ -5037,6 +5070,12 @@ def _rewrite_instantiate(text, plan, this_class):
         elif len(args) == 2:
             src = args[0].strip()
             parent = _setparent_parent_expr(args[1], cl)
+        elif len(args) == 3:
+            call = _instantiate_at(args, plan, cl)
+            out.append(before)
+            out.append(call or text[m.start():after])
+            i = after
+            continue
         else:
             out.append(text[i:after])
             i = after
@@ -5066,6 +5105,31 @@ def _rewrite_instantiate(text, plan, this_class):
             out.append(call)
         i = after
     return "".join(out)
+
+
+def _instantiate_at(args, plan, cl):
+    """`Instantiate(prefabField, posField, Quaternion.identity)` of a packed
+    class whose prefab rows are unrotated → `Object_InstantiateAt_T`, or
+    None (left for the stub detector)."""
+    src = re.sub(r"^this\s*\.\s*", "", args[0].strip())
+    pos = args[1].strip()
+    t = _prefab_instantiate_fields(
+        {"fields": cl.get("fields"), "methods": [{"body": (
+            "Instantiate(%s, %s, %s)" % (src, pos, args[2].strip()))}]},
+        plan).get(src)
+    tcl = (plan.get("classes") or {}).get(t)
+    pty = {f["name"]: f["ty"].split(".")[-1] for f in cl.get("fields") or ()
+           }.get(re.sub(r"^this\s*\.\s*", "", pos))
+    if (not tcl or pty not in ("Vector2", "Vector3")
+            or not int((plan.get("instantiate_budget") or {}).get(t) or 0)
+            or not _class_has_position(tcl)
+            or any(abs(q - e) > 1e-6
+                   for o in tcl.get("instances") or ()
+                   for q, e in zip(o.get("rot") or (0, 0, 0, 1),
+                                   (0, 0, 0, 1)))):
+        return None
+    return "Object_InstantiateAt_%s(%s, %s.x, %s.y, %s)" % (
+        _c_ident(t), src, pos, pos, pos + ".z" if pty == "Vector3" else "0.f")
 
 
 def _gcic_go_expr(recv, cl, plan, locals_ty):
@@ -10360,7 +10424,7 @@ def _emit_engine_gameobject_tables(
         if bud <= 0:
             bud = 1
         idn = _c_ident(type_name)
-        go_n = max(1, len(go_names))
+        go_n = max(1, len(go_names) + go_spawn_budget)
         authored = authored_names or set()
         init_vals = []
         for i, _n in enumerate(go_names if go_names else [""]):
@@ -13391,6 +13455,38 @@ def _emit_engine_instantiate(
             p("    return ex;")
             p("}")
             p("")
+            if cname in (plan.get("prefab_spawn") or ()) \
+                    and _class_has_position(cl):
+                # ponytail: the clone's Awake ran at the prefab's position
+                three = (cl.get("soa_dims")
+                         or (2 if cl.get("two_d") else 3)) != 2
+                for ax in "xyz" if three else "xy":
+                    p("static void %s_set_pos_%s(unsigned i, float v);"
+                      % (idn, ax))
+                p("static int Object_InstantiateAt_%s(int src, float x, "
+                  "float y, float z) {" % idn)
+                p("    int c;")
+                p("    if (src < 0) {")
+                p("        fprintf(stderr, \"ArgumentException: The Object you"
+                  " want to instantiate is null.\\n\");")
+                p("        exit(70);")
+                p("    }")
+                p("    c = Object_Instantiate_%s(src, -1);" % idn)
+                p("    if (c < 0) {")
+                p("        fprintf(stderr, \"Instantiate: more than %d live "
+                  "%s clones; raise [MaxInstances(N)]\\n\");"
+                  % (cap - int(cl["n"]), cname))
+                p("        exit(70);")
+                p("    }")
+                p("    %s_set_pos_x((unsigned)c, x);" % idn)
+                p("    %s_set_pos_y((unsigned)c, y);" % idn)
+                if three:
+                    p("    %s_set_pos_z((unsigned)c, z);" % idn)
+                else:
+                    p("    (void)z;")
+                p("    return c;")
+                p("}")
+                p("")
             if not mb_add:
                 p("static char _%s_tostring_buf[256];" % idn)
                 p("static const char *%s_ToString(int ci) {" % idn)
@@ -14327,7 +14423,14 @@ def _emit_engine_class_groups(
         has_enable, has_disable, has_destroy = (
             _has("OnEnable"), _has("OnDisable"), _has("OnDestroy"))
         p("/* awoken (1), started (2), enabled (4): per instance */")
-        p("static unsigned char _%s_life[%d];" % (idn, cap))
+        # an unplaced prefab's row only answers Instantiate: "awoken" but
+        # never enabled, so no tick wakes or runs it
+        dormant = [k for k, o in enumerate(cl.get("instances") or [])
+                   if o.get("prefab_asset")]
+        p("static unsigned char _%s_life[%d]%s;" % (idn, cap, (
+            " = { %s }" % ", ".join("1" if k in dormant else "0"
+                                    for k in range(max(dormant) + 1))
+            if dormant else "")))
         # ponytail: `enabled` reads "enabled and active" (Unity's stays true
         # on an inactive GameObject); a per-row enabled bit if that matters
         p("static int %s_get_enabled(unsigned i) { return (_%s_life[i] & 4)"
@@ -18699,8 +18802,11 @@ def emit_engine(plan, analyses, used_apis):
                     go_cap_d, ", ".join(str(v) for v in gcls)))
                 p("static unsigned _godot_go_inst[%d] = { %s };" % (
                     go_cap_d, ", ".join("%du" % v for v in ginst)))
+        # seconds till a `Destroy(go, t)`; 0 = none
+        p("static float _engine_go_doom[%d];" % go_cap_d)
         p("static void Object_Destroy(int go) {")
         p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;" % go_cap_d)
+        p("    _engine_go_doom[go] = 0.f;")
         if tree:
             p("    {")
             p("        int c = _godot_go_child[go];")
@@ -18712,6 +18818,23 @@ def emit_engine(plan, analyses, used_apis):
         if want_go_tables:
             p("    _engine_go_message(go, 2); /* OnDisable, OnDestroy */")
         p("    _engine_go_destroyed[go] = 1;")
+        p("}")
+        p("")
+        p("static void Object_DestroyAfter(int go, float t) {")
+        p("    if (go < 0 || go >= %d || _engine_go_destroyed[go]) return;"
+          % go_cap_d)
+        p("    if (t <= 0.f) Object_Destroy(go);")
+        p("    else _engine_go_doom[go] = t;")
+        p("}")
+        # ponytail: O(GameObjects) per frame, and the doomed object goes
+        # at the start of the frame its time runs out (Unity: the end)
+        p("static void _engine_go_doom_tick(float dt) {")
+        p("    int go;")
+        p("    for (go = 0; go < %d; go = go + 1)" % go_cap_d)
+        p("        if (_engine_go_doom[go] > 0.f) {")
+        p("            _engine_go_doom[go] = _engine_go_doom[go] - dt;")
+        p("            if (_engine_go_doom[go] <= 0.f) Object_Destroy(go);")
+        p("        }")
         p("}")
         p("")
     _emit_engine_debug_log(p, plan, want_log)
@@ -19468,6 +19591,8 @@ def emit_engine(plan, analyses, used_apis):
         p("    _godot_input_latch();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
+    if plan.get("_destroy_after"):
+        p("    _engine_go_doom_tick(Time_deltaTime);")
     if want_ui:
         p("    engine_ui_tick();")
     for cname in sorted(plan["classes"]):
@@ -25185,6 +25310,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(",
         "Object_Destroy(",
         text)
+    if plan.get("go_names"):
+        for m in reversed(list(re.finditer(r"\bObject_Destroy\s*\(", text))):
+            got = _match_call_args(text, m.end() - 1)
+            if got and len(_split_call_args(got[0])) == 2:
+                plan["_destroy_after"] = True
+                text = text[:m.start()] + "Object_DestroyAfter" + \
+                    text[m.start() + len("Object_Destroy"):]
     text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = cs2cpp.code_sub(
@@ -27147,6 +27279,8 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets,
                 pi + 1, len(prefabs), os.path.basename(path)))
         copies = [(si, _prefab_instance_text(raw, inst))
                   for si, inst in placed.get(os.path.realpath(path), [])]
+        pguid = next((g for g, ap in (assets or {}).items()
+                      if os.path.realpath(ap) == os.path.realpath(path)), None)
         for si, text in copies or [(None, raw)]:
             objs, _l, _c, _h = parse_unity_yaml(
                 text, guid_to_script=guids, asset_guids=assets)
@@ -27157,6 +27291,10 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets,
                     else:
                         # an asset Instantiate copies, not a live object
                         o["prefab_asset"] = True
+                        if pguid:
+                            o["mb_ids"] = list(o.get("mb_ids") or []) + [
+                                "%s@%s" % (mb, pguid)
+                                for mb in o.get("mb_ids") or []]
                     out.append(o)
     return out
 
@@ -27340,12 +27478,19 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             scenes=_unity_scenes_to_pack(root, asset_guids=assets))
         objects.extend(prefab_objs)
         _attach_sprite_textures(prefab_objs, assets)
+        # a prefab a script Instantiates runs: its clones need its methods
+        spawned = set()
+        for a in analyses:
+            for c in a.get("classes") or []:
+                spawned |= set(_prefab_instantiate_fields(
+                    c, {"classes": dict.fromkeys(missing)}).values())
         for t in missing:
             sp = typename_map[t]
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
                 continue
             a = analyze_script(sp)
-            if all(not c.get("bases") for c in a.get("classes") or []):
+            if t in spawned or all(
+                    not c.get("bases") for c in a.get("classes") or []):
                 # a plain [Serializable] value (no component): its methods
                 # are what the objects embedding it call
                 analyses.append(a)
@@ -28465,6 +28610,18 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         plan["addcomponent_budget"]["Rigidbody2D"] = int(
             plan["addcomponent_budget"].get("Rigidbody2D") or 0) + _jadd
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
+    # a prefab Instantiate'd from a field reuses destroyed clones' slots;
+    # ponytail: at most _PREFAB_SPAWN_POOL live clones, the next one stops
+    # the program (`_rewrite_instantiate`) -- raise it, or [MaxInstances(N)]
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c["name"] not in plan["classes"]:
+                continue
+            for _t in _prefab_instantiate_fields(c, plan).values():
+                plan.setdefault("prefab_spawn", set()).add(_t)
+                _tc = plan["classes"][_t]
+                if _tc.get("max_instances") is None:
+                    _tc["max_instances"] = int(_tc["n"]) + _PREFAB_SPAWN_POOL
     if plan.get("godot"):
         # Godot's PackedScene.Instantiate: a template root's class spawns,
         # [MaxInstances(N)] or a default number of spare rows
