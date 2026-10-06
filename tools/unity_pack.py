@@ -2863,6 +2863,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "size_y": float(sz.group(2)) if sz else 1.0,
                 "material_guid": _parse_material_guid(block),
             }
+            er = re.search(r"(?m)^\s+m_EdgeRadius:\s*([^\s]+)", block)
+            if kind == "BoxCollider2D" and er:
+                rec["collider2d"]["edge_radius"] = float(er.group(1))
         if kind == "PolygonCollider2D":
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
@@ -6672,6 +6675,11 @@ def analyze_script(path, text=None, shallow=False):
                  r"queriesStartInColliders\b", scan):
         apis.add("Physics2D.query")
         apis.add("Vector2")
+        apis.add("GameObject.SetActive")
+    # Collider2D.IsTouchingLayers: the last step's contact and trigger
+    # pairs, by the other collider's GameObject layer
+    if re.search(r"\.\s*IsTouchingLayers\s*\(", scan):
+        apis.add("Collider2D.IsTouchingLayers")
         apis.add("GameObject.SetActive")
     if re.search(r"\bVector2Int\b", scan):
         apis.add("Vector2Int")
@@ -16163,6 +16171,30 @@ def _emit_engine_colliders_2d(
         p("        if (pa[i] == lo && pb[i] == hi) return 1;")
         p("    return 0;")
         p("}")
+        if plan.get("_touching_layers"):
+            p("/* Collider2D.IsTouchingLayers: a contact or trigger pair of the")
+            p("   last step whose other collider's GameObject is in the mask */")
+            p("static int Collider2D_IsTouchingLayers(int ci, int mask) {")
+            p("    int i, k, o, go;")
+            p("    if (ci < 0 || ci >= _Collider2D_count) {")
+            p('        fprintf(stderr, "NullReferenceException: Object reference'
+              ' not set to an instance of an object'
+              ' (Collider2D.IsTouchingLayers)\\n");')
+            p("        exit(70);")
+            p("    }")
+            p("    for (k = 0; k < 2; k = k + 1) {")
+            p("        const int *pa = k ? _col2d_trig_a : _col2d_contact_a;")
+            p("        const int *pb = k ? _col2d_trig_b : _col2d_contact_b;")
+            p("        int n = k ? _col2d_trig_n : _col2d_contact_n;")
+            p("        for (i = 0; i < n; i = i + 1) {")
+            p("            o = pa[i] == ci ? pb[i] : pb[i] == ci ? pa[i] : -1;")
+            p("            go = o >= 0 ? _col2d_go(o) : -1;")
+            p("            if (go >= 0 && ((unsigned)mask >> GameObject_layer(go)) & 1u)")
+            p("                return 1;")
+            p("        }")
+            p("    }")
+            p("    return 0;")
+            p("}")
         trig = {}
         for cname, msgs in collision2d_handlers.items():
             t = [m for m in ("OnTriggerEnter2D", "OnTriggerStay2D",
@@ -17121,6 +17153,23 @@ def _emit_engine_box2d_exports(
             p("    *y = 0.f;")
         p("}")
         p("")
+        # the collider GameObject's world origin and rotation-scale basis:
+        # the glue reshapes a body's collider when they change (Slime Jump
+        # flips its player's collider by its localScale)
+        p("void engine_col2d_frame(int ci, float *o, float *b) {")
+        if (want_col2d and col2d_list and plan.get("has_transform_parents")
+                and not _godot_bases(plan)):
+            p("    float z;")
+            p("    _engine_world_pos(_Collider2D_owner_class[ci],"
+              " (unsigned)_Collider2D_owner_inst[ci], &o[0], &o[1], &z, 0);")
+            p("    _engine_world_basis(_Collider2D_owner_class[ci],"
+              " (unsigned)_Collider2D_owner_inst[ci], b, 0);")
+        else:
+            p("    (void)ci;")
+            p("    o[0] = 0.f; o[1] = 0.f;")
+            p("    b[0] = 1.f; b[1] = 0.f; b[2] = 0.f; b[3] = 1.f;")
+        p("}")
+        p("")
         p("void engine_col2d_contact(int a, int b) {")
         if want_collision2d_msgs:
             p("    _col2d_add_contact(a, b);")
@@ -17663,6 +17712,17 @@ def _emit_engine_class_draws(
             p("        static const float _spr_oy[] = { %s };" % ", ".join(
                 "%sf" % repr(float(sp.get("draw_off_y") or 0.0))
                 for _i, sp in spr_idx))
+        # the sprite's pivot sits on the transform: the quad's centre is
+        # off it by (0.5 - pivot) of the size, in the quad's own frame
+        # ponytail: the authored sprite's pivot, kept when an animation
+        # swaps the sprite
+        pivs = [sp.get("pivot") or (0.5, 0.5) for _i, sp in spr_idx]
+        use_piv = any(tuple(map(float, pv)) != (0.5, 0.5) for pv in pivs)
+        if use_piv:
+            p("        static const float _spr_pvx[] = { %s };" % ", ".join(
+                "%sf" % repr(1.0 - 2.0 * float(pv[0])) for pv in pivs))
+            p("        static const float _spr_pvy[] = { %s };" % ", ".join(
+                "%sf" % repr(1.0 - 2.0 * float(pv[1])) for pv in pivs))
         p("        static const int _spr_layer[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_order[] = { %s };" % ", ".join(
@@ -17803,10 +17863,14 @@ def _emit_engine_class_draws(
                 p(ind + "out[n].half_h = _spr_hh[k];")
                 p(ind + "out[n].tex = _spr_tex[k];")
             if use_scale:
-                p(ind + "out[n].half_w = out[n].half_w * _%s_scale_x[i];"
-                  % idn)
-                p(ind + "out[n].half_h = out[n].half_h * _%s_scale_y[i];"
-                  % idn)
+                # the halves hold the authored world scale: the live
+                # localScale over the authored one
+                # ponytail: an authored 0 scale stays 0 (its halves hold
+                # no size to scale back up)
+                for ax, half in (("x", "half_w"), ("y", "half_h")):
+                    p(ind + "if (_%s_scale0_%s[i] != 0.f) out[n].%s = "
+                      "out[n].%s * _%s_scale_%s[i] / _%s_scale0_%s[i];"
+                      % (idn, ax, half, half, idn, ax, idn, ax))
 
         if any_ui:
             p("            if (_spr_ui[k]) {")
@@ -17901,6 +17965,16 @@ def _emit_engine_class_draws(
             p("            out[n].m01 = _spr_m01[k];")
             p("            out[n].m10 = _spr_m10[k];")
             p("            out[n].m11 = _spr_m11[k];")
+        if use_piv:
+            p("            if (%s_spr_pvx[k] != 0.f || _spr_pvy[k] != 0.f) {"
+              % ("!_spr_ui[k] && " if any_ui else ""))
+            p("                float dx = _spr_pvx[k] * out[n].half_w;")
+            p("                float dy = _spr_pvy[k] * out[n].half_h;")
+            p("                out[n].x = out[n].x + out[n].m00 * dx"
+              " + out[n].m01 * dy;")
+            p("                out[n].y = out[n].y + out[n].m10 * dx"
+              " + out[n].m11 * dy;")
+            p("            }")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
@@ -18522,6 +18596,7 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _Collider2D_oy[%d];" % nc)
         p("extern const float _Collider2D_hw[%d];" % nc)
         p("extern const float _Collider2D_hh[%d];" % nc)
+        p("extern const float _Collider2D_edge_r[%d];" % nc)
         p("extern const float _Collider2D_cos[%d];" % nc)
         p("extern const float _Collider2D_sin[%d];" % nc)
         p("extern const float _Collider2D_friction[%d];" % nc)
@@ -18580,6 +18655,8 @@ def emit_engine(plan, analyses, used_apis):
         n = max(1, plan["classes"][cname]["n"])
         p("extern float _%s_scale_x[%d];" % (idn, n))
         p("extern float _%s_scale_y[%d];" % (idn, n))
+        p("extern const float _%s_scale0_x[%d];" % (idn, n))
+        p("extern const float _%s_scale0_y[%d];" % (idn, n))
     for cname in sorted(plan.get("live_rot_classes") or []):
         if cname not in plan["classes"]:
             continue
@@ -19283,13 +19360,16 @@ def emit_engine(plan, analyses, used_apis):
             msgs[m["name"]] = arg
         if msgs:
             collision2d_handlers[cname] = msgs
-    want_collision2d_msgs = (bool(collision2d_handlers)
+    touching = "Collider2D.IsTouchingLayers" in used_apis
+    want_collision2d_msgs = (bool(collision2d_handlers) or touching
                              or bool(plan.get("godot_signals"))) and want_col2d
     trigger2d_handlers = {c: {k: v for k, v in msgs.items()
                               if k.startswith("OnTrigger")}
                           for c, msgs in collision2d_handlers.items()}
     trigger2d_handlers = {c: m for c, m in trigger2d_handlers.items() if m}
-    plan["physics2d_triggers"] = bool(trigger2d_handlers) and want_col2d \
+    plan["physics2d_triggers"] = (bool(trigger2d_handlers) or touching) \
+        and want_col2d and not plan.get("godot")
+    plan["_touching_layers"] = touching and want_col2d \
         and not plan.get("godot")
 
     if want_collision2d_msgs:
@@ -25620,6 +25700,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _mark_string_chars(text, string_idents, string_arrays
                               | _string_store_names(plan)
                               | plan.get("_string_lists_local", set()))
+    text = _lower_is_touching_layers(text, cl, plan, site)
     text = _format_bools(text, _bool_names(cl, body, site)
                          | {"Cursor_visible", "true", "false",
                             "engine_box2d_queries_start_in_colliders"},
@@ -25627,6 +25708,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                              "_engine_go_active_in_hierarchy",
                              "GameObject_activeSelf",
                              "GameObject_CompareTag",
+                             "Collider2D_IsTouchingLayers",
                              "_ia_enabled", "_ia_pressed", "_ia_down", "_ia_up",
                              "_gp_btn", "_gp_down", "_gp_up",
                              "ParticleSystem_get_isPlaying",
@@ -26346,6 +26428,43 @@ def _lower_bounds(text, plan, site=None):
     return text
 
 
+def _lower_is_touching_layers(text, cl, plan, site=None):
+    """`c.IsTouchingLayers([mask])` of a Collider2D field or local (a
+    collider row): `Collider2D_IsTouchingLayers`, beside the trigger pairs;
+    no mask is Physics2D.AllLayers. Before the field reads are lowered, so
+    the bool is formatted as C# prints it."""
+    if "IsTouchingLayers" not in text or not plan.get("collider2d") \
+            or plan.get("godot"):
+        return text
+    types = "|".join(sorted(_COLLIDER2D_FIELD_TYPES))
+    names = {f["name"] for f in cl.get("fields") or []
+             if f.get("ty") in _COLLIDER2D_FIELD_TYPES
+             and not (f.get("static") or f.get("const"))}
+    names |= set(re.findall(r"\b(?:%s)\s+(\w+)\s*[=;]" % types,
+                            cs2cpp._blank(text)))
+    if not names:
+        return text
+    pat = re.compile(r"(?<![\w.])(?:this\s*\.\s*)?(%s)\s*\.\s*IsTouchingLayers"
+                     r"\s*\(" % "|".join(map(re.escape, sorted(names))))
+    out, pos = [], 0
+    for m in pat.finditer(text):
+        got = _match_call_args(text, m.end() - 1)
+        if m.start() < pos or not got:
+            continue
+        a = _split_top_args(got[0])
+        if len(a) > 1:
+            continue
+        out += [text[pos:m.start()], "Collider2D_IsTouchingLayers(%s, %s)" % (
+            m.group(1), a[0] if a and a[0].strip() else "-1")]
+        pos = got[1]
+    if not out:
+        return text
+    if site is not None:
+        site.setdefault("protos", set()).add(
+            "static int Collider2D_IsTouchingLayers(int ci, int mask);")
+    return "".join(out) + text[pos:]
+
+
 def _emit_bounds(p, plan):
     """The runtime of `_lower_bounds` (what: 0/1 the center's x/y, 2/3 the
     extents'), after the draw list."""
@@ -26404,7 +26523,10 @@ def _emit_bounds(p, plan):
             p("    } else if (kind == 3) {")
             p("        r = hh; l = hw - hh; if (l < 0.f) l = 0.f;")
             p("        ex = c * l + r; ey = s * l + r;")
-            p("    } else { ex = c * hw + s * hh; ey = s * hw + c * hh; }")
+            p("    } else {")
+            p("        ex = c * hw + s * hh + _Collider2D_edge_r[ci];")
+            p("        ey = s * hw + c * hh + _Collider2D_edge_r[ci];")
+            p("    }")
             p("    return what == 2 ? ex : ey;")
         else:
             p('    (void)ci; (void)what;')
@@ -26793,6 +26915,9 @@ def emit_data(plan, used_apis=None):
             n, ", ".join("%sf" % repr(float(c["hw"])) for c in col2d_list)))
         p("const float _Collider2D_hh[%d] = { %s };" % (
             n, ", ".join("%sf" % repr(float(c["hh"])) for c in col2d_list)))
+        p("const float _Collider2D_edge_r[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c.get("edge_r") or 0.0))
+                         for c in col2d_list)))
         p("const float _Collider2D_cos[%d] = { %s };" % (
             n, ", ".join("%sf" % repr(float(c["cos_z"])) for c in col2d_list)))
         p("const float _Collider2D_sin[%d] = { %s };" % (
@@ -27016,6 +27141,11 @@ def emit_data(plan, used_apis=None):
         p("float _%s_scale_x[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sys)))
+        # the authored localScale: sprite halves hold it already
+        p("const float _%s_scale0_x[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
+        p("const float _%s_scale0_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
     # Live localRotation for Transform.Rotate / LookAt / eulerAngles / rotation.
     for cname in sorted(plan.get("live_rot_classes") or []):

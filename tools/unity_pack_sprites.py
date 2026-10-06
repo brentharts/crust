@@ -5,6 +5,7 @@ Moved out of tools/unity_pack.py unchanged; unity_pack re-exports every name
 here, so `unity_pack.<name>` keeps working."""
 
 from __future__ import annotations
+import functools
 import hashlib
 import json
 import os
@@ -269,6 +270,35 @@ def _parse_sprite_sheet(asset_path):
     return out
 
 
+_ALIGN_PIVOT = ((0.5, 0.5), (0.0, 1.0), (0.5, 1.0), (1.0, 1.0), (0.0, 0.5),
+                (1.0, 0.5), (0.0, 0.0), (0.5, 0.0), (1.0, 0.0))
+
+
+@functools.lru_cache(maxsize=None)
+def _sprite_pivot(asset_path, file_id=None):
+    """The sprite's normalized pivot (Unity SpriteAlignment; 9 = Custom):
+    a sheet slice's own, else the importer's."""
+    try:
+        text = _read(asset_path + ".meta")
+    except IOError:
+        return 0.5, 0.5
+    mode = re.search(r"(?m)^\s*spriteMode:\s*(\d+)", text)
+    fid = int(file_id or 0)
+    if fid not in (0, 21300000) and not (mode and mode.group(1) == "1"):
+        for m in re.finditer(r"(?ms)^\s{4}-\s+serializedVersion:.*?"
+                             r"internalID:\s*(-?\d+)", text):
+            if int(m.group(1)) == fid:
+                text = m.group(0)
+                break
+    al = re.search(r"(?m)^\s*alignment:\s*(\d+)", text)
+    a = int(al.group(1)) if al else 0
+    if a == 9:
+        pv = re.search(r"(?m)^\s*(?:spritePivot|pivot):\s*\{x:\s*([^,}]+),"
+                       r"\s*y:\s*([^}]+)\}", text)
+        return (float(pv.group(1)), float(pv.group(2))) if pv else (0.5, 0.5)
+    return _ALIGN_PIVOT[a] if a < len(_ALIGN_PIVOT) else (0.5, 0.5)
+
+
 def _crop_rgba(rgba, tw, th, x, y, cw, ch):
     """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom.
 
@@ -369,6 +399,7 @@ def _attach_sprite_textures(objects, asset_guids):
         if sp.get("source") not in ("ui", "ui_tmp"):
             sp["half_w"] = (float(w) / ppu) * sx * 0.5
             sp["half_h"] = (float(h) / ppu) * sy * 0.5
+            sp["pivot"] = _sprite_pivot(path, fid)
         if "a" not in sp:
             sp["a"] = 1.0
 

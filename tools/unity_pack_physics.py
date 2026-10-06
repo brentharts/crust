@@ -508,6 +508,10 @@ def _build_collider2d_tables(plan):
                 "oy": float(c.get("oy") or 0.0),
                 "hw": float(c.get("hw") or 0.5),
                 "hh": float(c.get("hh") or 0.5),
+                # ponytail: unscaled by the transform, as Unity hands Box2D
+                # the scaled box and the raw radius (an assumption, unchecked
+                # against a non-uniform scale)
+                "edge_r": float(c.get("edge_radius") or 0.0),
                 "cos_z": float(c.get("cos_z") or 1.0),
                 "sin_z": float(c.get("sin_z") or 0.0),
                 "friction": float(c.get("friction")
