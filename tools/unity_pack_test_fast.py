@@ -1192,6 +1192,40 @@ class TestLocalNamedI(unittest.TestCase):
         self.assertIn("A1 22", out)
 
 
+class TestStopSite(unittest.TestCase):
+    """A runtime stop in a helper (`SpriteRenderer.bounds` of a renderer
+    crust does not draw) names the C# call: script, line, column."""
+
+    @needs_cc
+    def test_helper_stop_has_site(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public SpriteRenderer sr;\n"
+             "    void Update() {\n"
+             "        float x = sr.bounds.extents.x;\n"
+             "        Debug.Log(\"x \" + x);\n    }\n}\n")
+        extra = ("--- !u!212 &{fid}\nSpriteRenderer:\n"
+                 "  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"A": a}, [("A", extra, "  sr: {fileID: 103}\n")])
+        out = pack(self, root)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f; engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe,
+                            os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 70, run.stderr[-2000:])
+        self.assertIn("SpriteRenderer.bounds", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:5:19)", run.stderr)
+
+
 class TestTwoScriptsOneGameObject(unittest.TestCase):
     """Slime Jump's Player GO also carries AffectedByVortex: every script
     on a GO was folded into the first one's object (fields merged, the

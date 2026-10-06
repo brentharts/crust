@@ -19691,7 +19691,98 @@ def emit_engine(plan, analyses, used_apis):
     p("")
     if _multi_scene(plan):
         _emit_engine_scene_apply(lines, plan, class_ids)
-    return _fill_accessor_prototypes("\n".join(lines) + "\n")
+    return _site_stops(_fill_accessor_prototypes("\n".join(lines) + "\n"))
+
+
+_SITE_MARK = re.compile(r" /\*@site (.*?) @cs (.*?)\*/$", re.M)
+
+
+def _site_stops(text):
+    """A runtime helper that stops the player (`exit(70)`: a refusal, an
+    out-of-range index) says where in the C# it was called, as Unity's
+    trace does: each call from a script body records its site first
+    (`(_engine_at(site), helper(..))`), and the helper prints it before it
+    exits. The column is the call's member in the C# line (`bounds` of
+    `collider.bounds.min`), else the statement's first character.
+
+    ponytail: the site is the last script call that recorded one; a helper
+    the engine itself calls (the tick, physics) reports that stale site."""
+    lines = text.split("\n")
+    defs = {}  # name -> (first line, last line) of a multi-line definition
+    k = 0
+    while k < len(lines):
+        m = re.match(r"static [^;=]*?\b(\w+)\(", lines[k])
+        j = k
+        while m and j < min(k + 3, len(lines) - 1) and not re.search(
+                r"\)\s*\{\s*$", lines[j]) and ";" not in lines[j]:
+            j += 1
+        if m and re.search(r"\)\s*\{\s*$", lines[j]) and ";" not in "".join(
+                lines[k:j + 1]):
+            e = j + 1
+            while e < len(lines) and lines[e] != "}":
+                e += 1
+            defs[m.group(1)] = (k, e)
+            k = e
+        k += 1
+    stops = {n for n, (a, b) in defs.items()
+             if n not in ("_engine_nn", "_engine_nre_ix")
+             and any("exit(70)" in l for l in lines[a:b])}
+
+    def col_for(cs, name):
+        for part in reversed(name.split("_")):
+            if not part or part in ("get", "set", "T"):
+                continue
+            for mm in re.finditer(
+                    r"((?:[A-Za-z_]\w*\s*(?:\(\s*\))?\s*\.\s*)*)\b%s\b"
+                    % re.escape(part), cs, re.I):
+                return mm.start() + 1
+        return len(cs) - len(cs.lstrip()) + 1
+
+    for k, line in enumerate(lines):
+        mk = _SITE_MARK.search(line)
+        if not mk:
+            continue
+        head, cs = mk.group(1), mk.group(2)
+        line = line[:mk.start()]
+        calls = [m for m in re.finditer(r"(?<![\w.])(\w+)\(",
+                                        cs2cpp._blank(line))
+                 if m.group(1) in stops]
+        for m in reversed(calls):
+            close = _match_close(cs2cpp._blank(line), m.end() - 1, "(", ")")
+            if close is None:
+                continue
+            line = "%s(_engine_at(%s, %d), %s)%s" % (
+                line[:m.start()], head, col_for(cs, m.group(1)),
+                line[m.start():close + 1], line[close + 1:])
+        lines[k] = line
+    if stops:
+        # the stopping helpers print the recorded site before they exit
+        for n in stops:
+            a, b = defs[n]
+            for j in range(a + 1, b):
+                lines[j] = lines[j].replace(
+                    "exit(70);", "_engine_site_print(); exit(70);")
+        first = next((j for j, l in enumerate(lines)
+                      if l.startswith("static ")), 0)
+        lines[first:first] = _SITE_RUNTIME.rstrip("\n").split("\n")
+    return "\n".join(lines)
+
+
+_SITE_RUNTIME = """static const char *_engine_site_cls, *_engine_site_method, *_engine_site_path;
+static int _engine_site_line, _engine_site_col;
+static int _engine_at(const char *cls, const char *method, const char *path,
+                      int line, int col) {
+    _engine_site_cls = cls; _engine_site_method = method;
+    _engine_site_path = path; _engine_site_line = line; _engine_site_col = col;
+    return 0;
+}
+static void _engine_site_print(void) {
+    if (_engine_site_cls)
+        fprintf(stderr, "%s.%s () (at %s:%d:%d)\\n", _engine_site_cls,
+                _engine_site_method, _engine_site_path, _engine_site_line,
+                _engine_site_col);
+}
+"""
 
 
 def emit_engine_draw_h():
