@@ -6673,6 +6673,11 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Physics2D.query")
         apis.add("Vector2")
         apis.add("GameObject.SetActive")
+    # Collider2D.IsTouchingLayers: the last step's contact and trigger
+    # pairs, by the other collider's GameObject layer
+    if re.search(r"\.\s*IsTouchingLayers\s*\(", scan):
+        apis.add("Collider2D.IsTouchingLayers")
+        apis.add("GameObject.SetActive")
     if re.search(r"\bVector2Int\b", scan):
         apis.add("Vector2Int")
     # The Input System's Gamepad.current: the host's gamepad.
@@ -16163,6 +16168,30 @@ def _emit_engine_colliders_2d(
         p("        if (pa[i] == lo && pb[i] == hi) return 1;")
         p("    return 0;")
         p("}")
+        if plan.get("_touching_layers"):
+            p("/* Collider2D.IsTouchingLayers: a contact or trigger pair of the")
+            p("   last step whose other collider's GameObject is in the mask */")
+            p("static int Collider2D_IsTouchingLayers(int ci, int mask) {")
+            p("    int i, k, o, go;")
+            p("    if (ci < 0 || ci >= _Collider2D_count) {")
+            p('        fprintf(stderr, "NullReferenceException: Object reference'
+              ' not set to an instance of an object'
+              ' (Collider2D.IsTouchingLayers)\\n");')
+            p("        exit(70);")
+            p("    }")
+            p("    for (k = 0; k < 2; k = k + 1) {")
+            p("        const int *pa = k ? _col2d_trig_a : _col2d_contact_a;")
+            p("        const int *pb = k ? _col2d_trig_b : _col2d_contact_b;")
+            p("        int n = k ? _col2d_trig_n : _col2d_contact_n;")
+            p("        for (i = 0; i < n; i = i + 1) {")
+            p("            o = pa[i] == ci ? pb[i] : pb[i] == ci ? pa[i] : -1;")
+            p("            go = o >= 0 ? _col2d_go(o) : -1;")
+            p("            if (go >= 0 && ((unsigned)mask >> GameObject_layer(go)) & 1u)")
+            p("                return 1;")
+            p("        }")
+            p("    }")
+            p("    return 0;")
+            p("}")
         trig = {}
         for cname, msgs in collision2d_handlers.items():
             t = [m for m in ("OnTriggerEnter2D", "OnTriggerStay2D",
@@ -19283,13 +19312,16 @@ def emit_engine(plan, analyses, used_apis):
             msgs[m["name"]] = arg
         if msgs:
             collision2d_handlers[cname] = msgs
-    want_collision2d_msgs = (bool(collision2d_handlers)
+    touching = "Collider2D.IsTouchingLayers" in used_apis
+    want_collision2d_msgs = (bool(collision2d_handlers) or touching
                              or bool(plan.get("godot_signals"))) and want_col2d
     trigger2d_handlers = {c: {k: v for k, v in msgs.items()
                               if k.startswith("OnTrigger")}
                           for c, msgs in collision2d_handlers.items()}
     trigger2d_handlers = {c: m for c, m in trigger2d_handlers.items() if m}
-    plan["physics2d_triggers"] = bool(trigger2d_handlers) and want_col2d \
+    plan["physics2d_triggers"] = (bool(trigger2d_handlers) or touching) \
+        and want_col2d and not plan.get("godot")
+    plan["_touching_layers"] = touching and want_col2d \
         and not plan.get("godot")
 
     if want_collision2d_msgs:
@@ -25620,6 +25652,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _mark_string_chars(text, string_idents, string_arrays
                               | _string_store_names(plan)
                               | plan.get("_string_lists_local", set()))
+    text = _lower_is_touching_layers(text, cl, plan, site)
     text = _format_bools(text, _bool_names(cl, body, site)
                          | {"Cursor_visible", "true", "false",
                             "engine_box2d_queries_start_in_colliders"},
@@ -25627,6 +25660,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                              "_engine_go_active_in_hierarchy",
                              "GameObject_activeSelf",
                              "GameObject_CompareTag",
+                             "Collider2D_IsTouchingLayers",
                              "_ia_enabled", "_ia_pressed", "_ia_down", "_ia_up",
                              "_gp_btn", "_gp_down", "_gp_up",
                              "ParticleSystem_get_isPlaying",
@@ -26344,6 +26378,43 @@ def _lower_bounds(text, plan, site=None):
             site.setdefault("protos", set()).add(
                 "static float %s(int h, int what);" % fn)
     return text
+
+
+def _lower_is_touching_layers(text, cl, plan, site=None):
+    """`c.IsTouchingLayers([mask])` of a Collider2D field or local (a
+    collider row): `Collider2D_IsTouchingLayers`, beside the trigger pairs;
+    no mask is Physics2D.AllLayers. Before the field reads are lowered, so
+    the bool is formatted as C# prints it."""
+    if "IsTouchingLayers" not in text or not plan.get("collider2d") \
+            or plan.get("godot"):
+        return text
+    types = "|".join(sorted(_COLLIDER2D_FIELD_TYPES))
+    names = {f["name"] for f in cl.get("fields") or []
+             if f.get("ty") in _COLLIDER2D_FIELD_TYPES
+             and not (f.get("static") or f.get("const"))}
+    names |= set(re.findall(r"\b(?:%s)\s+(\w+)\s*[=;]" % types,
+                            cs2cpp._blank(text)))
+    if not names:
+        return text
+    pat = re.compile(r"(?<![\w.])(?:this\s*\.\s*)?(%s)\s*\.\s*IsTouchingLayers"
+                     r"\s*\(" % "|".join(map(re.escape, sorted(names))))
+    out, pos = [], 0
+    for m in pat.finditer(text):
+        got = _match_call_args(text, m.end() - 1)
+        if m.start() < pos or not got:
+            continue
+        a = _split_top_args(got[0])
+        if len(a) > 1:
+            continue
+        out += [text[pos:m.start()], "Collider2D_IsTouchingLayers(%s, %s)" % (
+            m.group(1), a[0] if a and a[0].strip() else "-1")]
+        pos = got[1]
+    if not out:
+        return text
+    if site is not None:
+        site.setdefault("protos", set()).add(
+            "static int Collider2D_IsTouchingLayers(int ci, int mask);")
+    return "".join(out) + text[pos:]
 
 
 def _emit_bounds(p, plan):
