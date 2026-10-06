@@ -3099,7 +3099,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         animator = None
         audiosources = []
         rect = None
+        # Each further project script on this GO is its own object below:
+        # its fields and fileID are not the primary one's.
+        scripted = [k for k in kids if k.get("kind") == "MonoBehaviour"
+                    and k.get("guid") in (guid_to_script or {})]
+        prim = next((k for k in reversed(scripted) if k.get("ui_slider")),
+                    scripted[0] if scripted else None)
+        extra_mbs = [k for k in scripted if k is not prim]
         for k in kids:
+            if any(k is e for e in extra_mbs):
+                continue
             if k.get("kind") == "Transform":
                 xf = k
                 if k.get("rect"):
@@ -3558,6 +3567,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "object_ref_arrays": object_ref_arrays,
             "struct_values": struct_values,
             "mb_ids": mb_ids,
+            "mb_enabled": _mb_enabled((prim or {}).get("raw") or ""),
             "comp_ids": [str(k.get("file_id")) for k in kids
                          if k.get("file_id") is not None],
             "script": script,
@@ -3598,6 +3608,41 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "anim_player": player,
             "audiosources": audiosources,
         })
+        for k in extra_mbs:
+            efields = dict(k.get("fields") or {})
+            for vk, (vx, vy) in (k.get("vec2_fields") or {}).items():
+                efields[vk + "_x"], efields[vk + "_y"] = vx, vy
+            for vk, (vx, vy, vz) in (k.get("vec3_fields") or {}).items():
+                efields[vk + "_x"], efields[vk + "_y"] = vx, vy
+                efields[vk + "_z"] = vz
+            try:
+                ecurves = _curves.parse_curve_fields(k.get("raw") or "")
+            except _curves.CurveError as e:
+                raise PackError("GameObject `%s`: an AnimationCurve field "
+                                "holds %s" % (go.get("name") or "?", e))
+            escript = guid_to_script[k["guid"]]
+            objects.append({
+                "name": go.get("name") or "obj", "pos": pos, "rot": rot,
+                "local_pos": local_pos, "local_rot": local_rot,
+                "local_scale": local_scale, "father_id": father_id,
+                "xf_id": xf_id, "child_ids": child_ids,
+                "go_id": go.get("file_id"), "active": active,
+                "fields": efields,
+                "str_fields": dict(k.get("str_fields") or {}),
+                "anim_curves": ecurves,
+                "object_refs": dict(k.get("object_refs") or {}),
+                "object_ref_arrays": dict(k.get("object_ref_arrays") or {}),
+                "struct_values": dict(k.get("struct_values") or {}),
+                "mb_ids": [str(k.get("file_id"))],
+                "mb_enabled": _mb_enabled(k.get("raw") or ""),
+                "comp_ids": [str(c.get("file_id")) for c in kids
+                             if c.get("file_id") is not None],
+                "script": escript, "class": _class_name_from_cs(escript),
+                "sprite": None, "canvas": None, "rect": rect,
+                "rigidbody2d": None, "rigidbody": None,
+                "collider2d": None, "collider3d": None, "anim_player": None,
+                "co_mb": True,
+            })
     # Stripped PrefabInstance Transforms are not joined via m_Component, but
     # scene children still m_Father them (e.g. button labels). Register those
     # xfs so activeInHierarchy can walk to inactive layout parents.
@@ -27301,7 +27346,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 6
+_SCENE_CACHE_VERSION = 9
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",

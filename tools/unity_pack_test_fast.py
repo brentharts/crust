@@ -927,6 +927,32 @@ public class Mgr : MonoBehaviour {
         self.assertIn("embedded struct", str(cm.exception))
 
 
+class TestTwoScriptsOneGameObject(unittest.TestCase):
+    """Slime Jump's Player GO also carries AffectedByVortex: every script
+    on a GO was folded into the first one's object (fields merged, the
+    second had no row, `player.affectedByVortex` was null)."""
+
+    @needs_cc
+    def test_second_script_is_its_own_row(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public float speed;\n    public B b;\n    int f;\n"
+             "    void Update() { f++; if (f > 1) return;\n"
+             "        Debug.Log(\"s \" + speed + \" \" + b.speed + \" \" + "
+             "GetComponent<B>().speed); }\n}\n")
+        b = ("using UnityEngine;\npublic class B : MonoBehaviour {\n"
+             "    public float speed;\n"
+             "    void Start() { Debug.Log(\"b start \" + speed); }\n}\n")
+        extra = ("--- !u!114 &{fid}\nMonoBehaviour:\n"
+                 "  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_Script: {{fileID: 11500000, guid: %032x}}\n"
+                 "  speed: 7\n" % 2)
+        root = project(self, {"A": a, "B": b}, [
+            ("A", extra, "  speed: 3\n  b: {fileID: 103}\n")])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("b start 7", out)
+        self.assertIn("s 3 7 7", out)
+
+
 class TestNullFieldRead(unittest.TestCase):
     """`other.v` through a null reference (Slime Jump's unset
     `affectedByVortex.velocity`) read out of bounds; it is Unity's NRE.
