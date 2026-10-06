@@ -927,6 +927,25 @@ public class Mgr : MonoBehaviour {
         self.assertIn("embedded struct", str(cm.exception))
 
 
+class TestLocalNamedI(unittest.TestCase):
+    """`for (int i = 0; ..) speed += 1f;`: the packed instance index is `i`,
+    so the loop counter took its place and each pass bumped instance
+    0, 1 (A0 11, A1 22) instead of this one twice."""
+
+    @needs_cc
+    def test_loop_counter_i(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public float speed;\n    int f;\n"
+             "    void Update() { f++; if (f > 1) return;\n"
+             "        for (int i = 0; i < 2; i++) speed += 1f;\n"
+             "        Debug.Log(name + \" \" + speed); }\n}\n")
+        root = project(self, {"A": a}, [("A", None, "  speed: 10\n"),
+                                        ("A", None, "  speed: 20\n")])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("A0 12", out)
+        self.assertIn("A1 22", out)
+
+
 class TestTwoScriptsOneGameObject(unittest.TestCase):
     """Slime Jump's Player GO also carries AffectedByVortex: every script
     on a GO was folded into the first one's object (fields merged, the

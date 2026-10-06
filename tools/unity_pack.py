@@ -24529,8 +24529,15 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = _trap_tmp_writes(_drop_shader_params(body, plan, site), plan,
-                            site)
+    body = _drop_shader_params(body, plan, site)
+    # the packed instance index is `i`: a C# local of that name (a loop
+    # counter) would take its place in every field access below
+    if any(m.group(1) not in ("return", "else", "case", "goto", "throw",
+                              "yield", "await", "new", "in", "out", "ref")
+           for m in re.finditer(r"(?<![\w.])([A-Za-z_][\w.<>\[\]]*)\s+i\s*"
+                                r"(?:[=;,)]|\bin\b)", cs2cpp._blank(body))):
+        body = cs2cpp.code_sub(r"(?<![\w.])i\b", "_cs_i", body)
+    text = _trap_tmp_writes(body, plan, site)
     text = _own_string_params(text, site)
     text = _drop_iface_tick_loops(text, plan, site)
     # before `gameObject` is lowered: the terrain calls take it as written
