@@ -1855,6 +1855,27 @@ def _run_rc(test, out, frames=1):
     return run.returncode, run.stdout, run.stderr
 
 
+class TestUnpackedClassCall(unittest.TestCase):
+    """`g.Use();` on a class crust packs no methods of (Slime Jump's
+    `World.Instance.SetPieces()`, `fallerObject.Awake()`): Unity's NRE for
+    a null receiver, else a stop at the call -- not a stubbed method."""
+
+    @needs_cc
+    def test_null_receiver_nre(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public Gadget g;\n    int f;\n"
+             "    void Update() {\n        f++; Debug.Log(\"tick \" + f);\n"
+             "        g.Use ();\n    }\n}\n")
+        g = ("using UnityEngine;\npublic class Gadget : MonoBehaviour {\n"
+             "    public void Use () { Debug.Log(\"used\"); }\n}\n")
+        root = project(self, {"A": a, "Gadget": g},
+                       [("A", None, "  g: {fileID: 0}\n")])
+        rc, out, err = _run_rc(self, pack(self, root, strict=False), 2)
+        self.assertIn("tick 1", out)
+        self.assertNotIn("used", out)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:9)", err)
+
+
 class TestSpriteSwapDropped(unittest.TestCase):
     """`s = img.sprite;` (Player.Awake's toggle images): the pack draws
     each Image with its authored sprite, so the statement goes with a

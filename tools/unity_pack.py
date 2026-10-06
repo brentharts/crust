@@ -25031,7 +25031,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     # first: their warnings point into the source by offset
-    body = _drop_sprite_swaps(_drop_shader_params(body, plan, site), plan, site)
+    body = _trap_shallow_calls(_drop_sprite_swaps(_drop_shader_params(body, plan, site), plan, site), plan, site)
     # the packed instance index is `i`: a C# local of that name (a loop
     # counter) would take its place in every field access below
     if any(m.group(1) not in ("return", "else", "case", "goto", "throw",
@@ -25863,6 +25863,62 @@ def _body_src_off(ft, at, body, pos):
     for _ in range(k):
         ls = ft.index("\n", ls) + 1
     return ls + pos - (body.rfind("\n", 0, pos) + 1)
+
+
+def _trap_shallow_calls(body, plan, site):
+    """`recv.M(..);` on a class crust packs no methods of (SHALLOW_METHODS:
+    only in prefabs nothing spawns, or nowhere) -- a local or field of it, or
+    its `Instance` -- keeps Unity's NullReferenceException, then stops the
+    player with its C# line if it runs. A CS8000 warning names it; under
+    strict it is left for the stub.
+
+    ponytail: a receiver is typed by name across the file (one type per
+    name), and the arguments are not evaluated before the stop."""
+    import tools.unity_pack_common as _cm
+    if plan.get("strict") or not site or not _cm.SHALLOW_METHODS:
+        return body
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    if not ft:
+        return body
+    path = site.get("path") or "<cs>"
+    decl = cs2cpp._blank(ft)
+    for cname, methods in sorted(_cm.SHALLOW_METHODS.items()):
+        if not methods or cname not in decl:
+            continue
+        recvs = [re.escape(v) for v in sorted(set(re.findall(
+            r"(?<![\w.])%s\s+(\w+)\s*[;=,)]" % re.escape(cname), decl)))]
+        recvs.append(r"%s\s*\.\s*[Ii]nstance" % re.escape(cname))
+        pat = re.compile(
+            r"(?<![\w.])(?:this\s*\.\s*)?(?P<r>%s)\s*\.\s*(?P<m>%s)\s*"
+            r"\((?:[^();]|\([^();]*\))*\)\s*;" % (
+                "|".join(recvs), "|".join(re.escape(m) for m in methods)))
+        scan = cs2cpp._blank(body)
+        out, last = [], 0
+        for m in pat.finditer(scan):
+            prev = scan[:m.start()].rstrip()
+            if prev and prev[-1] not in ";{})" and not re.search(
+                    r"\belse$", prev):
+                continue
+            off = _body_src_off(ft, at, body, m.start("r"))
+            ln = ft.count("\n", 0, off) + 1
+            col = off - (ft.rfind("\n", 0, off) + 1) + 1
+            api = "%s.%s" % (cname, m.group("m"))
+            sys.stderr.write(_cs_diag(
+                path, ft, _body_src_off(ft, at, body, m.start()), "CS8000",
+                "`%s` is not lowered (crust packs no %s methods: only in "
+                "prefabs nothing spawns, or nowhere); the statement stops "
+                "the player if it runs" % (api, cname),
+                kind="warning") + "\n")
+            out.append(body[last:m.start()])
+            out.append("{ if (%s == null) __nre(%d, %d); "
+                       "_engine_unlowered_at(%s, %s, %d); }%s" % (
+                           body[m.start("r"):m.end("r")], ln, col,
+                           _c_string(api), _c_string(path), ln,
+                           "\n" * body.count("\n", m.start(), m.end())))
+            last = m.end()
+        body = "".join(out) + body[last:]
+    return body
 
 
 def _drop_shader_params(body, plan, site):
@@ -27544,6 +27600,8 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     *objects* is extended in place with prefab instances. Returns analyses.
     """
+    import tools.unity_pack_common as _common
+    _common.SHALLOW_METHODS.clear()
     if _godot.is_godot_project(root):
         return _godot.analyze_scripts(root, objects, analyze_script)
     _godot.GODOT_ROOT[0] = None
@@ -27622,10 +27680,13 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
                 # are what the objects embedding it call
                 analyses.append(a)
                 continue
+            full = {c["name"]: {m["name"] for m in c.get("methods") or []}
+                    for c in a.get("classes") or []}
             a = analyze_script(sp, shallow=True)
             a["shallow"] = True
             for c in a.get("classes") or []:
                 c["methods"] = []
+                _common.SHALLOW_METHODS[c["name"]] = full.get(c["name"], set())
             a["apis"] = set()
             a["getcomponent_types"] = set()
             a["getcomponentsinchildren_types"] = set()
@@ -27660,6 +27721,25 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
                 "literals": [],
             })
             have.add(o["class"])
+    # a project class with no rows (nothing packs its methods; a base class
+    # is analyzed only for its subclasses): its method names, for the trap
+    rows = {o["class"] for o in objects}
+    for t, sp in sorted(typename_map.items()):
+        if t in rows or t in _common.SHALLOW_METHODS:
+            continue
+        try:
+            with open(sp, encoding="utf-8", errors="replace") as f:
+                src = cs2cpp._blank(f.read())
+        except OSError:
+            continue
+        # no base: a plain value, its methods lowered where it is embedded
+        if not re.search(r"\bclass\s+%s\b\s*(?:<[^>{]*>)?\s*:" % re.escape(t),
+                         src):
+            continue
+        _common.SHALLOW_METHODS[t] = {
+            n for n in re.findall(r"[\w>\]]\s+(\w+)\s*\([^;{}]*\)\s*\{", src)
+            if n not in ("if", "while", "for", "foreach", "switch", "catch",
+                         "using", "lock", "fixed")}
     return analyses
 
 
