@@ -927,6 +927,145 @@ public class Mgr : MonoBehaviour {
         self.assertIn("embedded struct", str(cm.exception))
 
 
+class TestAnimatorStateMachine(unittest.TestCase):
+    """An Animator field runs its controller: `Play` switches state at the
+    animator update (after Update), `IsName` reads the current one, the
+    clip's float curve writes the script's field, and the exit-time
+    transition returns to the default state."""
+
+    MGR = """using UnityEngine;
+public class Mgr : MonoBehaviour {
+    public Animator anim;
+    public Vector2 multiplySize = Vector2.one;
+    int f;
+    void Update() {
+        f++;
+        if (f == 2) anim.Play("Squash");
+        if (f == 2 || f == 3 || f == 5 || f == 20)
+            Debug.Log("f" + f + " " + (anim.GetCurrentAnimatorStateInfo(0).IsName("Squash") ? 1 : 0) + " " + (int)(multiplySize.x * 100f + 0.5f));
+    }
+}
+"""
+    CTRL = """%YAML 1.1
+--- !u!91 &9100000
+AnimatorController:
+  m_Name: C
+  m_AnimatorParameters: []
+  m_AnimatorLayers:
+  - serializedVersion: 5
+    m_Name: Base Layer
+    m_StateMachine: {fileID: 1107000}
+    m_Mask: {fileID: 0}
+    m_BlendingMode: 0
+    m_SyncedLayerIndex: -1
+    m_DefaultWeight: 0
+--- !u!1107 &1107000
+AnimatorStateMachine:
+  m_Name: Base Layer
+  m_ChildStates:
+  - serializedVersion: 1
+    m_State: {fileID: 1102001}
+  - serializedVersion: 1
+    m_State: {fileID: 1102002}
+  m_ChildStateMachines: []
+  m_AnyStateTransitions: []
+  m_EntryTransitions: []
+  m_DefaultState: {fileID: 1102001}
+--- !u!1102 &1102001
+AnimatorState:
+  m_Name: Idle
+  m_Speed: 1
+  m_CycleOffset: 0
+  m_Transitions: []
+  m_Motion: {fileID: 0}
+--- !u!1102 &1102002
+AnimatorState:
+  m_Name: Squash
+  m_Speed: 1
+  m_CycleOffset: 0
+  m_Transitions:
+  - {fileID: 1101003}
+  m_Motion: {fileID: 7400000, guid: CLIPGUID, type: 2}
+--- !u!1101 &1101003
+AnimatorStateTransition:
+  m_Conditions: []
+  m_DstState: {fileID: 1102001}
+  m_Mute: 0
+  m_IsExit: 0
+  m_TransitionDuration: 0
+  m_TransitionOffset: 0
+  m_ExitTime: 1
+  m_HasExitTime: 1
+"""
+    CLIP = """%YAML 1.1
+--- !u!74 &7400000
+AnimationClip:
+  m_Name: Squash
+  m_PositionCurves: []
+  m_FloatCurves:
+  - serializedVersion: 2
+    curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: 1
+        inSlope: -5
+        outSlope: -5
+        weightedMode: 0
+      - serializedVersion: 3
+        time: 0.1
+        value: 0.5
+        inSlope: -5
+        outSlope: -5
+        weightedMode: 0
+    attribute: multiplySize.x
+    path: 
+    classID: 114
+  m_PPtrCurves: []
+  m_AnimationClipSettings:
+    m_StopTime: 0.1
+    m_LoopTime: 0
+"""
+    ANIMATOR = ("--- !u!95 &{fid}\nAnimator:\n  m_GameObject: {{fileID: {go}}}\n"
+                "  m_Enabled: 1\n  m_Controller: {{fileID: 9100000, guid: "
+                "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0, type: 2}}\n")
+
+    def _project(self, ctrl=None):
+        root = project(self, {"Mgr": self.MGR}, [
+            ("Mgr", self.ANIMATOR,
+             "  anim: {fileID: 103}\n  multiplySize: {x: 1, y: 1}\n")])
+        d = os.path.join(root, "Assets", "Animations")
+        os.makedirs(d)
+        for name, guid, text in (
+                ("C.controller", "c0" * 16,
+                 (ctrl or self.CTRL).replace("CLIPGUID", "d0" * 16)),
+                ("Squash.anim", "d0" * 16, self.CLIP)):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+            with open(os.path.join(d, name + ".meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+        return root
+
+    @needs_cc
+    def test_play_isname_curve_and_exit(self):
+        out = run_frames(self, pack(self, self._project()), 20)
+        # f2: Play is pending; f3/f5: Squash after 1 and 3 animator ticks
+        # (value 1 - 5t); f20: back in Idle through the exit transition
+        self.assertIn("f2 0 100", out)
+        self.assertIn("f3 1 92", out)
+        self.assertIn("f5 1 75", out)
+        self.assertTrue(any(l.startswith("f20 0 ") for l in out), out)
+
+    def test_parameters_are_refused(self):
+        ctrl = self.CTRL.replace(
+            "  m_AnimatorParameters: []\n",
+            "  m_AnimatorParameters:\n  - m_Name: Speed\n    m_Type: 1\n")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            pack(self, self._project(ctrl))
+        self.assertIn("parameters", str(cm.exception))
+
+
 class TestHandleEulerZ(unittest.TestCase):
     """`t.eulerAngles += Vector3.forward * d` and `t.eulerAngles =
     Vector3.zero` through a Transform field (Slime Jump's lasso swing)."""

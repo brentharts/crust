@@ -608,7 +608,7 @@ _REFUSED_ADDCOMPONENT = frozenset((
 # only ever used through the engine's GO-keyed helpers (`Transform_get_parent`,
 # `RectTransform_get_rect_height`, …), so the GO is the handle.
 _GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
-    ("Transform", "GameObject"))
+    ("Transform", "GameObject", "Animator", "SpriteRenderer"))
 
 # Every GameObject has a Transform (RectTransform is the uGUI subclass).
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
@@ -3606,6 +3606,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "collider2d": col2d,
             "collider3d": col3d,
             "anim_player": player,
+            "animator_controller": (animator or {}).get("controller_guid")
+            if (animator or {}).get("enabled", 1) else None,
             "audiosources": audiosources,
         })
         for k in extra_mbs:
@@ -10356,11 +10358,25 @@ def _emit_engine_gameobject_tables(
         p("static int _%s_live = 0;" % idn)
         p("static const int _%s_cap = %d;" % (idn, bud))
         p("static int _%s_owner_go[%d];" % (idn, bud))
-        p("static int GameObject_GetComponent_%s(int go) {" % idn)
-        p("    if (go < 0 || go >= _engine_go_count) return -1;")
-        p("    return _engine_go_%s[go];" % idn)
-        p("}")
-        p("static int GameObject_AddComponent_%s(int go) {" % idn)
+        # a GO-handle type's value is its GameObject, as its fields' are
+        handle = type_name in _GO_HANDLE_FIELD_TYPES
+        if handle:
+            p("static int GameObject_AddComponent_%s_row(int go);" % idn)
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go] >= 0 ? go : -1;" % idn)
+            p("}")
+            p("static int GameObject_AddComponent_%s(int go) {" % idn)
+            p("    return GameObject_AddComponent_%s_row(go) >= 0 ? go : -1;"
+              % idn)
+            p("}")
+        else:
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go];" % idn)
+            p("}")
+        sfx = "_row" if handle else ""
+        p("static int GameObject_AddComponent_%s%s(int go) {" % (idn, sfx))
         p("    int ex;")
         p("    if (go < 0 || go >= _engine_go_count) return -1;")
         p("    ex = _engine_go_%s[go];" % idn)
@@ -10382,9 +10398,15 @@ def _emit_engine_gameobject_tables(
         p("static char _%s_tostring_buf[256];" % idn)
         p("static const char *%s_ToString(int ci) {" % idn)
         p("    int n, go;")
-        p("    if (ci < 0 || ci >= _%s_live) return \"null\";" % idn)
-        p("    go = _%s_owner_go[ci];" % idn)
-        p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+        if handle:
+            p("    go = ci;")
+            p("    if (go < 0 || go >= _engine_go_count || _engine_go_%s[go] < 0)"
+              % idn)
+            p("        return \"null\";")
+        else:
+            p("    if (ci < 0 || ci >= _%s_live) return \"null\";" % idn)
+            p("    go = _%s_owner_go[ci];" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
         p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
           % (idn, idn))
         p("                 \"%%s (%s)\", _engine_go_name[go]);"
@@ -17808,7 +17830,7 @@ def emit_engine(plan, analyses, used_apis):
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
     if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
-            or want_transform_matrix or want_quat_angle
+            or plan.get("animators") or want_transform_matrix or want_quat_angle
             or _plan_needs_vector2(plan, used_apis)):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
@@ -17820,7 +17842,8 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
             or want_app_open_url or plan.get("player_prefs")
-            or "GodotPrint" in used_apis or not plan.get("strict")):
+            or "GodotPrint" in used_apis or not plan.get("strict")
+            or plan.get("animators")):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
@@ -17875,7 +17898,8 @@ def emit_engine(plan, analyses, used_apis):
     if (want_log or want_draw_sort or want_data_path
             or want_persistent_data_path or want_file_io or want_go_tables
             or want_app_open_url or plan.get("player_prefs")
-            or want_str_plus or not plan.get("strict")):
+            or want_str_plus or not plan.get("strict")
+            or plan.get("animators")):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -19149,9 +19173,11 @@ def emit_engine(plan, analyses, used_apis):
         _godot.emit_custom_decls(p, plan, _c_ident)
         if plan.get("godot_spawn"):
             _emit_godot_spawn_decls(p, plan)
+    _emit_animator_protos(p, plan)
     _emit_engine_class_groups(
             class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
             want_go_tables)
+    _emit_animator_runtime(p, plan)
     if plan.get("godot_custom"):
         _godot.emit_custom_dispatch(p, plan, _c_ident, want_go_tables)
     _parts.emit_sim(p, plan, class_ids, _c_ident, _class_has_position)
@@ -19393,6 +19419,8 @@ def emit_engine(plan, analyses, used_apis):
     # LateUpdate -- the animation ran before Update, LateUpdate never
     if want_anim and anim_players:
         p("    engine_animation_tick();")
+    if plan.get("animators"):
+        p("    engine_animator_tick();")
     for cname in sorted(plan["classes"]):
         p("    %s_LateTick();" % _c_ident(cname))
     if plan.get("particles"):
@@ -25476,8 +25504,10 @@ def _drop_shader_params(body, plan, site):
     return body
 
 
-def _call_suffix_sub(text, funcs, suffix, build):
-    """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match)."""
+def _call_suffix_sub(text, funcs, suffix, build, args=False):
+    """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match);
+    with *args*, a *suffix* ending in `(` (a method of the result) is
+    consumed with its arguments, *build*(call, match, [args])."""
     if not funcs:
         return text
     pat = re.compile(r"(?<![\w.])(%s)\s*\(" % "|".join(
@@ -25493,8 +25523,17 @@ def _call_suffix_sub(text, funcs, suffix, build):
         mm = re.match(suffix, text[after:])
         if not mm:
             continue
+        end = after + mm.end()
+        if args:
+            inner = _match_call_args(text, end - 1)
+            if not inner:
+                continue
+            out += [text[pos:m.start()], build(
+                text[m.start():after], mm, _split_top_args(inner[0]))]
+            pos = inner[1]
+            continue
         out += [text[pos:m.start()], build(text[m.start():after], mm)]
-        pos = after + mm.end()
+        pos = end
     return "".join(out) + text[pos:] if out else text
 
 
@@ -25522,6 +25561,24 @@ def _late_call_members(text, plan):
             text = _fill_defaults_after(text, _method_c_symbol(
                 _c_ident(cn), m["name"], m.get("args") or "", False), prms,
                 receiver=True)
+    if plan.get("animators"):
+        anims = {g for g in gos if any(
+            "%s_get_%s" % (_c_ident(cn), f["name"]) == g
+            and f.get("ty") == "Animator"
+            for cn, c in plan["classes"].items()
+            for f in c.get("fields") or [])}
+        text = _call_suffix_sub(
+            text, anims, r"\s*\.\s*Play\s*\(",
+            lambda call, mm, a: "Animator_Play(%s)" % ", ".join(
+                [call] + a + ["-1", "-INFINITY"][len(a) - 1:]), True)
+        text = _call_suffix_sub(
+            text, anims, r"\s*\.\s*GetCurrentAnimatorStateInfo\s*\(",
+            lambda call, mm, a: "_Animator_StateInfo(%s)" % ", ".join(
+                [call] + a), True)
+        text = _call_suffix_sub(
+            text, {"_Animator_StateInfo"}, r"\s*\.\s*IsName\s*\(",
+            lambda call, mm, a: "Animator_IsName(%s)" % ", ".join(
+                [call[call.index("(") + 1:-1]] + a), True)
     return _call_suffix_sub(
         text, gos,
         r"\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
@@ -28106,8 +28163,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         # every texture is in the table (see below)
         plan["_gpu_batch"] = True
     _ensure_texture_guids(
-        plan["textures"], _anim_sprite_guids(objects),
-        asset_guids)
+        plan["textures"], _anim_sprite_guids(objects)
+        + _animator_sprite_guids(objects, asset_guids), asset_guids)
     # a MeshRenderer's material's _MainTex (tools/unity_pack_mesh.py)
     for _o in objects:
         _md = _o.get("mesh_draw")
@@ -28245,6 +28302,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         for c in plan["collider2d"])
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
+    plan["animators"] = _build_animator_tables(plan, asset_guids, {
+        (cn, f["name"]): f.get("ty") for cn, c in plan["classes"].items()
+        for f in c.get("fields") or []})
     # a clip's rotation / scale curves need their owners' live tables
     plan["live_rot_classes"] = sorted(set(plan.get("live_rot_classes") or [])
                                       | set(plan.get("anim_rot_classes") or []))
