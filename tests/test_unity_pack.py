@@ -16259,6 +16259,90 @@ class TestBox2DTerrainChunk(unittest.TestCase):
         self.assertAlmostEqual(y, 1.5, delta=0.06)
 
 
+class TestBox2DInactiveChildCollider(unittest.TestCase):
+    """A child GameObject's collider rides on its parent's Rigidbody2D; an
+    inactive child's collider is out of the simulation (Slime Jump's player
+    stood on the 1-unit box of a disabled child)."""
+
+    @needs_box2d
+    def test_ball_ignores_inactive_childs_box(self):
+        root = tempfile.mkdtemp(prefix="upack-inactive-")
+        self.addCleanup(shutil.rmtree, root, True)
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(TestBox2DTerrainChunk._BALL)
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: 7e44a2" + "0" * 26 + "\n")
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Floor\n  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: -0.5, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+                "--- !u!61 &3\nBoxCollider2D:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 10, y: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Ball\n  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 3, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n"
+                "  m_Children:\n  - {fileID: 21}\n"
+                "--- !u!50 &12\nRigidbody2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+                "  m_LinearDamping: 0\n"
+                "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
+                "--- !u!114 &14\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: 7e44a2" + "0" * 26 + "}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Leg\n  m_IsActive: 0\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 11}\n"
+                "--- !u!61 &22\nBoxCollider2D:\n  m_GameObject: {fileID: 20}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 0.2, y: 4}\n")
+        out = tempfile.mkdtemp(prefix="upack-inactive-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        plan = unity_pack.pack(root, out, force=True, box2d_root=_BOX2D_ROOT)
+        self.assertEqual(sorted(c["rb2d"] for c in plan["collider2d"]),
+                         [-1, 0, 0])
+        unity_pack.build_player_executable(
+            out, os.path.basename(root), box2d_root=_BOX2D_ROOT)
+        # a frame-counted harness: a window player runs until closed
+        src = os.path.join(out, "h.c")
+        with open(src, "w") as f:
+            f.write("extern float Time_deltaTime;\n"
+                    "void engine_apply_argv(int, char **);\n"
+                    "void engine_tick(void);\n"
+                    "int main(int c, char **v) { int f; engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f;\n"
+                    "  for (f = 0; f < 90; f++) engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        import glob
+        b2 = sorted(glob.glob(os.path.join(out, "box2d", "*.o")))
+        subprocess.run(["cc", "-o", exe, src, os.path.join(out, "engine.o"),
+                        os.path.join(out, "data.o"),
+                        os.path.join(out, "physics_box2d.o")] + b2
+                       + ["-lm", "-lpthread", "-lstdc++"], check=True)
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        y = float(run.stdout.split("y=")[1].split()[0])
+        # radius 0.5 on the floor's top at y = 0; 2.0 on the leg's box
+        self.assertAlmostEqual(y, 0.5, delta=0.06)
+
+
 class TestBox2DPhysicsBackend(unittest.TestCase):
     """2D physics is Box2D-Packed; OnCollisionEnter/Stay/Exit2D still come
     from unity_pack after the step. See box2d_unity.py in the Box2D-Packed

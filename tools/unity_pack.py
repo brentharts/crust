@@ -17135,7 +17135,12 @@ def _emit_engine_box2d_exports(
         plan["_live_destroy"] = bool(
             plan.get("_want_destroy") and plan.get("_go_of_fn")
             and (plan.get("collider2d") or plan.get("rigidbody2d")))
-        if plan["_live_destroy"]:
+        # An inactive GameObject's colliders are out of the simulation too
+        # (a child collider on an inactive object stayed on its parent's body)
+        plan["_live_active"] = bool(
+            plan.get("_want_active") and plan.get("_go_of_fn")
+            and (plan.get("collider2d") or plan.get("rigidbody2d")))
+        if plan["_live_destroy"] or plan["_live_active"]:
             plan["physics2d_live"] = True
         if plan.get("physics2d_live"):
             p("/* Whether a body's GameObject is in the simulation (active, in a")
@@ -17149,7 +17154,7 @@ def _emit_engine_box2d_exports(
             p("    }")
             p("}")
             live = []
-            if _multi_scene(plan):
+            if _multi_scene(plan) or plan.get("_live_active"):
                 live.append("_engine_go_active_in_hierarchy(go)")
             if plan.get("_live_destroy"):
                 live.append("!_engine_go_destroyed[go]")
@@ -18061,6 +18066,8 @@ def emit_engine(plan, analyses, used_apis):
                or _multi_scene(plan))
     plan["physics2d_live"] = _multi_scene(plan)
     plan["_want_destroy"] = bool(want_destroy)
+    plan["_want_active"] = bool(
+        "GameObject.SetActive" in used_apis or authored_inactive)
     rt_apis = (
         "rectTransform.anchoredPosition" in used_apis
         or "rectTransform.sizeDelta" in used_apis)
