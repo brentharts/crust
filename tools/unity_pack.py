@@ -5671,25 +5671,40 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
         f["name"] for f in (cl.get("fields") or [])
         if f.get("ty") == "Transform"]
     vec2_fields = set(cl.get("vec2_fields") or [])
-    if not transform_fields:
+    # receivers: (pattern, owner class C name, field, owner index)
+    recvs = [(r"(?<![_\w.])%s" % re.escape(f), idn, f, "i")
+             for f in transform_fields]
+    classes = plan.get("classes") or {}
+    for other in sorted(set(plan.get("singleton_instance_types") or ())
+                        & set(classes)):
+        oidn = _c_ident(other)
+        if other not in text and oidn not in text:
+            continue
+        for f in classes[other].get("fields") or []:
+            if f.get("ty") == "Transform" and not f.get("static"):
+                recvs.append((
+                    r"(?:(?<![\w.])%s\s*\.\s*[Ii]nstance\s*\.\s*%s\b|"
+                    r"(?<![\w.])%s_get_%s\(\s*%s_Instance\(\)\s*\))" % (
+                        re.escape(other), re.escape(f["name"]), oidn,
+                        re.escape(f["name"]), oidn),
+                    oidn, f["name"], "%s_Instance()" % oidn))
+    if not recvs:
         return text
 
     out = []
     i = 0
     while i < len(text):
         found = None
-        for fname in transform_fields:
-            pat = (r"(?<![_\w])%s\s*\.\s*SetWorldScale\s*\("
-                   % re.escape(fname))
-            m = re.search(pat, text[i:])
+        for pat0, oidn, fname, ix in recvs:
+            m = re.search(pat0 + r"\s*\.\s*SetWorldScale\s*\(", text[i:])
             if not m:
                 continue
             if found is None or m.start() < found[0]:
-                found = (m.start(), m.end(), fname)
+                found = (m.start(), m.end(), fname, oidn, ix)
         if not found:
             out.append(text[i:])
             break
-        start_rel, end_rel, fname = found
+        start_rel, end_rel, fname, oidn, ix = found
         abs_start = i + start_rel
         abs_open = i + end_rel - 1
         out.append(text[i:abs_start])
@@ -5724,6 +5739,16 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
                 if len(parts) >= 3:
                     sx, sy, sz = parts[0], parts[1], parts[2]
         if sx is None:
+            # `Vector3.one[.SetX(e)]`
+            om = re.match(r"(?s)^(?:Vector[23]\s*\.\s*one|Vector2_make\(\s*1\.f"
+                          r"\s*,\s*1\.f\s*\))\s*(\.\s*SetX\s*\()?", arg_s)
+            if om and not om.group(1) and om.end() == len(arg_s):
+                sx, sy, sz = "1.f", "1.f", "1.f"
+            elif om and om.group(1):
+                ax = _match_call_args(arg_s, om.end() - 1)
+                if ax and not arg_s[ax[1]:].strip():
+                    sx, sy, sz = ax[0].strip(), "1.f", "1.f"
+        if sx is None:
             out.append(text[abs_start:after])
             i = after
             continue
@@ -5738,11 +5763,13 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
                         "%s_get_%s_y(i)" % (idn, vf), sz)
         out.append(
             "_engine_set_world_scale("
-            "_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i], "
+            "_%s_%s_target_class[%s], (unsigned)_%s_%s_target_inst[%s], "
             "(%s), (%s), (%s))" % (
-                idn, fname, idn, fname, sx, sy, sz))
+                oidn, fname, ix, oidn, fname, ix, sx, sy, sz))
         i = after
     text = "".join(out)
+    if not transform_fields:
+        return text
 
     # field.localScale = new Vector3(x, y, z): _engine_set_world_scale writes
     # the target's local scale table (the name is SetWorldScale's).
@@ -18825,7 +18852,11 @@ def emit_engine(plan, analyses, used_apis):
             p("            _%s_scale_y[ti] = sy;" % idn)
             p("        }")
             p("        break;")
-        p("    default: break;")
+        p("    default:")
+        p('        fprintf(stderr, "SetWorldScale / localScale of a Transform'
+          ' whose scale crust does not keep live is not lowered; stopping'
+          ' rather than skipping it\\n");')
+        p("        exit(70);")
         p("    }")
         p("}")
         p("static float _engine_get_local_scale(int tc, unsigned ti, int y) {")

@@ -1095,6 +1095,38 @@ class TestVector2FieldAssign(unittest.TestCase):
         self.assertIn("v 4 2", out)
 
 
+class TestSetWorldScaleOne(unittest.TestCase):
+    """`trs.SetWorldScale(Vector3.one.SetX(x))` on a Transform field and
+    `Hook.instance.trs.SetWorldScale(Vector3.one)` (Slime Jump's DoUpdate)."""
+
+    @needs_cc
+    def test_field_and_singleton(self):
+        ext = ("using UnityEngine;\npublic static class Extensions {\n"
+               "    public static Vector3 SetX(this Vector3 v, float x) "
+               "{ v.x = x; return v; }\n"
+               "    public static void SetWorldScale(this Transform t, Vector3 s)"
+               " { t.localScale = s; }\n}\n")
+        hook = ("using UnityEngine;\npublic class Hook : MonoBehaviour {\n"
+                "    public static Hook instance;\n    public Transform trs;\n"
+                "    void Awake() { instance = this; }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public Transform colliderTrs;\n    public float xSize = 2f;\n"
+               "    void Update() {\n"
+               "        colliderTrs.SetWorldScale(Vector3.one.SetX(xSize));\n"
+               "        Hook.instance.trs.SetWorldScale(Vector3.one);\n    }\n}\n")
+        log = ("using UnityEngine;\npublic class Log : MonoBehaviour {\n"
+               "    void LateUpdate() { Debug.Log(name + \" \" + Mathf.RoundToInt("
+               "transform.localScale.x * 10f) + \" \" + Mathf.RoundToInt("
+               "transform.localScale.y * 10f)); }\n}\n")
+        root = project(self, {"Extensions": ext, "Hook": hook, "Mgr": mgr,
+                              "Log": log}, [
+            ("Mgr", None, "  colliderTrs: {fileID: 121}\n  xSize: 2\n"),
+            ("Hook", None, "  trs: {fileID: 131}\n"), ("Log",), ("Log",)])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertIn("Log2 20 10", out)
+        self.assertIn("Log3 10 10", out)
+
+
 class TestInheritedUpdatables(unittest.TestCase):
     """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
     `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class
