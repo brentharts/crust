@@ -7260,6 +7260,12 @@ def _default_arg_c(expr, ty=None):
         return "1"
     if e == "false":
         return "0"
+    fl = {"float.NegativeInfinity": "(-INFINITY)",
+          "float.PositiveInfinity": "INFINITY",
+          "float.MaxValue": "3.40282347e+38f",
+          "float.MinValue": "(-3.40282347e+38f)"}.get(re.sub(r"\s+", "", e))
+    if fl:
+        return fl
     if re.fullmatch(r'"(?:[^"\\\n]|\\.)*"', e):
         return e
     if e in ("null", "default") and ty and not ty.endswith("?"):
@@ -7335,8 +7341,10 @@ def _call_with_defaults(args, params):
     return ", ".join(out)
 
 
-def _fill_defaults_after(text, sym, params):
-    """Fill missing default arguments in every ``sym(...)`` call in *text*."""
+def _fill_defaults_after(text, sym, params, receiver=False):
+    """Fill missing default arguments in every ``sym(...)`` call in *text*
+    (*receiver*: an instance method's, whose first argument is the
+    receiver's index)."""
     if not any(prm.default is not None for prm in params):
         return text
     out = []
@@ -7350,7 +7358,15 @@ def _fill_defaults_after(text, sym, params):
         args, end = _match_call_args(text, open_i)
         if end <= open_i:
             break
-        new_args = _call_with_defaults(args, params)
+        if receiver:
+            parts = cs2cpp.split_call_args(args) if args.strip() else []
+            new_args = args if not parts else ", ".join(
+                [parts[0]] + ([_call_with_defaults(", ".join(parts[1:]),
+                                                   params)]
+                              if len(parts) > 1 or params else []))
+            new_args = cs2cpp.lower_float_literals(new_args.rstrip(", "))
+        else:
+            new_args = _call_with_defaults(args, params)
         out.append(text[pos:open_i + 1])
         out.append(new_args)
         out.append(")")
@@ -25421,6 +25437,15 @@ def _late_call_members(text, plan):
            for f in c.get("fields") or []
            if f.get("ty") in _GO_HANDLE_FIELD_TYPES
            and not f.get("static") and not f.get("const")}
+    for cn, methods in (plan.get("_methods_by") or {}).items():
+        for _c, m in methods:
+            prms = cs2cpp.parse_params(m.get("args") or "")
+            if m.get("static") or not any(
+                    prm.default is not None for prm in prms):
+                continue
+            text = _fill_defaults_after(text, _method_c_symbol(
+                _c_ident(cn), m["name"], m.get("args") or "", False), prms,
+                receiver=True)
     return _call_suffix_sub(
         text, gos,
         r"\s*\.\s*gameObject\b(?:\s*\.\s*(activeSelf\b|SetActive\s*\())?"
