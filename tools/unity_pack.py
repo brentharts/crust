@@ -6061,10 +6061,56 @@ def _rewrite_static_ref_arrays(text, cl, plan):
 def _nre_at_expr(site, line):
     """C expr that raises Unity-style NullReferenceException at *line*."""
     return (
-        "_engine_null_reference_at(%s, %s, %s, %d)"
+        "_engine_null_reference_at(%s, %s, %s, %d, 0)"
         % (_c_string(site["class"]), _c_string(site["method"]),
            _c_string(site["path"]), int(line))
     )
+
+
+def _nre_line_sites(line, site, ln, syms):
+    """One emitted body line (C# line *ln*: the lowering keeps lines): an
+    instance accessor in *syms* called on a receiver other than `i` checks
+    it for null first (`_engine_nn`), and every NRE on the line reports
+    script, line and column. The column is the receiver's in the C# line
+    (`affectedByVortex` of `affectedByVortex.velocity.x`), else the
+    statement's first character.
+
+    ponytail: a line the lowering moved reports the line it landed on."""
+    src = (site.get("file_text") or "").split("\n")
+    cs = src[ln - 1] if 0 < ln <= len(src) else ""
+    first = len(cs) - len(cs.lstrip()) + 1
+
+    def col_of(member):
+        for mem in (member, re.sub(r"_[xyz]$", "", member)):
+            for m in re.finditer(r"((?:[A-Za-z_]\w*\s*(?:\(\s*\))?\s*\.\s*)+)"
+                                 r"%s\b" % re.escape(mem), cs):
+                return m.start(1) + 1
+        return first
+
+    head = "%s, %s, %s, %d" % (_c_string(site["class"]),
+                               _c_string(site["method"]),
+                               _c_string(site.get("path") or "<cs>"), ln)
+    # for `_site_stops`, once every helper is emitted
+    line = "%s /*@site %s @cs %s*/" % (line, head, cs.replace("*/", "* /"))
+    line = re.sub(r"_engine_null_reference_at\(\"[^\"]*\", \"[^\"]*\", "
+                  r"\"[^\"]*\", -?\d+, 0\)",
+                  lambda m: "_engine_null_reference_at(%s, %d)" % (head, first),
+                  line)
+    calls = [m for m in re.finditer(r"(?<![\w.])(\w+)\(", cs2cpp._blank(line))
+             if m.group(1) in syms]
+    for m in reversed(calls):
+        scan = cs2cpp._blank(line)
+        close = _match_close(scan, m.end() - 1, "(", ")")
+        if close is None:
+            continue
+        args = cs2cpp.split_call_args(line[m.end():close])
+        if not args or args[0].strip() == "i":
+            continue
+        a = m.end() + line[m.end():close].index(args[0])
+        b = a + len(args[0])
+        line = "%s_engine_nn(%s, %s, %d)%s" % (
+            line[:a], args[0], head, col_of(syms[m.group(1)]), line[b:])
+    return line
 
 
 def _rewrite_find_getcomponent(text, plan, this_class, site=None):
@@ -9962,10 +10008,13 @@ def _emit_engine_gameobject_tables(
     p("static int _engine_in_script = 0;")
     p("static void _engine_null_reference_at(")
     p("    const char *cls, const char *method,")
-    p("    const char *path, int line) {")
+    p("    const char *path, int line, int col) {")
     p("    fprintf(stderr, \"NullReferenceException: Object reference "
       "not set to an instance of an object\\n\");")
-    p("    if (cls && method && path && path[0] && line > 0)")
+    p("    if (cls && method && path && path[0] && line > 0 && col > 0)")
+    p("        fprintf(stderr, \"%s.%s () (at %s:%d:%d)\\n\",")
+    p("                cls, method, path, line, col);")
+    p("    else if (cls && method && path && path[0] && line > 0)")
     p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
     p("                cls, method, path, line);")
     p("    else if (cls && method)")
@@ -9973,7 +10022,11 @@ def _emit_engine_gameobject_tables(
     p("    if (_engine_in_script)")
     p("        longjmp(_engine_script_jmp, 1);")
     p("}")
-    p("")
+    p(_NRE_GUARDS % ("_engine_null_reference_at(cls, method, path, line, col);"
+                     "\n        exit(70);",
+                     "_engine_null_reference_at(0, 0, 0, 0, 0);\n"
+                     "        exit(70);"))
+    plan["_nre_ix"] = True
     if want_add_any:
         p("static void _engine_cant_add_component("
           "const char *comp, int go) {")
@@ -13768,14 +13821,57 @@ def _emit_engine_static_collections(_emitted_coll, p, plan):
     return _emitted_coll
 
 
+# `_engine_nn(r, site)`: a receiver the body checks, with its C# site;
+# `_engine_nre_ix(i)`: the `_AT` backstop, a null nothing checked first.
+# %s: what each does on null (raise and unwind, or report and stop).
+_NRE_GUARDS = """static int _engine_nn(int r, const char *cls, const char *method,
+                      const char *path, int line, int col) {
+    if (r < 0) {
+        %s
+    }
+    return r;
+}
+static unsigned _engine_nre_ix(unsigned i) {
+    if (i == 4294967295u) {
+        %s
+    }
+    return i;
+}
+"""
+
+_NRE_REPORT = ('fprintf(stderr, "NullReferenceException: Object reference '
+               'not set to an instance of an object\\n");')
+
+
+def _at_macro(idn, plan):
+    pre = ""
+    if not plan.get("_nre_ix"):
+        # no GameObject tables: no script unwinding to skip the method with
+        plan["_nre_ix"] = True
+        pre = _NRE_GUARDS % (
+            _NRE_REPORT + '\n        fprintf(stderr, "%s.%s () (at %s:%d:%d)'
+            '\\n", cls, method, path, line, col);\n        exit(70);',
+            _NRE_REPORT + "\n        exit(70);")
+    return pre + "#define %s_AT(i) (_%s_inst_array[_engine_nre_ix(i)])" % (
+        idn, idn)
+
+
 def _emit_engine_class_groups(
         class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
         want_go_tables):
     """emit_engine: Per-class groups: instance arrays, accessors, statics and script methods."""
+    nn_syms = {}
+    for _cn, _cl in plan["classes"].items():
+        _members = [m[0] for m in _cl.get("members") or []]
+        if _cl.get("soa_dims"):
+            _members += ["pos_x", "pos_y", "pos_z"]
+        for _mn in _members:
+            for _acc in ("get", "set"):
+                nn_syms["%s_%s_%s" % (_c_ident(_cn), _acc, _mn)] = _mn
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
-        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (idn, idn))
+        p(_at_macro(idn, plan))
         p("")
         # Position accessors: SoA table or AoS fields.
         if cl.get("soa_dims"):
@@ -13999,9 +14095,10 @@ def _emit_engine_class_groups(
                         else "Vector2_make(0.f, 0.f)" if rty == "Vector2"
                         else "0"))
             else:
-                for line in body.split("\n"):
+                for j, line in enumerate(body.split("\n")):
                     if line.strip():
-                        p("    " + line.rstrip())
+                        p("    " + _nre_line_sites(
+                            line.rstrip(), site, cs_line + j, nn_syms))
             p("}")
             p("")
 
@@ -17415,6 +17512,7 @@ def _emit_engine_class_draws(
 def emit_engine(plan, analyses, used_apis):
     lines = []
     p = lines.append
+    plan.pop("_nre_ix", None)
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
@@ -18839,7 +18937,7 @@ def emit_engine(plan, analyses, used_apis):
                     _handle_targets.add(_other)
     for _other in sorted(_handle_targets):
         _oidn = _c_ident(_other)
-        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (_oidn, _oidn))
+        p(_at_macro(_oidn, plan))
     if _handle_targets:
         p("")
 
@@ -24441,6 +24539,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 text)
         text = cs2cpp.code_sub(r"(?<![\w.])__sprite_fx\s*\(", "engine_set_sprite_effect(",
                                text)
+    if "__nre(" in text:
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])__nre\s*\(", "(void)_engine_nn(-1, %s, %s, %s, " % (
+                _c_string(site.get("class") or cl["name"]),
+                _c_string(site.get("method") or ""),
+                _c_string(site.get("path") or "")), text)
     # (before the null comparisons: `gp == null` is the connected flag)
     text = _lower_gamepad(text)
     if collision2d_param:

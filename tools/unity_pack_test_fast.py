@@ -927,6 +927,46 @@ public class Mgr : MonoBehaviour {
         self.assertIn("embedded struct", str(cm.exception))
 
 
+class TestNullFieldRead(unittest.TestCase):
+    """`other.v` through a null reference (Slime Jump's unset
+    `affectedByVortex.velocity`) read out of bounds; it is Unity's NRE.
+    This pack has no script unwinding, so it stops (exit 70) before the
+    `read` log."""
+
+    @needs_cc
+    def test_nre_stops(self):
+        o = ("using UnityEngine;\npublic class O : MonoBehaviour {\n"
+             "    public Vector2 v;\n}\n")
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public O other;\n    int f;\n"
+             "    void Update() {\n        f++;\n"
+             "        Debug.Log(\"tick \" + f);\n"
+             "        float x = other.v.x;\n"
+             "        Debug.Log(\"read \" + x);\n    }\n}\n")
+        root = project(self, {"O": o, "A": a}, [("A", None, "  other: {fileID: 0}\n"),
+                                                ("O",)])
+        out = pack(self, root)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f;\n"
+                    "  engine_tick(); engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe,
+                            os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 70, run.stderr[-2000:])
+        self.assertIn("NullReferenceException", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:8:19)", run.stderr)
+        self.assertIn("tick 1", run.stdout)
+        self.assertNotIn("read", run.stdout)
+
+
 class TestInheritedUpdatables(unittest.TestCase):
     """Slime Jump's update loop: `UpdateWhileEnabled.OnEnable` registers in
     `GM.updatables`, and the pack dispatches `DoUpdate` on each. A class
