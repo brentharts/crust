@@ -234,7 +234,9 @@ index, and its fields are properties over the same packed arrays the lowered
 code uses (`tools/unity_pack_hybrid.py`, the managed `UnityEngine` is
 `tools/unity_pack_managed/UnityShim.cs`). Instance and static methods and
 overloads cross the boundary, with number and bool parameters and returns;
-`transform.position` (2D classes read z as 0), `transform.rotation` /
+`transform.position` (the world one, composed through script parents by the
+engine's own helpers; 2D classes read z as 0), `localPosition`, `parent` (null
+test) and `SetParent(null)`, `transform.rotation` /
 `eulerAngles` / `Rotate` / `LookAt` (over the engine's rotation arrays; a class
 with none is declined at pack time) and the `Time` members the
 engine declares (`deltaTime`, `time`, `fixedDeltaTime`, ...) are the engine's
@@ -242,7 +244,24 @@ own. The managed `UnityEngine` also has the plain-math types, written to
 Unity's definitions and checked against hand-worked Unity answers on DNA
 (`TestManagedShim`): `Mathf`, `Vector2/3/4`, `Vector2Int` / `Vector3Int`,
 `Quaternion` (ZXY Euler, `LookRotation`, `Slerp`, ...), `Color`, `Rect`,
-`Bounds`. `Vector2` parameters and returns cross the boundary (as two floats, and a
+`Bounds`. The project's own plain classes, structs, enums and static utilities that
+managed code names (and the ones those name) are compiled into the managed
+assembly from their own source; a helper the shim cannot build leaves the
+method as it was. Other script objects are managed handles too: a field of a script class's type
+(`public Holder target;`, with identity and the null test), its fields,
+its lowered methods and its `transform`; `GetComponent<T>()` on the object or on
+a `GameObject`; `gameObject`, `GameObject.Find("literal")`, `activeSelf` /
+`SetActive`; and `Screen.width` / `height`. Whatever the engine has no function
+for (it emits them for code that uses them) is left out, so code that wants it
+stays lowered with the reason. `Random` (`Range` of ints and floats, `value`, `InitState`) is the engine's own
+generator, so managed and lowered code draw one sequence; the packer is asked
+to emit it when only managed code uses it. `Camera.main` (`orthographicSize`, `transform.position`, the clip planes) and
+`RenderSettings.ambientLight` and `Physics.gravity` / `Physics2D.gravity` are the
+engine's own globals, reads and writes;
+the camera's transform is position only. `Input` is the engine's own: `GetAxis` of its axes, `GetButton` / `Down` / `Up`
+of its buttons, and keys (`GetKey` / `GetKeyDown` / `GetKeyUp`, by `KeyCode`
+-- letters, digits, Space -- or by name; the packer lowers only `GetKey("a")`,
+so the rest run only managed, over a latch put at the top of each tick). `Vector2` parameters and returns cross the boundary (as two floats, and a
 two-float result slot). Not yet: `Vector3` (the packer itself has no value for
 it) / object parameters and returns, and the engine-backed parts of UnityEngine (Transform
 hierarchy, `Camera`, `RenderSettings`, `Input`, physics): a class
