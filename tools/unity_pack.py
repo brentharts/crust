@@ -4747,6 +4747,23 @@ def _new_budget(analyses, plan):
     return budget
 
 
+#: spare GameObjects each `new GameObject(..)` call site of a class may make, per instance of that class (the count is data-driven
+#: when a loop makes them, so the cap is a promise like [MaxInstances]: the call returns -1 once the pool is full)
+_NEW_GO_POOL = 64
+
+
+def _newgo_budget(analyses, plan):
+    """Spare GameObject slots for ``new GameObject(..)``: `_NEW_GO_POOL` for each call site of each instance of the calling class."""
+    total = 0
+    class_n = {n: int(cl.get("n") or 0) for n, cl in (plan.get("classes") or {}).items()}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            n = max(1, class_n.get(c["name"], 1) or 1)
+            bodies = cs2cpp._blank("\n".join(m.get("body") or "" for m in c.get("methods") or []))
+            total += len(re.findall(r"(?<![\w.])new\s+(?:UnityEngine\s*\.\s*)?GameObject\s*\(", bodies)) * n * _NEW_GO_POOL
+    return total
+
+
 def _static_new_fields(fields, classes):
     """{name: class} of the `static T f = new T();` fields of a packed T."""
     return {f["name"]: f["ty"].split(".")[-1] for f in fields or ()
@@ -5353,6 +5370,32 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
     return text
 
 
+def _rewrite_new_gameobject(text):
+    """``new GameObject(name)`` → ``GameObject_New(name)`` (``new GameObject()``: named "GameObject"); the extra constructor arguments
+    (component types) are dropped.  ``new GameObject("x").AddComponent<T>()`` chains onto the new index as any GameObject does."""
+    pat = r"(?<![\w.])new\s+(?:UnityEngine\s*\.\s*)?GameObject\s*\("
+    out, pos = [], 0
+    for m in list(re.finditer(pat, cs2cpp._blank(text))):
+        if m.start() < pos:
+            continue
+        got = _match_call_args(text, m.end() - 1)
+        if not got:
+            continue
+        args, end = got
+        parts = cs2cpp._split_top_level(args) if args.strip() else []
+        name = parts[0].strip() if parts and not parts[0].strip().startswith("typeof") else '"GameObject"'
+        chain = re.match(r"\s*\.\s*AddComponent\s*<\s*(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)", text[end:])
+        if chain:
+            out += [text[pos:m.start()], "GameObject_AddComponent_%s(GameObject_New(%s))" % (_c_ident(chain.group(1)), name)]
+            pos = end + chain.end()
+        else:
+            # (a GameObject is its own Transform here: `.transform` / `.gameObject` of the new object is the index)
+            tail = re.match(r"\s*\.\s*(?:transform|gameObject)\b", text[end:])
+            out += [text[pos:m.start()], "GameObject_New(%s)" % name]
+            pos = end + (tail.end() if tail else 0)
+    return "".join(out) + text[pos:]
+
+
 def _rewrite_addcomponent(text, plan, this_class, go_vars=()):
     """Lower gameObject.AddComponent<T>() / AddComponent<T>() to C helpers.
 
@@ -5384,6 +5427,8 @@ def _rewrite_addcomponent(text, plan, this_class, go_vars=()):
     gos = set(go_vars) | set(re.findall(
         r"(?<![\w.])(?:UnityEngine\s*\.\s*)?GameObject\s+(\w+)\s*[=;]",
         cs2cpp._blank(text)))
+    # (a GameObject local is an `int` by now: the ones `new GameObject` / Find made are GameObject indices)
+    gos |= set(re.findall(r"(?<![\w.])int\s+(\w+)\s*=\s*GameObject_(?:New|Find)\s*\(", cs2cpp._blank(text)))
     gos -= {"this", "gameObject"}
     if gos:
         def repl_var(m):
@@ -13353,6 +13398,24 @@ def _emit_engine_instantiate(
         want_get_sibling, want_go_tables, want_inst_parent, want_instantiate,
         want_set_parent, want_transform_parent, want_ui):
     """emit_engine: Object.Instantiate, after the GameObject and parent tables."""
+    if plan.get("newgo_budget") and want_go_tables:
+        p("/* new GameObject(name): the next spare GameObject slot (-1 once they are all taken) */")
+        p("static int GameObject_New(const char *name) {")
+        p("    int go;")
+        p("    if (_engine_go_count >= _engine_go_cap) return -1;")
+        p("    go = _engine_go_count;")
+        p("    _engine_go_count = _engine_go_count + 1;")
+        p("    _engine_go_name[go] = name;")
+        if want_ui:
+            p("    _engine_go_active_init();")
+            p("    _engine_go_active[go] = 1;")
+        if want_destroy:
+            p("    _engine_go_destroyed[go] = 0;")
+        if _multi_scene(plan):
+            p("    _engine_go_scene[go] = _engine_scene_active;")
+        p("    return go;")
+        p("}")
+        p("")
     if want_instantiate and want_go_tables:
         go_names_i = plan.get("go_names") or []
         go_cap_i = max(1, len(go_names_i) + go_spawn_budget)
@@ -14361,6 +14424,8 @@ def _emit_engine_class_groups(
                            "ret": (m.get("ret") or "void").strip(),
                            "body": m.get("body") or "", "scalar": hy_ok,
                            "static": bool(m.get("static")),
+                           "src_path": m.get("path") or c.get("path"),
+                           "cls": m.get("inherited_from") or cname,
                            "overloaded": m["name"] in overloaded}
                 if why is None:
                     plan.setdefault("_hybrid_methods", {}).setdefault(
@@ -15415,7 +15480,7 @@ def _emit_engine_world_positions(
             _emit_godot_spawn(class_ids, p, plan)
 
         if want_set_parent and want_go_tables:
-            go_n = max(1, len(plan.get("go_names") or []))
+            go_n = max(1, len(plan.get("go_names") or []) + int(plan.get("instantiate_go_budget") or 0))
             pos_classes = [
                 (cname, class_ids[cname], _c_ident(cname))
                 for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1])
@@ -15547,7 +15612,7 @@ def _emit_engine_world_positions(
 
 def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
     """emit_engine: world position / rotation through a Transform handle."""
-    go_n = max(1, len(plan.get("go_names") or []))
+    go_n = max(1, len(plan.get("go_names") or []) + int(plan.get("instantiate_go_budget") or 0))
     p("/* Transform.DetachChildren: SetParent(null) keeping world position. */")
     p("static void Transform_DetachChildren(int go) {")
     p("    int c;")
@@ -15555,11 +15620,20 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
     p("    for (c = 0; c < %d; c = c + 1)" % go_n)
     p("        if (_engine_go_parent[c] == go) Transform_SetParent(c, -1, 1);")
     p("}")
+    bare = bool(plan.get("newgo_budget"))
+    if bare:
+        # a GameObject no script or component sits on keeps its position here (a `new GameObject("Level")`)
+        p("static float _engine_go_bare_pos[%d][3];" % go_n)
     if want_vector2:
         p("static Vector2 Transform_get_position2(int go) {")
         p("    int c = -1;")
         p("    unsigned n = 0u;")
         p("    float x = 0.f, y = 0.f, z = 0.f;")
+        if bare:
+            p("    if (!_engine_go_xf(go, &c, &n)) {")
+            p("        if (go >= 0 && go < %d) return Vector2_make(_engine_go_bare_pos[go][0], _engine_go_bare_pos[go][1]);" % go_n)
+            p("        return Vector2_make(0.f, 0.f);")
+            p("    }")
         p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
         p("    return Vector2_make(x, y);")
         p("}")
@@ -15570,6 +15644,12 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    unsigned n = 0u;")
         p("    float px = 0.f, py = 0.f, pz = 0.f;")
         p("    if (go < 0 || go >= %d) return;" % go_n)
+        if bare:
+            p("    if (!_engine_go_xf(go, &c, &n)) {")
+            p("        _engine_go_bare_pos[go][0] = v.x; _engine_go_bare_pos[go][1] = v.y; _engine_go_bare_pos[go][2] = wz;")
+            p("        return;")
+            p("    }")
+            p("    c = -1; n = 0u;")
         p("    if (_engine_go_parent[go] >= 0")
         p("        && _engine_go_xf(_engine_go_parent[go], &c, &n))")
         p("        _engine_world_pos(c, n, &px, &py, &pz, 0);")
@@ -15589,6 +15669,8 @@ def _emit_engine_transform_handles(p, plan, want_vector2, want_live_rot):
         p("    int c = -1;")
         p("    unsigned n = 0u;")
         p("    float x = 0.f, y = 0.f, z = 0.f;")
+        if bare:
+            p("    if (!_engine_go_xf(go, &c, &n) && go >= 0 && go < %d) z = _engine_go_bare_pos[go][2];" % go_n)
         p("    if (_engine_go_xf(go, &c, &n)) _engine_world_pos(c, n, &x, &y, &z, 0);")
         p("    Transform_set_position2_z(go, v, z);")
         p("}")
@@ -18167,6 +18249,7 @@ def emit_engine(plan, analyses, used_apis):
         or want_getcomponent or want_findobject
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy
         or want_instantiate or want_gcic or want_live_rt
+        or bool(plan.get("newgo_budget"))
         # `name` reads the object's GameObject name (_lower_own_name)
         or "MonoBehaviour.name" in used_apis
         # a mesh draws while its GameObject is active (unity_pack_mesh)
@@ -18174,7 +18257,7 @@ def emit_engine(plan, analyses, used_apis):
         # SpriteEffects2D: effects are per GameObject
         or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0]))
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
-    if want_inst_parent or want_gcic:
+    if want_inst_parent or want_gcic or plan.get("newgo_budget"):
         want_set_parent = True
         want_transform_parent = True
         want_go_tables = True
@@ -19574,7 +19657,7 @@ def emit_engine(plan, analyses, used_apis):
 
     # Live Transform hierarchy (m_Father): world = parent_world + local.
     # SetParent also needs these tables (mutable) even with no authored parents.
-    want_set_parent = "transform.SetParent" in used_apis
+    want_set_parent = "transform.SetParent" in used_apis or bool(plan.get("newgo_budget"))
     _emit_engine_world_positions(
             class_ids, p, plan, want_get_sibling, want_go_tables, want_set_parent)
     if want_set_parent and want_go_tables:
@@ -20496,7 +20579,8 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
         text = cs2cpp.code_sub(
             pat + r"\s*\.\s*(?:gameObject|transform)\b",
             lambda m, e=expr: e, text)
-    trs = [(pat, expr) for pat, expr, ty in recvs if ty == "Transform"]
+    # (a GameObject variable is the same index: `g.transform.position` was made `g.position` just above)
+    trs = [(pat, expr) for pat, expr, ty in recvs if ty in ("Transform", "GameObject")]
     if trs:
         text = _rewrite_transform_handle_trs(text, trs, site)
     return text
@@ -20508,6 +20592,8 @@ _TRANSFORM_HANDLE_PROTOS = {
         "static void Transform_set_position2(int go, Vector2 v);",
     "Transform_set_position2_keepz":
         "static void Transform_set_position2_keepz(int go, Vector2 v);",
+    "Transform_set_position2_z":
+        "static void Transform_set_position2_z(int go, Vector2 v, float wz);",
     "Transform_DetachChildren": "static void Transform_DetachChildren(int go);",
     "Transform_get_rotation": "static Quaternion Transform_get_rotation(int go);",
     "Transform_set_rotation":
@@ -20569,9 +20655,17 @@ def _rewrite_transform_handle_trs(text, trs, site=None):
         args, after = got
         tail = re.match(r"\s*\)\s*;" if m.group(2) else r"\s*;", text[after:])
         xyz = cs2cpp._split_top_level(args)
-        if not tail or len(xyz) != 3 or not re.fullmatch(
-                r"\(?\s*%s\s*\.\s*position\s*\.\s*z\s*\)?" % re.escape(m.group(1)),
-                xyz[2].strip()):
+        if not tail or len(xyz) != 3:
+            continue
+        if not re.fullmatch(r"\(?\s*%s\s*\.\s*position\s*\.\s*z\s*\)?" % re.escape(m.group(1)), xyz[2].strip()):
+            # an explicit z: the world position is set whole (the packed z is kept per object)
+            if re.search(r"\bposition\b", xyz[0] + xyz[1] + xyz[2]):
+                continue
+            out += [text[pos:m.start()], "Transform_set_position2_z(%s, Vector2_make(%s, %s), %s);"
+                    % (e(m.group(1)), xyz[0].strip(), xyz[1].strip(), xyz[2].strip())]
+            pos = after + tail.end()
+            if site is not None:
+                site.setdefault("protos", set()).add(_TRANSFORM_HANDLE_PROTOS["Transform_set_position2_z"])
             continue
         out += [text[pos:m.start()], "Transform_set_position2_keepz(%s, Vector2_make(%s, %s));"
                 % (e(m.group(1)), xyz[0].strip(), xyz[1].strip())]
@@ -22023,7 +22117,8 @@ def _plan_needs_vector2(plan, used_apis=None):
             or "rectTransform.sizeDelta" in used_apis
             or "Rect.PointToNormalized" in used_apis):
         return True
-    if plan and (plan.get("live_rt") or plan.get("physics2d_contacts")):
+    if plan and (plan.get("live_rt") or plan.get("physics2d_contacts")
+                 or plan.get("newgo_budget")):      # (a new object's position goes through the transform handles)
         return True
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2_fields"):
@@ -25572,6 +25667,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_local_types(text, _packed_model(plan))
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
+    if plan.get("newgo_budget"):
+        text = _rewrite_new_gameobject(text)
     text, add_locals = _rewrite_addcomponent(
         text, plan, cl["name"],
         go_vars={prm.name for prm in cs2cpp.parse_params(
@@ -28914,6 +29011,8 @@ def pack(root, outdir, *args, **kwargs):
                         files[fp] = f.read()
                 except (OSError, UnicodeDecodeError):
                     pass
+    _common.SOURCE_ORIGINAL.clear()
+    _common.SOURCE_ORIGINAL.update({os.path.abspath(fp): txt for fp, txt in files.items()})
     # SpriteEffects2D.Set / Clear (the 2D path's effect byte): rewritten
     # before the static helpers are copied into their callers
     _fx_changed = []
@@ -29204,6 +29303,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
          if (plan["classes"].get(cname) or {}).get("max_instances") is not None
          else int(v))
         for cname, v in (plan["instantiate_budget"] or {}).items())
+    # `new GameObject(..)` takes a slot of the same table
+    plan["newgo_budget"] = _newgo_budget(analyses, plan)
+    plan["instantiate_go_budget"] += plan["newgo_budget"]
     plan["instantiate_types"] = sorted(plan["instantiate_budget"] or {})
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
     fot_types = set()

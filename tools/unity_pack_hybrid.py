@@ -197,6 +197,20 @@ def _words(text):
 
 # ---- the managed class of a script ----------------------------------------------------------------------------------------------------
 
+def _const_literal(f):
+    """the C# literal of a constant field the packer parsed (`const float TIME = 1;`), or None"""
+    v, t = f.get("default"), f.get("ty")
+    if t not in SCALAR or v is None or isinstance(v, (str, list, dict, tuple)):
+        return None
+    if t == "bool":
+        return "true" if v else "false"
+    if t in ("float", "double"):
+        return "%s%s" % (repr(float(v)), "f" if t == "float" else "")
+    if isinstance(v, float) and not float(v).is_integer():
+        return None
+    return str(int(v)) + ("L" if t == "long" else "")
+
+
 class ClassGen(object):
     """The managed C# of one script class, and what it needs from the engine."""
 
@@ -217,14 +231,22 @@ class ClassGen(object):
         self.words = set()
         self.find_names = set()
         self.uses_go = False
+        self.xf_fields = []
+        self.uses_rb2d = False
         self.go_components = []
         self.src = self._build()
 
     # a managed property for each field the engine has accessors for
     def _field(self, f):
         t = f["ty"]
+        if t == VEC2:
+            return self._vec2_field(f)
+        if t == "Transform":
+            return self._transform_field(f)
+        if t == "Rigidbody2D":
+            return self._rigidbody_field(f)
         a = self.acc.get(f["name"])
-        handle = t in self.class_names and a is not None and a[0] == "int" and a[1] == "int" and f["name"] in self._used
+        handle =t in self.class_names and a is not None and a[0] == "int" and a[1] == "int" and f["name"] in self._used
         if (t not in FIELD_TYPES and not handle) or a is None or a[1] is None:
             return None
         gt, st = a
@@ -246,6 +268,47 @@ class ClassGen(object):
         mt = SCALAR[t][0]
         sc = "(%s)" % ("uint" if ACCESSOR_FFI[st] == "uint" else "int" if ACCESSOR_FFI[st] == "int" else "float")
         return "    public %s %s { get { return (%s)HybridNative.%s(__i); } set { HybridNative.%s(__i, %svalue); } }" % (mt, n, mt, get_ex, set_ex, sc)
+
+    def _vec2_field(self, f):
+        """an embedded Vector2 field: the engine keeps it as two floats with accessors `Class_get_f_x/_y` and `Class_set_f_x/_y`"""
+        n = f["name"]
+        ax, ay = self.acc.get(n + "_x"), self.acc.get(n + "_y")
+        if not all(a and a[0] == "float" and a[1] == "float" for a in (ax, ay)):
+            return None
+        for c in "xy":
+            self.natives["ccs_x_%s_get_%s_%s" % (self.name, n, c)] = ("float", ["uint"], "float ccs_x_%s_get_%s_%s(unsigned i) { return %s_get_%s_%s(i); }" % (self.name, n, c, self.name, n, c))
+            self.natives["ccs_x_%s_set_%s_%s" % (self.name, n, c)] = ("void", ["uint", "float"], "void ccs_x_%s_set_%s_%s(unsigned i, float v) { %s_set_%s_%s(i, v); }" % (self.name, n, c, self.name, n, c))
+        g = lambda c: "HybridNative.ccs_x_%s_get_%s_%s(__i)" % (self.name, n, c)
+        s = lambda c: "HybridNative.ccs_x_%s_set_%s_%s(__i, value.%s);" % (self.name, n, c, c)
+        return "    public %s %s { get { return new %s(%s, %s); } set { %s %s } }" % (VEC2, n, VEC2, g("x"), g("y"), s("x"), s("y"))
+
+    def _rigidbody_field(self, f):
+        """a `Rigidbody2D` field: an int handle into the engine's Box2D-backed arrays (-1 for none), as a managed Rigidbody2D (_rigidbody2d_class)"""
+        n, c = f["name"], self.name
+        a = self.acc.get(n)
+        if not (a and a == ("int", "int")) or not re.search(r"^static void Rigidbody2D_set_velocity\(int rb,", self.engine, re.M):
+            return None
+        self.uses_rb2d = True
+        get_ex, set_ex = "ccs_x_%s_get_%s" % (c, n), "ccs_x_%s_set_%s" % (c, n)
+        self.natives[get_ex] = ("int", ["uint"], "int %s(unsigned i) { return %s_get_%s(i); }" % (get_ex, c, n))
+        self.natives[set_ex] = ("void", ["uint", "int"], "void %s(unsigned i, int v) { %s_set_%s(i, v); }" % (set_ex, c, n))
+        return ("    public UnityEngine.Rigidbody2D %s {\n        get { return UnityEngine.Rigidbody2D.__Wrap(HybridNative.%s(__i)); }\n"
+                "        set { HybridNative.%s(__i, value == null ? -1 : value.__rb); }\n    }" % (n, get_ex, set_ex))
+
+    def _transform_field(self, f):
+        """a `Transform` field the packer resolved to an object (`_Class_f_target_class[i]` / `_target_inst[i]`: -1 for none): a read-only
+        property giving a Transform of that object, whose position is the world one (`_engine_world_pos` / `_engine_set_world`, as the lowered
+        code uses).  Only position: _build declines code that asks such a transform for anything else."""
+        n, e, c = f["name"], self.engine, self.name
+        if n not in self._used or not re.search(r"^extern const int _%s_%s_target_class\[" % (re.escape(c), re.escape(n)), e, re.M):
+            return None
+        if not re.search(r"^static void _engine_world_pos\(int class_id, unsigned inst,[^;{]*\) \{", e, re.M):
+            return None
+        self.xf_fields.append(n)
+        self.natives["ccs_x_%s_%s_tc" % (c, n)] = ("int", ["uint"], "int ccs_x_%s_%s_tc(unsigned i) { return _%s_%s_target_class[i]; }" % (c, n, c, n))
+        self.natives["ccs_x_%s_%s_ti" % (c, n)] = ("int", ["uint"], "int ccs_x_%s_%s_ti(unsigned i) { return (int)_%s_%s_target_inst[i]; }" % (c, n, c, n))
+        return ("    public UnityEngine.Transform %s { get { int c = HybridNative.ccs_x_%s_%s_tc(__i); "
+                "return c < 0 ? null : new __TargetTransform(c, HybridNative.ccs_x_%s_%s_ti(__i)); } }" % (n, c, n, c, n))
 
     def _rotation_storage(self):
         """Does the engine keep a rotation for this class (`_Class_rot_x/y/z/w[i]` and the basis `_Class_rot_m00..m11[i]`), and the helper that sets
@@ -335,7 +398,15 @@ class ClassGen(object):
         self.refs = (used & set(self.class_names)) - {name}
         props, unreachable = [], []
         for f in cl.get("fields") or []:
-            if f.get("static") or f.get("const"):
+            if f.get("const"):
+                # a constant is its value, in the managed class too (when the packer parsed it: a number or a bool)
+                lit = _const_literal(f)
+                if lit is not None:
+                    props.append("    public const %s %s = %s;" % (SCALAR[f["ty"]][0], f["name"], lit))
+                elif f["name"] in used:
+                    unreachable.append("const %s %s" % (f["ty"], f["name"]))
+                continue
+            if f.get("static"):
                 continue
             line = self._field(f)
             if line is not None:
@@ -345,6 +416,13 @@ class ClassGen(object):
         if unreachable:
             self.problem = ("the method uses %s, which the packed engine stores in a form managed code cannot reach yet"
                             % ", ".join("`%s`" % u for u in unreachable))
+            return ""
+        if self.xf_fields and (ROTATION_WORDS | {"localPosition", "parent", "SetParent", "localScale", "lossyScale", "childCount"}) & used:
+            self.problem = ("the method uses a Transform field (%s) and asks a transform for more than its position, which the managed shim "
+                            "cannot give for another object yet" % ", ".join(self.xf_fields))
+            return ""
+        if self.xf_fields and not _has_set_world(self.engine) and re.search(r"\.\s*position\s*[-+*/]?=(?!=)", bodies):
+            self.problem = "the method moves a Transform field's object, and the packed engine has no world-position setter for it"
             return ""
         transform = self._transform()
         if transform is None and "transform" in used:
@@ -670,6 +748,103 @@ def _gameobject_class(gens, engine, natives):
             + "\n".join(members) + "\n    }\n}\n")
 
 
+def _rigidbody2d_class(engine, natives):
+    """UnityEngine.Rigidbody2D over the engine's Rigidbody2D_* functions and arrays.  A member the engine has no function for is left out, so
+    code that wants it does not build (and keeps its lowered C); the engine's own functions ignore a missing body, as the lowered code relies on."""
+    has = lambda n: re.search(r"^static [a-z]+ %s\(" % re.escape(n), engine, re.M) is not None
+    m = []
+
+    def prop(name, mt, getter, setter, gc, sc, conv_in="", conv_out=""):
+        # a property over Rigidbody2D_get_<x> / Rigidbody2D_set_<x>
+        if not (has("Rigidbody2D_get_" + getter) and has("Rigidbody2D_set_" + setter)):
+            return
+        natives["ccs_x_rb_get_" + getter] = (gc, ["int"], "%s ccs_x_rb_get_%s(int rb) { return Rigidbody2D_get_%s(rb); }" % ({"float": "float", "int": "int"}[gc], getter, getter))
+        natives["ccs_x_rb_set_" + setter] = ("void", ["int", sc], "void ccs_x_rb_set_%s(int rb, %s v) { Rigidbody2D_set_%s(rb, v); }" % (setter, sc, setter))
+        m.append("        public %s %s { get { return %s; } set { %s; } }" % (
+            mt, name, conv_out % ("HybridNative.ccs_x_rb_get_%s(__rb)" % getter), "HybridNative.ccs_x_rb_set_%s(__rb, %s)" % (setter, conv_in % "value")))
+    prop("mass", "float", "mass", "mass", "float", "float", "%s", "%s")
+    prop("gravityScale", "float", "gravityScale", "gravityScale", "float", "float", "%s", "%s")
+    prop("drag", "float", "drag", "drag", "float", "float", "%s", "%s")
+    prop("linearDamping", "float", "drag", "drag", "float", "float", "%s", "%s")
+    prop("rotation", "float", "rotation", "rotation", "float", "float", "%s", "%s")
+    prop("angularVelocity", "float", "angularVelocity", "angularVelocity", "float", "float", "%s", "%s")
+    prop("freezeRotation", "bool", "freezeRotation", "freezeRotation", "int", "int", "(%s ? 1 : 0)", "(%s != 0)")
+    prop("isKinematic", "bool", "isKinematic", "isKinematic", "int", "int", "(%s ? 1 : 0)", "(%s != 0)")
+    prop("bodyType", "RigidbodyType2D", "bodyType", "bodyType", "int", "int", "(int)%s", "(RigidbodyType2D)%s")
+    if has("Rigidbody2D_set_velocity") and "_Rigidbody2D_vel_x" in engine:
+        natives["ccs_x_rb_vel"] = ("float", ["int", "int"], "float ccs_x_rb_vel(int rb, int axis) { if (!(rb >= 0 && _rb2d_ok(rb))) return 0.f; return axis == 0 ? _Rigidbody2D_vel_x[rb] : _Rigidbody2D_vel_y[rb]; }")
+        natives["ccs_x_rb_set_vel"] = ("void", ["int", "float", "float"], "void ccs_x_rb_set_vel(int rb, float x, float y) { Rigidbody2D_set_velocity(rb, x, y); }")
+        for nme in ("linearVelocity", "velocity"):
+            m.append("        public Vector2 %s { get { return new Vector2(HybridNative.ccs_x_rb_vel(__rb, 0), HybridNative.ccs_x_rb_vel(__rb, 1)); }\n"
+                     "            set { HybridNative.ccs_x_rb_set_vel(__rb, value.x, value.y); } }" % nme)
+    if has("Rigidbody2D_position_x") and has("Rigidbody2D_set_position"):
+        natives["ccs_x_rb_pos"] = ("float", ["int", "int"], "float ccs_x_rb_pos(int rb, int axis) { return axis == 0 ? Rigidbody2D_position_x(rb) : Rigidbody2D_position_y(rb); }")
+        natives["ccs_x_rb_set_pos"] = ("void", ["int", "float", "float"], "void ccs_x_rb_set_pos(int rb, float x, float y) { Rigidbody2D_set_position(rb, x, y); }")
+        m.append("        public Vector2 position { get { return new Vector2(HybridNative.ccs_x_rb_pos(__rb, 0), HybridNative.ccs_x_rb_pos(__rb, 1)); }\n"
+                 "            set { HybridNative.ccs_x_rb_set_pos(__rb, value.x, value.y); } }")
+        # (the engine moves a body by setting its position, as the lowered code does)
+        m.append("        public void MovePosition(Vector2 p) { HybridNative.ccs_x_rb_set_pos(__rb, p.x, p.y); }")
+    if has("Rigidbody2D_AddForce"):
+        natives["ccs_x_rb_force"] = ("void", ["int", "float", "float", "int"], "void ccs_x_rb_force(int rb, float x, float y, int mode) { Rigidbody2D_AddForce(rb, x, y, mode); }")
+        m.append("        public void AddForce(Vector2 f, ForceMode2D mode) { HybridNative.ccs_x_rb_force(__rb, f.x, f.y, (int)mode); }")
+        m.append("        public void AddForce(Vector2 f) { HybridNative.ccs_x_rb_force(__rb, f.x, f.y, 0); }")
+    if has("Rigidbody2D_AddTorque"):
+        natives["ccs_x_rb_torque"] = ("void", ["int", "float", "int"], "void ccs_x_rb_torque(int rb, float t, int mode) { Rigidbody2D_AddTorque(rb, t, mode); }")
+        m.append("        public void AddTorque(float t, ForceMode2D mode) { HybridNative.ccs_x_rb_torque(__rb, t, (int)mode); }")
+        m.append("        public void AddTorque(float t) { HybridNative.ccs_x_rb_torque(__rb, t, 0); }")
+    return ("namespace UnityEngine\n{\n    public enum ForceMode2D { Force = 0, Impulse = 1 }\n"
+            "    public enum RigidbodyType2D { Dynamic = 0, Kinematic = 1, Static = 2 }\n"
+            "    public class Rigidbody2D\n    {\n        public readonly int __rb;\n        Rigidbody2D(int rb) { __rb = rb; }\n"
+            "        static Rigidbody2D[] __all = new Rigidbody2D[8];\n"
+            "        public static Rigidbody2D __Wrap(int rb)\n        {\n            if (rb < 0) return null;\n"
+            "            if (rb >= __all.Length) {\n                Rigidbody2D[] bigger = new Rigidbody2D[rb * 2 + 8];\n"
+            "                for (int k = 0; k < __all.Length; k++) bigger[k] = __all[k];\n                __all = bigger;\n            }\n"
+            "            if (__all[rb] == null) __all[rb] = new Rigidbody2D(rb);\n            return __all[rb];\n        }\n"
+            + "\n".join(m) + "\n    }\n}\n")
+
+
+def _keyboard_class(engine, natives):
+    """UnityEngine.InputSystem.Keyboard over the engine's own `Keyboard_<name>Key_isPressed()` (and wasPressed/ReleasedThisFrame) functions: the
+    keys some script of the project names (the packer emits exactly those).  `Keyboard.current` is null while the host says no keyboard is
+    connected, as in the lowered code."""
+    keys = sorted(set(re.findall(r"^static int Keyboard_(\w+)Key_isPressed\(void\)", engine, re.M)))
+    if not keys or not re.search(r"^static EngineKeyboard \*Keyboard_current\(void\)", engine, re.M):
+        return None
+    natives["ccs_x_kb_connected"] = ("int", [], "int ccs_x_kb_connected(void) { return Keyboard_current() != 0; }")
+    arms = "".join("case %d: if (what == 0) return Keyboard_%sKey_isPressed(); if (what == 1) return Keyboard_%sKey_wasPressedThisFrame(); "
+                   "if (what == 2) return Keyboard_%sKey_wasReleasedThisFrame(); return 0; " % (k, key, key, key) for k, key in enumerate(keys))
+    natives["ccs_x_kb"] = ("int", ["int", "int"], "int ccs_x_kb(int k, int what) { switch (k) { %sdefault: return 0; } }" % arms)
+    props = "\n".join("        public KeyControl %sKey { get { return __keys[%d]; } }" % (key, k) for k, key in enumerate(keys))
+    return ("namespace UnityEngine.InputSystem\n{\n    public class KeyControl\n    {\n        readonly int k;\n        public KeyControl(int k) { this.k = k; }\n"
+            "        public bool isPressed { get { return HybridNative.ccs_x_kb(k, 0) != 0; } }\n"
+            "        public bool wasPressedThisFrame { get { return HybridNative.ccs_x_kb(k, 1) != 0; } }\n"
+            "        public bool wasReleasedThisFrame { get { return HybridNative.ccs_x_kb(k, 2) != 0; } }\n    }\n"
+            "    public class Keyboard\n    {\n        static Keyboard __one = new Keyboard();\n        static KeyControl[] __keys = new KeyControl[] { %s };\n"
+            "        public static Keyboard current { get { return HybridNative.ccs_x_kb_connected() != 0 ? __one : null; } }\n%s\n    }\n}\n"
+            % (", ".join("new KeyControl(%d)" % k for k in range(len(keys))), props))
+
+
+def _has_set_world(engine):
+    return re.search(r"^static void _engine_set_world\(int c, unsigned i, float wx, float wy, float wz\) \{", engine, re.M) is not None
+
+
+def _target_transform_class(natives, engine):
+    """the Transform of a Transform field's object (a class id and an instance): world position through the engine's own helpers"""
+    natives["ccs_x_xf_get"] = ("float", ["int", "int", "int"],
+                               "float ccs_x_xf_get(int c, int inst, int axis) { float x, y, z; _engine_world_pos(c, (unsigned)inst, &x, &y, &z, 0); return axis == 0 ? x : axis == 1 ? y : z; }")
+    can_set = _has_set_world(engine)
+    if can_set:
+        natives["ccs_x_xf_set"] = ("void", ["int", "int", "float", "float", "float"],
+                                   "void ccs_x_xf_set(int c, int inst, float x, float y, float z) { _engine_set_world(c, (unsigned)inst, x, y, z); }")
+    nope = "throw new System.NotSupportedException(\"the managed shim keeps only the position of another object's transform\");"
+    return ("public class __TargetTransform : UnityEngine.Transform\n{\n    readonly int c, inst;\n    public __TargetTransform(int c, int inst) { this.c = c; this.inst = inst; }\n"
+            "    public override UnityEngine.Vector3 position {\n        get { return new UnityEngine.Vector3(HybridNative.ccs_x_xf_get(c, inst, 0), HybridNative.ccs_x_xf_get(c, inst, 1), HybridNative.ccs_x_xf_get(c, inst, 2)); }\n"
+            "        set { %s }\n    }\n"
+            "    public override UnityEngine.Vector3 localPosition { get { %s } set { %s } }\n"
+            "    public override UnityEngine.Quaternion rotation { get { %s } set { %s } }\n}\n"
+            % ("HybridNative.ccs_x_xf_set(c, inst, value.x, value.y, value.z);" if can_set else nope, nope, nope, nope, nope))
+
+
 def managed_source(gens, time_names):
     natives = {}
     parts = ["using System;\nusing UnityEngine;\n"]
@@ -690,6 +865,15 @@ def managed_source(gens, time_names):
         scn = _scene_class(gens[0].engine, natives)
         if scn:
             body.append(scn)
+        if any("Keyboard" in g.words for g in gens):
+            kb = _keyboard_class(gens[0].engine, natives)
+            if kb:
+                body.append(kb)
+                parts[0] += "using UnityEngine.InputSystem;\n"
+        if any(g.uses_rb2d for g in gens):
+            body.append(_rigidbody2d_class(gens[0].engine, natives))
+        if any(g.xf_fields for g in gens):
+            body.append(_target_transform_class(natives, gens[0].engine))
     body += [g.src for g in gens]
     parts.append(_native_decls(natives))
     parts += body
@@ -775,10 +959,71 @@ def ffi_manifest(natives):
         {"library": "ccs_native", "entry": ex, "ret": natives[ex][0], "args": list(natives[ex][1])} for ex in sorted(natives)]}
 
 
+# ---- a method's own source ----------------------------------------------------------------------------------------------------------------
+
+def original_body(path, cname, mname, nparams):
+    """The body of method *mname* (with *nparams* parameters) of class *cname*, as written in the project's file *path*, before the packer's source
+    rewrites (extension calls, collections, coroutines, input actions ...) -- or None when it is not there exactly once."""
+    import tools.unity_pack_common as common
+    import tools.cs2cpp as cs2cpp
+    text = common.SOURCE_ORIGINAL.get(os.path.abspath(path)) if path else None
+    if not text:
+        return None
+    scan = cs2cpp._blank(text)
+    m = re.search(r"\bclass\s+%s\b[^{;]*\{" % re.escape(cname), scan)
+    if not m:
+        return None
+    end, depth = None, 0
+    for k in range(m.end() - 1, len(scan)):
+        if scan[k] == "{":
+            depth += 1
+        elif scan[k] == "}":
+            depth -= 1
+            if depth == 0:
+                end = k
+                break
+    if end is None:
+        return None
+    region = scan[m.end():end]
+    hits = []
+    for h in re.finditer(r"(?<![\w.])%s\s*\(([^()]*)\)\s*(?:where[^{;]*)?\{" % re.escape(mname), region):
+        params = h.group(1).strip()
+        if (0 if not params else params.count(",") + 1) != nparams:
+            continue
+        hits.append(h)
+    if len(hits) != 1:
+        return None
+    start = m.end() + hits[0].end()
+    depth = 1
+    for k in range(start, end):
+        if scan[k] == "{":
+            depth += 1
+        elif scan[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:k]
+    return None
+
+
+def with_original_bodies(cands):
+    """the candidates with each body replaced by the method's own source where that can be found (the rest as they were)"""
+    out, changed = [], False
+    for c in cands:
+        body = original_body(c.get("src_path"), c.get("cls") or "", c["name"], len(c["params"])) if c.get("src_path") and c.get("cls") else None
+        if body is not None and body != c["body"]:
+            c = dict(c, body=body)
+            changed = True
+        out.append(c)
+    return out if changed else None
+
+
 # ---- project helper classes ---------------------------------------------------------------------------------------------------------------
 
 _TYPE_DECL = re.compile(r"\b(?:class|struct|enum|interface)\s+([A-Za-z_]\w*)")
 _ENGINE_BASES = re.compile(r":\s*(?:[\w.<>, ]*,\s*)?(?:MonoBehaviour|ScriptableObject|StateMachineBehaviour|Editor|EditorWindow)\b")
+
+
+_EXTENSION_DECL = re.compile(r"\bstatic\s+[\w<>\[\],.?]+(?:\s*<[^>]*>)?\s+(\w+)\s*(?:<[^>]*>)?\s*\(\s*this\s")
 
 
 def project_helpers(root, script_classes, bodies):
@@ -803,6 +1048,11 @@ def project_helpers(root, script_classes, bodies):
             continue
         for n in names:
             declared.setdefault(n, path)
+    # an extension method (`v.SetX(1f)`) names no class: the file that declares one of that name is needed too
+    for path, text in files.items():
+        if path in declared.values():
+            for m in _EXTENSION_DECL.finditer(text):
+                declared.setdefault(m.group(1), path)
     need, todo = [], _words(bodies)
     seen = set()
     while todo:
@@ -875,22 +1125,30 @@ def apply(plan, engine, outdir, report_stub, progress=lambda m: None):
     os.makedirs(outdir, exist_ok=True)
     work = os.path.join(outdir, "hybrid_work")
     os.makedirs(work, exist_ok=True)
-    gens = {}
+    gens, variants = {}, {}
     root = plan.get("_root")
     script_classes = set(plan["classes"] if not isinstance(plan["classes"], list) else [c["name"] for c in plan["classes"]])
     for cname, cands in sorted(cands_by_class.items()):
         cl = next(c for c in plan["classes"] if c["name"] == cname) if isinstance(plan["classes"], list) else plan["classes"][cname]
-        gens[cname] = ClassGen(plan, engine, cl, cands, methods.get(cname, []))
-        gens[cname].helpers = project_helpers(root, script_classes, "\n".join(c["body"] for c in cands)) if root else []
-        for h in gens[cname].helpers:
-            with open(h, encoding="utf-8-sig") as f:
-                gens[cname].words |= _words(f.read())
+        # the methods' own source first (the packer's rewrites of it are for lowering to C), then the rewritten text the lowering took
+        variants[cname] = []
+        for vc in (with_original_bodies(cands), cands):
+            if vc is None:
+                continue
+            g = ClassGen(plan, engine, cl, vc, methods.get(cname, []))
+            g.helpers = project_helpers(root, script_classes, "\n".join(c["body"] for c in vc)) if root else []
+            for h in g.helpers:
+                with open(h, encoding="utf-8-sig") as f:
+                    g.words |= _words(f.read())
+            variants[cname].append(g)
+        gens[cname] = variants[cname][-1]
     # the script classes a managed class names are managed classes as well (handles on their indexes, fields over their accessors, their lowered
     # methods through the bridge): "peers", built from the engine alone, with every word any managed code uses
     all_used = set()
-    for g in gens.values():
-        all_used |= g.words
-        all_used |= g._used
+    for gs in variants.values():
+        for g in gs:
+            all_used |= g.words
+            all_used |= g._used
     peers = {}
 
     def peer(cname):
@@ -911,25 +1169,64 @@ def apply(plan, engine, outdir, report_stub, progress=lambda m: None):
         return seen
 
     good = []
-    for cname, g in sorted(gens.items()):
+
+    def check(g, tag):
+        """(ok, note): does the managed class of *g* (with the peers it needs) compile?"""
         if g.problem:
-            notes[cname] = g.problem
-            continue
+            return False, g.problem
         need = sorted(needed(g))
         bad_peer = next((c for c in need if peer(c).problem), None)
         if bad_peer:
-            notes[cname] = "the managed code names %s, which cannot be a managed class: %s" % (bad_peer, peer(bad_peer).problem)
-            continue
+            return False, "the managed code names %s, which cannot be a managed class: %s" % (bad_peer, peer(bad_peer).problem)
         text, _n = managed_source([g] + [peer(c) for c in need], g.time)
-        src = os.path.join(work, "check_%s.cs" % cname)
+        src = os.path.join(work, "check_%s.cs" % tag)
         with open(src, "w") as f:
             f.write(text)
-        ok, msg = compile_managed([SHIM, src] + g.helpers, os.path.join(work, "check_%s.dll" % cname), corlib)
+        ok, msg = compile_managed([SHIM, src] + g.helpers, os.path.join(work, "check_%s.dll" % tag), corlib)
         if ok:
-            good.append(cname)
+            return True, None
+        errs = [l for l in msg.splitlines() if "error" in l]
+        return False, "the managed code does not compile: " + (re.sub(r"^.*?\):\s*", "", errs[0]) if errs else msg.strip()[:160])
+
+    for cname in sorted(gens):
+        note = None
+        for g in variants[cname]:
+            ok, why = check(g, cname)
+            if ok:
+                gens[cname] = g
+                good.append(cname)
+                note = None
+                break
+            note = note or why
+        if cname not in good and len(variants[cname][0].cands) > 1:
+            # the class as a whole does not build: the methods that do, one by one, still can (the rest keep their lowered C or their stub)
+            cl = next(c for c in plan["classes"] if c["name"] == cname) if isinstance(plan["classes"], list) else plan["classes"][cname]
+            passing = []
+            for k in range(len(variants[cname][0].cands)):
+                for vi, vg in enumerate(variants[cname]):
+                    one = ClassGen(plan, engine, cl, [vg.cands[k]], methods.get(cname, []))
+                    one.helpers = project_helpers(root, script_classes, vg.cands[k]["body"]) if root else []
+                    ok, why = check(one, "%s_%d" % (cname, k))
+                    if ok:
+                        passing.append(vg.cands[k])
+                        break
+                else:
+                    progress("managed: %s.%s stays lowered: %s" % (cname, variants[cname][0].cands[k]["name"], why))
+            if passing:
+                g = ClassGen(plan, engine, cl, passing, methods.get(cname, []))
+                g.helpers = sorted({h for c in passing for h in (project_helpers(root, script_classes, c["body"]) if root else [])})
+                for h in g.helpers:
+                    with open(h, encoding="utf-8-sig") as f:
+                        g.words |= _words(f.read())
+                ok, why = check(g, cname + "_part")
+                if ok:
+                    gens[cname] = g
+                    good.append(cname)
+                    note = None
+        if cname not in good:
+            notes[cname] = note
         else:
-            errs = [l for l in msg.splitlines() if "error" in l]
-            notes[cname] = "the managed code does not compile: " + (re.sub(r"^.*?\):\s*", "", errs[0]) if errs else msg.strip()[:160])
+            cands_by_class[cname] = gens[cname].cands
     if not good:
         shutil.rmtree(work, ignore_errors=True)
         return finish(set())

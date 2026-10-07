@@ -235,6 +235,9 @@ def player_display(root):
 #: path -> text a pack reads instead of the file: C# rewritten at the
 #: source level (tools/unity_pack_extensions.py). Set and cleared by pack().
 SOURCE_OVERLAY = {}
+# the project's C# files as they were read, before the source rewrites (desugaring) that make an overlay: path -> text.  The managed (--hybrid)
+# side compiles a method's own source where it can.
+SOURCE_ORIGINAL = {}
 
 #: API names a pack must emit because a static helper class uses them (its
 #: body is inlined or copied into a caller the per-script scan read

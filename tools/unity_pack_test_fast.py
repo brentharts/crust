@@ -1798,7 +1798,7 @@ class _PackHarness(unittest.TestCase):
             raise
         return out, err.getvalue()
 
-    def _play(self, out, frames=4, probe=None, setup="", each=""):
+    def _play(self, out, frames=4, probe=None, setup="", each="", post=""):
         """link the player (DotNetAnywhere in it, if the pack is hybrid) and run `frames` ticks from another directory: it must find its
         managed assembly and corlib.dll beside itself, wherever it is started.  *setup* is C run before the first tick (set an engine_input_ global), *each* before every tick (`f` is the frame, from 1).  *probe* is a C float expression over engine.c's own
         (static) functions, `Spark_get_pos_y(0)`, printed with %.4f after each tick (a list of them: comma-separated): the harness then
@@ -1810,7 +1810,7 @@ class _PackHarness(unittest.TestCase):
                     etext = ef.read()
                 # (the host defines the pointer: a player whose UI ticks needs it)
                 host = "".join("%s;\n" % d.replace("extern ", "", 1) for d in re.findall(r"^extern (?:float|int|unsigned char) engine_pointer_\w+;", etext, re.M))
-                f.write('#include <stdio.h>\n#include "engine.c"\n' + host +
+                f.write('#include <stdio.h>\n#include "engine.c"\n' + host + post +
                         "int main(int argc, char **argv) { int f;\n"
                         "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f; %s\n"
                         '  for (f = 1; f <= %d; f++) { %s engine_tick(); printf("%s\\n", %s); } return 0; }\n'
@@ -1883,6 +1883,106 @@ class TestHybrid(_PackHarness):
         self.assertNotIn("CS8000", err)
         self.assertEqual(self._play(out, 2, ["Spark_get_a(0)", "Spark_get_b(0)"]), ["8.0000,10.0000"] * 2)
 
+    VEC_FIELD = """
+    public Vector2 ms = new Vector2(1f, 1f);
+    public float a;
+    void Update() {
+        ms = new Vector2(ms.x + 1f, ms.y * 2f);
+        a = ms.x + ms.y;
+    }"""
+
+    def test_a_vector2_field_is_a_managed_property_over_its_two_floats(self):
+        """the same class, packed lowered and packed managed, gives the same numbers: the embedded Vector2 reads and writes through its x/y accessors"""
+        probes = ["Spark_get_a(0)", "Spark_get_ms_x(0)", "Spark_get_ms_y(0)"]
+        root = self._project(self._script(self.VEC_FIELD))
+        low, _ = self._pack(root)
+        man, err = self._pack(root, hybrid=True, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(man, 3, probes), self._play(low, 3, probes))
+        self.assertEqual(self._play(man, 3, probes)[2], "12.0000,4.0000,8.0000")
+
+    XF_FIELD = """
+    public Transform gt;
+    public float a;
+    void Update() {
+        gt.position = new Vector3(gt.position.x + 1f, 2f, 0f);
+        a = gt.position.x + gt.position.y;
+    }"""
+
+    def test_a_transform_field_is_the_world_position_of_its_object(self):
+        """a Transform field naming this object: managed code reads and writes its position (the lowered code stubs the write)"""
+        root = self._project(self._script(self.XF_FIELD), "  hp: 5\n  gt: {fileID: 2}\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(out, 3, ["Spark_get_a(0)", "Spark_get_pos_x(0)", "Spark_get_pos_y(0)"]),
+                         ["3.0000,1.0000,2.0000", "4.0000,2.0000,2.0000", "5.0000,3.0000,2.0000"])
+
+    def test_a_transform_field_asked_for_more_than_its_position_stays_lowered(self):
+        root = self._project(self._script("public Transform gt;\npublic float a;\nvoid Update() { a = gt.position.x + gt.localPosition.x; Func<int,int> f = q => q; }"),
+                             "  hp: 5\n  gt: {fileID: 2}\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("Transform field (gt)", err)
+
+    RB_SCRIPT = """
+    public Rigidbody2D rb;
+    public Vector2 ms = new Vector2(2f, 0f);
+    public float a;
+    void Update() {
+        rb.linearVelocity = new Vector2(ms.x, rb.linearVelocity.y);
+        rb.AddForce(new Vector2(0f, 50f), ForceMode2D.Force);
+        rb.gravityScale = 0.5f;
+        rb.mass = 2f;
+        a = rb.mass + rb.position.x + rb.gravityScale;
+    }"""
+
+    def _rb_project(self, script):
+        root = self._project(self._script(script), "  hp: 5\n  rb: {fileID: 4}\n")
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            t = f.read().replace("  - component: {fileID: 3}\n", "  - component: {fileID: 3}\n  - component: {fileID: 4}\n", 1)
+        with open(sc, "w") as f:
+            f.write(t + "--- !u!50 &4\nRigidbody2D:\n  m_GameObject: {fileID: 1}\n  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n")
+        return root
+
+    def test_a_rigidbody2d_field_runs_managed_like_it_runs_lowered(self):
+        """velocity, AddForce, gravityScale, mass and position of a Rigidbody2D, and an embedded Vector2: the same numbers lowered and managed"""
+        root = self._rb_project(self.RB_SCRIPT)
+        low, _ = self._pack(root)
+        man, err = self._pack(root, hybrid=True, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        probes = ["Spark_get_a(0)", "_Rigidbody2D_vel_x[0]", "_Rigidbody2D_vel_y[0]", "Rigidbody2D_position_x(0)", "Rigidbody2D_position_y(0)"]
+        stub = "void engine_box2d_step(void) { }\n"      # (no Box2D in this harness: a body keeps what the script sets)
+        got, want = self._play(man, 12, probes, post=stub), self._play(low, 12, probes, post=stub)
+        self.assertEqual(got, want)
+        self.assertNotEqual(got[-1].split(",")[1], "0.0000", "the velocity was set")
+
+    KB = """
+    public float held; public float pressed; public float conn;
+    void Update() {
+        conn = Keyboard.current == null ? 0f : 1f;
+        if (Keyboard.current == null) return;
+        if (Keyboard.current.spaceKey.isPressed) held += 1f;
+        if (Keyboard.current.spaceKey.wasPressedThisFrame) pressed += 1f;
+        Func<float, float> f = q => q;
+    }"""
+
+    def test_keyboard_current_reads_the_engines_own_key_state(self):
+        """the Input System keyboard in managed code: connected or not, isPressed and wasPressedThisFrame, as the lowered code reads them"""
+        root = self._project("using UnityEngine.InputSystem;\n" + self._script(self.KB))
+        man, err = self._pack(root, hybrid=True, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        probes = ["Spark_get_conn(0)", "Spark_get_held(0)", "Spark_get_pressed(0)"]
+        # no keyboard for the first frame, then it is connected and the space bar is down on frames 3-4 and 6
+        each = "engine_keyboard_connected = f > 1; engine_keyboard_space = (f == 3 || f == 4 || f == 6);"
+        got = self._play(man, 7, probes, each=each)
+        # (the lambda keeps this method from lowering: the numbers are what the same code does lowered, worked out by hand:
+        # held on frames 3, 4, 6; pressed on 3 and 6)
+        self.assertEqual(got[0], "0.0000,0.0000,0.0000")
+        self.assertEqual(got[-1], "1.0000,3.0000,2.0000")
+
     HELPERS = """
     public float a;
     void Update() { a = Calc(3f); }
@@ -1899,6 +1999,22 @@ class TestHybrid(_PackHarness):
         root = self._helper_project(
             "using UnityEngine;\npublic static class Util { public static float Sq(float x) { return x * x; } }\n"
             "public class Acc { float b; public Acc(float b) { this.b = b; } public float Add(float v) { return v + b; } }\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 2, ["Spark_get_a(0)"]), ["14.0000"] * 2)
+
+    def test_an_extension_method_pulls_in_its_file_and_a_tuple_in_it_compiles(self):
+        """`v.Twice()` names no class: the file that declares the extension is compiled in, and a (float, int) method in it builds (ValueTuple)"""
+        root = self._helper_project(
+            "using UnityEngine;\npublic static class Util {\n"
+            "    public static float Sq(this float x) { return x * x; }\n"
+            "    public static (float, int) Pair(float f, int n) { return (f, n); }\n}\n"
+            "public class Acc { float b; public Acc(float b) { this.b = b; } public float Add(float v) { return v + b; } }\n")
+        with open(os.path.join(root, "Assets", "Scripts", "Spark.cs"), "w") as f:
+            f.write(self._script("""
+    public float a;
+    void Update() { a = Calc(3f); }
+    float Calc(float v) { Func<float, float> f = q => q.Sq(); return f(v) + new Acc(2f).Add(v); }"""))
         out, err = self._pack(root, hybrid=True)
         self.assertNotIn("CS8000", err)
         self.assertEqual(self._play(out, 2, ["Spark_get_a(0)"]), ["14.0000"] * 2)
@@ -2259,6 +2375,50 @@ class TestHybrid(_PackHarness):
         self.assertNotIn("stays lowered", err)
         self.assertEqual(self._play(out, 1, ["Spark_get_a(0)"], "Screen_width = 640; Screen_height = 480;"), ["640.4800"])
 
+    PARTIAL = """
+    public float a; public float b;
+    const float K = 3f;
+    void Update() {
+        a += K;
+        Helper();
+        transform.position = new Vector3(a, b, 0f);
+    }
+    void Helper() {
+        if (!Application.isPlaying) a += 100f;
+        b = a * 2f;
+    }"""
+
+    def test_a_class_that_does_not_build_whole_still_moves_the_methods_that_do(self):
+        """Helper uses Application (not in the shim), Update does not: Update runs managed (calling Helper through the bridge, with the
+        constant K as its own), Helper stays lowered, and the numbers are the lowered pack's"""
+        root = self._project(self._script(self.PARTIAL))
+        probe = ["Spark_get_a(0)", "Spark_get_b(0)"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 3, probe)
+        self.assertEqual(want[2], "9.0000,18.0000")
+        managed, err = self._pack(root, managed="*")
+        self.assertIn("managed: Spark.Helper stays lowered", err)
+        self.assertNotIn("Spark.Update stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(managed, 3, probe), want)
+
+    def test_a_methods_own_source_is_found_before_the_packers_rewrites(self):
+        import tools.unity_pack_common as common
+        path = os.path.join(tempfile.gettempdir(), "Orig.cs")
+        text = ("using UnityEngine;\npublic class Orig : MonoBehaviour {\n  int Add(int a, int b) { return a + b; }\n"
+                "  int Add(int a) { return a; }\n  void Go() { if (true) { transform.Rotate(Vector3.up); } }\n}\n"
+                "public class Other { void Go() { } }\n")
+        common.SOURCE_ORIGINAL[os.path.abspath(path)] = text
+        try:
+            self.assertEqual(unity_pack_hybrid.original_body(path, "Orig", "Add", 2).strip(), "return a + b;")
+            self.assertEqual(unity_pack_hybrid.original_body(path, "Orig", "Add", 1).strip(), "return a;")
+            self.assertIn("transform.Rotate(Vector3.up);", unity_pack_hybrid.original_body(path, "Orig", "Go", 0))
+            self.assertIsNone(unity_pack_hybrid.original_body(path, "Orig", "Add", 3))          # (no such overload)
+            self.assertIsNone(unity_pack_hybrid.original_body(path, "Orig", "Missing", 0))
+            self.assertEqual(unity_pack_hybrid.original_body(path, "Other", "Go", 0).strip(), "")  # (the class asked for, not the first)
+        finally:
+            common.SOURCE_ORIGINAL.pop(os.path.abspath(path), None)
+
     def test_a_stub_runs_as_managed_code_over_the_packed_state(self):
         out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True)
         self.assertNotIn("CS8000", err)
@@ -2354,16 +2514,26 @@ class TestHybrid(_PackHarness):
         self.assertEqual(self._play(out), self.LOWERS_OUT)
 
     def test_managed_class_the_shim_cannot_build_stays_lowered(self):
-        # Application.isPlaying lowers to C but the managed UnityEngine has no Application: the class does not build
-        # managed, and is what a plain pack gives, with the reason printed
-        root = self._project(self._script(self.LOWERS.replace("total += hp * 2;", "if (!Application.isPlaying) total += 1; total += hp * 2;")))
+        # Application.isPlaying lowers to C but the managed UnityEngine has no Application: the class (one method) does not build managed, and is
+        # what a plain pack gives, with the reason printed
+        one = """
+    public int hp = 3;
+    public int total;
+    void Update() {
+        hp -= 1;
+        if (!Application.isPlaying) total += 1;
+        total += hp * 2;
+        Debug.Log("hp=" + hp + " total=" + total);
+    }"""
+        root = self._project(self._script(one))
         plain, _err = self._pack(root)
-        self.assertEqual(self._play(plain), self.LOWERS_OUT)
+        want = self._play(plain)
+        self.assertEqual(want[0], "hp=4 total=8")
         out, err = self._pack(root, managed="*")
         self.assertIn("managed: Spark stays lowered: the managed code does not compile", err)
         self.assertIn("Application", err)
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
-        self.assertEqual(self._play(out), self.LOWERS_OUT)
+        self.assertEqual(self._play(out), want)
 
     def test_managed_uses_roslyn_when_ccs_is_built_and_mcs_when_forced(self):
         if unity_pack_hybrid.ccs_dll() is None or shutil.which("mcs") is None:
@@ -2419,16 +2589,15 @@ class TestHybrid(_PackHarness):
         self.assertIn("hybrid:", cm.exception.message)
 
     def test_a_field_the_engine_stores_out_of_reach_is_not_copied(self):
-        # `dir` is a Vector2, which the packed engine keeps in two arrays managed code has no accessor for: a managed copy would silently
+        # `label` is a string, which the packed engine keeps in a table managed code has no accessor for: a managed copy would silently
         # disagree with it, so the class stays a stub
         root = self._project(self._script(
-            "    public Vector2 dir;\n    public int total;\n"
+            "    public string label = \"abc\";\n    public int total;\n"
             "    void Update() { Tally(); Debug.Log(\"total=\" + total); }\n"
-            "    public void Tally() { Func<float, int> f = v => (int)(v * 10f); total = f(dir.x); }"),
-            values="  dir: {x: 2, y: 0}\n")
+            "    public void Tally() { Func<int, int> f = v => v * 10; total = f(label.Length); }"))
         out, err = self._pack(root, hybrid=True)
         self.assertIn("warning CS8000", err)
-        self.assertIn("`Vector2 dir`", err)
+        self.assertIn("`string label`", err)
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
 
     def test_managed_code_calls_a_lowered_method_and_uses_bool_and_float_fields(self):
@@ -2576,6 +2745,75 @@ class TestRotation(_PackHarness):
         g = unity_pack_hybrid.ClassGen({"classes": []}, engine, {"name": "Spark", "fields": []}, [cand], [])
         self.assertIn("rotation", g.problem or "")
         self.assertEqual(g.src, "")
+
+
+@needs_cc
+class TestRuntimeCreation(_PackHarness):
+    """`new GameObject(..)` and `AddComponent<Script>()`: objects a script makes at run time, from the spare slots the packer budgets."""
+
+    KID = "using UnityEngine;\npublic class Kid : MonoBehaviour {\n    public int v;\n    void Update() { v++; }\n}\n"
+
+    def _kid_project(self, spark_members, kid=None):
+        root = self._project(self._script(spark_members), "  hp: 5\n")
+        d = os.path.join(root, "Assets", "Scripts")
+        with open(os.path.join(d, "Kid.cs"), "w") as f:
+            f.write(kid or self.KID)
+        with open(os.path.join(d, "Kid.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            t = f.read()
+        with open(sc, "w") as f:
+            f.write(t + "--- !u!1 &10\nGameObject:\n  m_Name: K\n  m_Component:\n  - component: {fileID: 11}\n  - component: {fileID: 12}\n"
+                    "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &12\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_Script: {fileID: 11500000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n  v: 1\n")
+        return root
+
+    def test_a_new_gameobject_takes_a_component_and_it_runs(self):
+        root = self._kid_project("""
+    public int hp;
+    void Update() {
+        GameObject g = new GameObject("kid");
+        Kid k = g.AddComponent<Kid>();
+        k.v = 3;
+        hp += k.v;
+    }""")
+        out, err = self._pack(root)
+        self.assertNotIn("CS8000", err)
+        # the first frame makes the one spare Kid (3 more on hp) and it ticks from then on; the pool is then full: no more are made
+        got = self._play(out, 3, ["Spark_get_hp(0)", "_Kid_inst_count", "Kid_get_v(1)"])
+        self.assertEqual(got, ["8.0000,2.0000,3.0000", "8.0000,2.0000,4.0000", "8.0000,2.0000,5.0000"])
+
+    def test_a_new_objects_position_through_its_transform(self):
+        """a new object with a component moves that component's row; a bare one keeps a position of its own; both read back"""
+        root = self._kid_project("""
+    public float px;
+    public float qy;
+    void Update() {
+        GameObject g = new GameObject("with");
+        Kid k = g.AddComponent<Kid>();
+        g.transform.position = new Vector3(4f, 5f, 0f);
+        Transform t = new GameObject("bare").transform;
+        t.position = new Vector3(7f, 9f, 0f);
+        px = k.transform.position.x + g.transform.position.x;
+        qy = t.position.y;
+    }""")
+        out, err = self._pack(root)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 1, ["Spark_get_px(0)", "Spark_get_qy(0)", "Kid_get_pos_x(1)", "Kid_get_pos_y(1)"]), ["8.0000,9.0000,4.0000,5.0000"])
+
+    def test_the_chained_form_and_the_name(self):
+        root = self._kid_project("""
+    public int hp;
+    public string n;
+    void Update() {
+        Kid k = new GameObject("chained").AddComponent<Kid>();
+        hp += k.v + 1;
+    }""")
+        out, err = self._pack(root)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 1, ["Spark_get_hp(0)"]), ["6.0000"])
 
 
 class TestLayerMaskAwake(unittest.TestCase):
