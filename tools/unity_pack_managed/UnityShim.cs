@@ -652,7 +652,13 @@ namespace UnityEngine
     {
         public abstract Vector3 position { get; set; }
         public abstract Quaternion rotation { get; set; }
-        public Vector3 localPosition { get { return position; } set { position = value; } }
+        /** the position in the parent's frame (the packed engine stores it so); `position` is the world one, composed through the parents */
+        public abstract Vector3 localPosition { get; set; }
+        /** null for no parent; otherwise a handle that only says there is one (what the packed engine can say of it): `transform.parent == null`,
+            `SetParent(null)`.  A hybrid class whose code uses either is declined at pack time when the engine has not got the functions. */
+        public virtual TransformRef parent { get { throw new System.NotSupportedException("the packed engine has no parent for this class"); } }
+        public virtual void SetParent(TransformRef p, bool worldPositionStays) { throw new System.NotSupportedException("the packed engine has no SetParent for this class"); }
+        public void SetParent(TransformRef p) { SetParent(p, true); }
         public Quaternion localRotation { get { return rotation; } set { rotation = value; } }
         public Vector3 eulerAngles { get { return rotation.eulerAngles; } set { rotation = Quaternion.Euler(value); } }
         public Vector3 localEulerAngles { get { return eulerAngles; } set { eulerAngles = value; } }
@@ -682,10 +688,16 @@ namespace UnityEngine
         public void LookAt(Transform target) { LookAt(target.position, Vector3.up); }
     }
 
+    public class TransformRef { }
+
     public class MonoBehaviour
     {
         /** the object's index in its class's packed arrays: the `i` of every `Class_method(i, ..)` in engine.c */
         public uint __i;
         public Transform transform;
+        /** the component of a script class's name on this object, as the hybrid class generated for it (null for none); generated classes override it
+            for the components the packed engine can find (GetComponent<T>() below goes through it) */
+        public virtual object __component(string typeName) { return null; }
+        public T GetComponent<T>() where T : class { return __component(typeof(T).Name) as T; }
     }
 }
