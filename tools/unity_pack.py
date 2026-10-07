@@ -741,7 +741,7 @@ _UNITY_API = re.compile(
     r"(?<![\w])Application\.Quit|"
     r"File\.(?:WriteAllText|AppendAllText|WriteAllBytes|ReadAllBytes|"
     r"Exists|Delete|CreateText|OpenText|Copy)|"
-    r"Input\.(?:GetAxis|GetButton|GetKey)|"
+    r"Input\.(?:GetAxis|GetButton(?:Down|Up)?|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
     r"transform\.position|Physics2D\.gravity|Physics\.gravity|"
     r"Rigidbody2D|Rigidbody|"
@@ -29402,6 +29402,8 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         strict = _godot.is_godot_project(root)
     plan["strict"] = bool(strict)
     plan["hybrid"] = bool(hybrid)
+    if isinstance(managed, str) and managed != "*":
+        managed = [m for m in managed.split(",") if m]       # ("A,B", as on the command line)
     plan["managed"] = "*" if managed == "*" else (set(managed) if managed else set())
     import tools.unity_pack_common as _common
     used_apis = set(used_apis) | _common.SOURCE_API_HINTS
@@ -29414,6 +29416,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     import tools.unity_pack_hybrid as _hybrid
     if plan.get("hybrid"):
         # a method the lowering left a stub: managed code on DotNetAnywhere where that compiles (tools/unity_pack_hybrid.py)
+        plan["_root"] = root
         engine = _hybrid.apply(plan, engine, outdir, _report_stub, _progress)
     else:
         _hybrid.clean(outdir)

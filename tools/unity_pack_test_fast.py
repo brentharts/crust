@@ -18,6 +18,7 @@ import contextlib
 import io
 import os
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
@@ -1797,19 +1798,23 @@ class _PackHarness(unittest.TestCase):
             raise
         return out, err.getvalue()
 
-    def _play(self, out, frames=4, probe=None):
+    def _play(self, out, frames=4, probe=None, setup="", each=""):
         """link the player (DotNetAnywhere in it, if the pack is hybrid) and run `frames` ticks from another directory: it must find its
-        managed assembly and corlib.dll beside itself, wherever it is started.  *probe* is a C float expression over engine.c's own
+        managed assembly and corlib.dll beside itself, wherever it is started.  *setup* is C run before the first tick (set an engine_input_ global), *each* before every tick (`f` is the frame, from 1).  *probe* is a C float expression over engine.c's own
         (static) functions, `Spark_get_pos_y(0)`, printed with %.4f after each tick (a list of them: comma-separated): the harness then
         includes engine.c itself."""
         with open(os.path.join(out, "harness.c"), "w") as f:
             if probe:
                 probes = [probe] if isinstance(probe, str) else list(probe)
-                f.write('#include <stdio.h>\n#include "engine.c"\n'
+                with open(os.path.join(out, "engine.c")) as ef:
+                    etext = ef.read()
+                # (the host defines the pointer: a player whose UI ticks needs it)
+                host = "".join("%s;\n" % d.replace("extern ", "", 1) for d in re.findall(r"^extern (?:float|int|unsigned char) engine_pointer_\w+;", etext, re.M))
+                f.write('#include <stdio.h>\n#include "engine.c"\n' + host +
                         "int main(int argc, char **argv) { int f;\n"
-                        "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f;\n"
-                        '  for (f = 1; f <= %d; f++) { engine_tick(); printf("%s\\n", %s); } return 0; }\n'
-                        % (frames, ",".join(["%.4f"] * len(probes)), ", ".join("(double)(%s)" % q for q in probes)))
+                        "  engine_apply_argv(argc, argv); Time_deltaTime = 1.f / 60.f; %s\n"
+                        '  for (f = 1; f <= %d; f++) { %s engine_tick(); printf("%s\\n", %s); } return 0; }\n'
+                        % (setup, frames, each, ",".join(["%.4f"] * len(probes)), ", ".join("(double)(%s)" % q for q in probes)))
             else:
                 f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
                         "int main(int argc, char **argv) { int f;\n"
@@ -1877,6 +1882,382 @@ class TestHybrid(_PackHarness):
         out, err = self._pack(self._project(self._script(self.VEC)), hybrid=True)
         self.assertNotIn("CS8000", err)
         self.assertEqual(self._play(out, 2, ["Spark_get_a(0)", "Spark_get_b(0)"]), ["8.0000,10.0000"] * 2)
+
+    HELPERS = """
+    public float a;
+    void Update() { a = Calc(3f); }
+    float Calc(float v) { Func<float, float> f = q => Util.Sq(q); return f(v) + new Acc(2f).Add(v); }"""
+
+    def _helper_project(self, helper_src):
+        root = self._project(self._script(self.HELPERS))
+        with open(os.path.join(root, "Assets", "Scripts", "Util.cs"), "w") as f:
+            f.write(helper_src)
+        return root
+
+    def test_project_helper_classes_are_built_into_the_managed_assembly(self):
+        """Calc is a stub (a lambda) that names a static utility and a plain class from other files: both are compiled in, and it runs."""
+        root = self._helper_project(
+            "using UnityEngine;\npublic static class Util { public static float Sq(float x) { return x * x; } }\n"
+            "public class Acc { float b; public Acc(float b) { this.b = b; } public float Add(float v) { return v + b; } }\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 2, ["Spark_get_a(0)"]), ["14.0000"] * 2)
+
+    def test_a_helper_the_shim_cannot_build_leaves_the_method_a_stub(self):
+        root = self._helper_project(
+            "using UnityEngine;\npublic static class Util { public static float Sq(float x) { return Application.isPlaying ? x * x : 0f; } }\n"
+            "public class Acc { float b; public Acc(float b) { this.b = b; } public float Add(float v) { return v + b; } }\n")
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("warning CS8000", err)
+        self.assertIn("hybrid: the managed code does not compile", err)
+
+    INPUT = """
+    public float a; public float d; public float k;
+    void Update() {
+        a = Input.GetAxis("Horizontal") * 2f;
+        d += Input.GetButtonDown("Jump") ? 10f : 0f;
+        k += Input.GetKey("a") ? 1f : 0f;
+    }"""
+
+    def test_managed_input_reads_the_engines_axes_buttons_and_keys(self):
+        """the same script, lowered and managed: axis 0.5, Jump held from the start (Down on the first frame only), key 'a' held."""
+        root = self._project(self._script(self.INPUT))
+        probe = ["Spark_get_a(0)", "Spark_get_d(0)", "Spark_get_k(0)"]
+        setup = "engine_input_axis_Horizontal = 0.5f; engine_input_button_Jump = 1; engine_input_key['a'] = 1;"
+        want = ["1.0000,10.0000,1.0000", "1.0000,10.0000,2.0000", "1.0000,10.0000,3.0000"]
+        plain, _ = self._pack(root)
+        self.assertEqual(self._play(plain, 3, probe, setup), want)
+        managed, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertEqual(self._play(managed, 3, probe, setup), want)
+
+    CAMERA_SCENE = (
+        "--- !u!1 &9000\nGameObject:\n  m_Name: Main Camera\n  m_Component:\n  - component: {fileID: 9001}\n  - component: {fileID: 9002}\n"
+        "  m_TagString: MainCamera\n--- !u!4 &9001\nTransform:\n  m_GameObject: {fileID: 9000}\n  m_LocalPosition: {x: 1, y: 2, z: -10}\n"
+        "  m_Father: {fileID: 0}\n--- !u!20 &9002\nCamera:\n  m_GameObject: {fileID: 9000}\n  m_Orthographic: 1\n  m_OrthographicSize: 5\n")
+
+    CAMERA = """
+    public float a;
+    void Update() {
+        transform.position = new Vector3(Camera.main.orthographicSize + Camera.main.transform.position.x,
+                                         Camera.main.transform.position.y + Camera.main.nearClipPlane,
+                                         RenderSettings.ambientLight.r + Camera.main.transform.position.z);
+    }"""
+
+    def test_managed_camera_and_ambient_light_read_what_the_lowered_engine_reads(self):
+        root = self._project(self._script(self.CAMERA))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(self.CAMERA_SCENE)
+        probe = ["Spark_get_pos_x(0)", "Spark_get_pos_y(0)", "Spark_get_pos_z(0)"]
+        setup = "RenderSettings_ambient_r = 0.25f;"
+        plain, _ = self._pack(root)
+        want = self._play(plain, 2, probe, setup)
+        self.assertEqual(want[0].split(",")[0], "6.0000")           # (5 + 1: Unity's own answer)
+        managed, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertEqual(self._play(managed, 2, probe, setup), want)
+
+    def test_managed_camera_writes_reach_the_engines_globals(self):
+        body = """
+    public float a;
+    void Update() {
+        Camera.main.orthographicSize = 3f;
+        Camera.main.transform.position = new Vector3(7f, 8f, -9f);
+        RenderSettings.ambientLight = new Color(0.5f, 0.25f, 0.125f);
+        transform.position = new Vector3(0f, 0f, 0f);
+    }"""
+        root = self._project(self._script(body))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(self.CAMERA_SCENE)
+        out, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        got = self._play(out, 1, ["Camera_main_orthographicSize", "Camera_main_pos_x", "Camera_main_pos_y", "Camera_main_pos_z",
+                                  "RenderSettings_ambient_r", "RenderSettings_ambient_g", "RenderSettings_ambient_b"])
+        self.assertEqual(got, ["3.0000,7.0000,8.0000,-9.0000,0.5000,0.2500,0.1250"])
+
+    def test_a_camera_member_the_shim_lacks_leaves_the_method_a_stub(self):
+        body = """
+    public float a;
+    void Update() {
+        a = Camera.main.aspect;
+        transform.position = new Vector3(a, 0f, 0f);
+    }"""
+        root = self._project(self._script(body))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(self.CAMERA_SCENE)
+        out, err = self._pack(root, managed="*")
+        # (the packer cannot lower Camera.main.aspect either: the method stays the stub it was, with the managed reason)
+        self.assertIn("warning CS8000", err)
+        self.assertIn("'Camera' does not contain a definition for 'aspect'", err)
+
+    KEYS = """
+    public float k; public float dn; public float up; public float db;
+    void Update() {
+        if (Input.GetKey(KeyCode.A)) k += 1f;
+        if (Input.GetKeyDown(KeyCode.Space)) dn += 1f;
+        if (Input.GetKeyUp(KeyCode.B)) up += 1f;
+        if (Input.GetKeyDown("b")) db += 1f;
+    }"""
+
+    def test_managed_key_codes_and_key_down_up(self):
+        """KeyCode and GetKeyDown / GetKeyUp are stubs in the lowered pack; managed they work, over a latch run at the top of every tick:
+        A is held throughout, B is pressed on frame 1 and released on 2, space is pressed on 2 and released on 3."""
+        root = self._project(self._script(self.KEYS))
+        out, err = self._pack(root, hybrid=True)
+        self.assertNotIn("stays lowered", err)
+        got = self._play(out, 3, ["Spark_get_k(0)", "Spark_get_dn(0)", "Spark_get_up(0)", "Spark_get_db(0)"],
+                         "engine_input_key['a'] = 1;", "engine_input_key['b'] = (f == 1); engine_input_key[' '] = (f == 2);")
+        self.assertEqual(got, ["1.0000,0.0000,0.0000,1.0000", "2.0000,1.0000,1.0000,1.0000", "3.0000,1.0000,1.0000,1.0000"])
+
+    def _physics_project(self, body):
+        """Spark with a 3D Rigidbody (so the pack has Physics.gravity)"""
+        root = self._project(self._script(body))
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            text = f.read()
+        text = text.replace("  - component: {fileID: 3}\n", "  - component: {fileID: 3}\n  - component: {fileID: 4}\n", 1)
+        with open(sc, "w") as f:
+            f.write(text + "--- !u!54 &4\nRigidbody:\n  m_GameObject: {fileID: 1}\n  m_Mass: 1\n  m_UseGravity: 1\n")
+        return root
+
+    GRAVITY = """
+    public float a;
+    void Update() {
+        a = Physics.gravity.y;
+        transform.position = new Vector3(Physics.gravity.x, a, Physics.gravity.z);
+    }"""
+
+    def test_managed_physics_gravity_reads_the_engines_gravity(self):
+        root = self._physics_project(self.GRAVITY)
+        probe = ["Spark_get_pos_x(0)", "Spark_get_pos_y(0)", "Spark_get_pos_z(0)"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 1, probe, "Physics_gravity_x = 1.5f; Physics_gravity_z = -2.5f;")
+        self.assertEqual(want[0].split(",")[0], "1.5000")
+        managed, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertEqual(self._play(managed, 1, probe, "Physics_gravity_x = 1.5f; Physics_gravity_z = -2.5f;"), want)
+
+    def test_managed_physics_gravity_can_be_set(self):
+        body = """
+    public float a;
+    void Update() {
+        Physics.gravity = new Vector3(1f, -2f, 3f);
+        transform.position = new Vector3(0f, 0f, 0f);
+    }"""
+        out, err = self._pack(self._physics_project(body), managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertEqual(self._play(out, 1, ["Physics_gravity_x", "Physics_gravity_y", "Physics_gravity_z"]), ["1.0000,-2.0000,3.0000"])
+
+    HOLDER = ("--- !u!1 &10\nGameObject:\n  m_Name: Holder\n  m_Component:\n  - component: {fileID: 11}\n  - component: {fileID: 12}\n"
+              "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n  m_LocalPosition: {x: 5, y: 6, z: 0}\n  m_Father: {fileID: 0}\n"
+              "--- !u!114 &12\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+              "  m_Script: {fileID: 11500000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n")
+
+    def _hierarchy_project(self, body):
+        """Spark, at local (1, 2, 0), under Holder (a script object too) at (5, 6, 0)"""
+        root = self._project(self._script(body))
+        s = os.path.join(root, "Assets", "Scripts")
+        with open(os.path.join(s, "Holder.cs"), "w") as f:
+            f.write("using UnityEngine;\npublic class Holder : MonoBehaviour {\n public float n;\n void Update() {\n n += 1f;\n }\n}\n")
+        with open(os.path.join(s, "Holder.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            text = f.read().replace("m_LocalPosition: {x: 0, y: 0, z: 0}", "m_LocalPosition: {x: 1, y: 2, z: 0}\n  m_Father: {fileID: 11}", 1)
+        with open(sc, "w") as f:
+            f.write(text + self.HOLDER)
+        return root
+
+    HIER = """
+    public float a;
+    void Update() {
+        a += 1f;
+        if (transform.parent == null) a += 100f;
+        transform.localPosition = new Vector3(transform.localPosition.x + 1f, 2f, 0f);
+        transform.position = new Vector3(transform.position.x + 1f, 7f, 0f);
+        if (a > 2.5f) transform.SetParent(null);
+    }"""
+
+    def test_managed_transform_hierarchy_matches_the_lowered_engine(self):
+        """position is the world one under a parent, localPosition the local one, parent is null-testable and SetParent(null) detaches:
+        the same script, lowered and managed, over four frames (the object is detached on the third)."""
+        root = self._hierarchy_project(self.HIER)
+        probe = ["Spark_get_pos_x(0)", "Spark_get_pos_y(0)", "Spark_get_a(0)"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 4, probe)
+        self.assertEqual(len(set(want)), 4)               # (it moved every frame)
+        self.assertEqual(want[0].split(",")[2], "1.0000")   # (it has a parent: no +100)
+        managed, err = self._pack(root, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(managed, 4, probe), want)
+
+    def test_a_parent_the_engine_has_no_functions_for_leaves_the_stub(self):
+        """a stub (a lambda) that names transform.parent, in a pack whose engine never emitted the parent functions: declined, not broken"""
+        body = """
+    public float a;
+    void Update() {
+        a += 1f;
+        Probe();
+        transform.position = new Vector3(a, 0f, 0f);
+    }
+    void Probe() {
+        Func<float, float> f = x => x + 1f;
+        if (transform.parent == null) a = f(a);
+    }"""
+        out, err = self._pack(self._project(self._script(body)), hybrid=True)
+        self.assertIn("warning CS8000", err)
+        self.assertIn("hybrid:", err)
+
+    RANDOM = """
+    public float a; public float b; public float c;
+    void Update() {
+        Random.InitState(7 + (int)a);
+        a += 1f;
+        b = Random.value + Random.Range(1, 100);
+        c = Random.Range(0.5f, 2.5f);
+    }"""
+
+    def test_managed_random_draws_the_engines_own_sequence(self):
+        root = self._project(self._script(self.RANDOM))
+        probe = ["Spark_get_a(0)", "Spark_get_b(0)", "Spark_get_c(0)"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 3, probe)
+        self.assertEqual(len(set(want)), 3)
+        managed, err = self._pack(root, managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertEqual(self._play(managed, 3, probe), want)
+
+    def test_random_in_a_stub_pulls_the_engines_generator_in(self):
+        """Roll is a stub (a lambda), and nothing lowered uses Random: the packer is asked for the generator all the same, and managed Roll
+        draws the same numbers as lowered code that calls Random.Range directly."""
+        stub = """
+    public float a; public float b;
+    void Update() {
+        Roll();
+        transform.position = new Vector3(a, b, 0f);
+    }
+    void Roll() {
+        Func<int, int> twice = x => x * 2;
+        Random.InitState(5);
+        a = twice(Random.Range(1, 50)); b = Random.value;
+    }"""
+        direct = """
+    public float a; public float b;
+    void Update() {
+        Random.InitState(5);
+        a = Random.Range(1, 50) * 2; b = Random.value;
+        transform.position = new Vector3(a, b, 0f);
+    }"""
+        probe = ["Spark_get_a(0)", "Spark_get_b(0)"]
+        want = self._play(self._pack(self._project(self._script(direct)))[0], 2, probe)
+        out, err = self._pack(self._project(self._script(stub)), hybrid=True)
+        self.assertNotIn("CS8000", err)
+        self.assertEqual(self._play(out, 2, probe), want)
+
+    REFS = """
+    public Holder target;
+    public float a;
+    void Update() {
+        if (target == null) { a = -1f; return; }
+        a = target.n * 10f;
+        target.Bump(2);
+        target.n = target.n + 0.5f;
+        transform.position = new Vector3(target.transform.position.x, a, 0f);
+    }"""
+
+    def _refs_project(self, body, values="  hp: 5\n  speed: 3\n  target: {fileID: 12}\n"):
+        """Spark holds a reference (m_target) to Holder (a script object at (5, 6, 0))"""
+        root = self._project(self._script(body), values=values)
+        s = os.path.join(root, "Assets", "Scripts")
+        with open(os.path.join(s, "Holder.cs"), "w") as f:
+            f.write("using UnityEngine;\npublic class Holder : MonoBehaviour {\n public float n = 4f;\n public int bump;\n"
+                    " public void Bump(int by) { bump += by; }\n void Update() {\n n += 1f;\n }\n}\n")
+        with open(os.path.join(s, "Holder.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(self.HOLDER)
+        return root
+
+    def test_managed_class_reaches_another_script_object_through_a_field(self):
+        """a handle field: its fields, a lowered method of it, its transform, and the null test, as in the lowered pack"""
+        root = self._refs_project(self.REFS)
+        probe = ["Spark_get_a(0)", "Holder_get_n(0)", "Holder_get_bump(0)", "Spark_get_pos_x(0)"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 3, probe)
+        self.assertEqual(len(set(want)), 3)
+        managed, err = self._pack(root, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(managed, 3, probe), want)
+
+    COMP = """
+    public float a;
+    void Update() {
+        Holder h = GetComponent<Holder>();
+        if (h == null) { a = -1f; return; }
+        a = h.n;
+        h.Bump(1);
+    }"""
+
+    def test_managed_get_component_finds_a_script_on_the_same_object(self):
+        """Holder sits on Spark's object (a second MonoBehaviour); GetComponent<Holder>() is the one the lowered engine finds"""
+        root = self._project(self._script(self.COMP))
+        s = os.path.join(root, "Assets", "Scripts")
+        with open(os.path.join(s, "Holder.cs"), "w") as f:
+            f.write("using UnityEngine;\npublic class Holder : MonoBehaviour {\n public float n = 4f;\n public int bump;\n"
+                    " public void Bump(int by) { bump += by; }\n void Update() {\n n += 1f;\n }\n}\n")
+        with open(os.path.join(s, "Holder.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            text = f.read().replace("  - component: {fileID: 3}\n", "  - component: {fileID: 3}\n  - component: {fileID: 4}\n", 1)
+        with open(sc, "w") as f:
+            f.write(text + "--- !u!114 &4\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n")
+        probe = ["Spark_get_a(0)", "Holder_get_n(0)", "Holder_get_bump(0)"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 3, probe)
+        self.assertEqual(len(set(want)), 3)
+        self.assertNotEqual(want[0].split(",")[0], "-1.0000")
+        managed, err = self._pack(root, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(managed, 3, probe), want)
+
+    FIND = """
+    public float a;
+    void Update() {
+        GameObject h = GameObject.Find("Holder");
+        if (h == null) { a = -1f; return; }
+        Holder c = h.GetComponent<Holder>();
+        a = c.n;
+        c.Bump(1);
+        if (gameObject.activeSelf) a += 100f;
+        h.SetActive(c.bump < 2);
+    }"""
+
+    def test_managed_find_game_object_and_active(self):
+        root = self._refs_project(self.FIND, "  hp: 5\n  speed: 3\n")
+        probe = ["Spark_get_a(0)", "Holder_get_bump(0)", "GameObject_activeSelf(_engine_go_of_Holder(0))"]
+        plain, _ = self._pack(root)
+        want = self._play(plain, 3, probe)
+        self.assertNotIn("-1.0000", want[0])
+        managed, err = self._pack(root, managed="Spark")
+        self.assertNotIn("stays lowered", err)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(managed, 3, probe), want)
+
+    def test_managed_screen_size_is_the_engines(self):
+        body = """
+    public float a;
+    void Update() {
+        a = Screen.width + Screen.height * 0.001f;
+        transform.position = new Vector3(a, 0f, 0f);
+    }"""
+        out, err = self._pack(self._project(self._script(body)), managed="*")
+        self.assertNotIn("stays lowered", err)
+        self.assertEqual(self._play(out, 1, ["Spark_get_a(0)"], "Screen_width = 640; Screen_height = 480;"), ["640.4800"])
 
     def test_a_stub_runs_as_managed_code_over_the_packed_state(self):
         out, err = self._pack(self._project(self._script(self.TALLY)), hybrid=True)
@@ -1973,14 +2354,14 @@ class TestHybrid(_PackHarness):
         self.assertEqual(self._play(out), self.LOWERS_OUT)
 
     def test_managed_class_the_shim_cannot_build_stays_lowered(self):
-        # Random.InitState lowers to C (the packer owns the random state) but the managed UnityEngine has no Random: the class does not build
+        # Application.isPlaying lowers to C but the managed UnityEngine has no Application: the class does not build
         # managed, and is what a plain pack gives, with the reason printed
-        root = self._project(self._script(self.LOWERS.replace("total += hp * 2;", "Random.InitState(1); total += hp * 2;")))
+        root = self._project(self._script(self.LOWERS.replace("total += hp * 2;", "if (!Application.isPlaying) total += 1; total += hp * 2;")))
         plain, _err = self._pack(root)
         self.assertEqual(self._play(plain), self.LOWERS_OUT)
         out, err = self._pack(root, managed="*")
         self.assertIn("managed: Spark stays lowered: the managed code does not compile", err)
-        self.assertIn("Random", err)
+        self.assertIn("Application", err)
         self.assertFalse(os.path.exists(os.path.join(out, "hybrid_glue.c")))
         self.assertEqual(self._play(out), self.LOWERS_OUT)
 
