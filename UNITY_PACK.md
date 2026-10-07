@@ -247,7 +247,11 @@ Unity's definitions and checked against hand-worked Unity answers on DNA
 `Bounds`. The project's own plain classes, structs, enums and static utilities that
 managed code names (and the ones those name) are compiled into the managed
 assembly from their own source; a helper the shim cannot build leaves the
-method as it was. Other script objects are managed handles too: a field of a script class's type
+method as it was. A method's own source is compiled where it builds (the packer's rewrites of it
+are for lowering to C), then the rewritten text; and a class that does not
+build whole still moves the methods that do, one by one (the others keep their
+lowered C or their stub, each with its reason). Constants are their values;
+`[Serializable]` and the usual Unity attributes are there. Other script objects are managed handles too: a field of a script class's type
 (`public Holder target;`, with identity and the null test), its fields,
 its lowered methods and its `transform`; `GetComponent<T>()` on the object or on
 a `GameObject`; `gameObject`, `GameObject.Find("literal")`, `activeSelf` /
@@ -262,7 +266,18 @@ the camera's transform is position only. `Input` is the engine's own: `GetAxis` 
 of its buttons, and keys (`GetKey` / `GetKeyDown` / `GetKeyUp`, by `KeyCode`
 -- letters, digits, Space -- or by name; the packer lowers only `GetKey("a")`,
 so the rest run only managed, over a latch put at the top of each tick). `Vector2` parameters and returns cross the boundary (as two floats, and a
-two-float result slot). Not yet: `Vector3` (the packer itself has no value for
+two-float result slot). An embedded `Vector2` field is a property over its two float accessors (read it, assign a whole
+`Vector2`; a struct property cannot take `ms.x = 1`, which then fails the compile and keeps the lowered C). A `Transform` field the
+packer resolved to an object is a read-only property giving a Transform of that object: its `position` is the world one through the
+engine's `_engine_world_pos` / `_engine_set_world` (no setter when the engine has none, and a method that moves it is then declined);
+anything else asked of it (rotation, `localPosition`, parent, scale) declines the class. A `Rigidbody2D` field is a managed
+`Rigidbody2D` over the engine's own `Rigidbody2D_*` functions and arrays: `linearVelocity` / `velocity`, `AddForce` and `AddTorque`
+(`ForceMode2D`), `mass`, `gravityScale`, `drag`, `position` / `MovePosition`, `rotation`, `angularVelocity`, `freezeRotation`,
+`isKinematic`, `bodyType`. The Input System keyboard is the engine's own: `Keyboard.current` (null while the host says no keyboard is
+connected) and `<name>Key.isPressed` / `wasPressedThisFrame` / `wasReleasedThisFrame` for the keys some script names as
+`Keyboard.current.<name>Key` (the packer finds keys by that spelling, so a key reached through a local variable is not there).
+An extension method call (`v.SetX(1f)`) pulls in the project file that declares it, and the shim has a `ValueTuple`
+so helpers returning `(float, int)` compile. Not yet: `Rigidbody` (3D), `AddComponent`, `SetWorldScale` / scale, `Vector3` (the packer itself has no value for
 it) / object parameters and returns, and the engine-backed parts of UnityEngine (Transform
 hierarchy, `Camera`, `RenderSettings`, `Input`, physics): a class
 that needs one stays lowered, with the missing member in the message.
@@ -915,6 +930,16 @@ connected anchor are the frames' points (`autoConfigureConnectedAnchor`,
 configures them), and a hinge's limits and angle are relative to its pose
 at creation. A GameObject with a joint and no Rigidbody2D gets the one
 Unity adds (dynamic, mass 1, gravity 1).
+
+**`new GameObject(name)`** makes an object at run time: `GameObject_New(name)` takes the next spare GameObject slot (-1 once they are
+gone), and `AddComponent<Script>()` on it (a local, or chained: `new GameObject("x").AddComponent<Kid>()`) takes a spare row of
+that class, as `AddComponent` on a scene object does. Each call site gets `_NEW_GO_POOL` (64) spare GameObjects per instance of
+the class that makes them; the data a loop creates from is not known when the project is packed, so the pool is a cap, not a
+count. `g.transform.position` (or a `Transform t = new GameObject("x").transform`, `t.position = new Vector3(x, y, z)`) moves
+the object: through the component on it when it has one, else through a position of its own (a bare object keeps x, y and z
+there). `g.transform.position = new Vector3(..)` with any z lowers for a GameObject variable of a `Find` too (it stubbed).
+Not yet: a bare object as a *parent* (its offset is not composed into its children), a scene-less project (scripts are found
+from the scenes), `Resources.Load` and `JsonUtility`.
 
 `gameObject.AddComponent<XJoint2D>()` (or on a GameObject variable) adds
 one of the joint kinds at run time: the joint tables keep a spare row per
