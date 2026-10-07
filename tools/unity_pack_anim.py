@@ -139,7 +139,7 @@ def _parse_pptr_sprite_curves(text):
         attr = re.search(r"(?m)^\s+attribute:\s*(.+)$", block)
         if not attr or attr.group(1).strip() != "m_Sprite":
             continue
-        path_m = re.search(r"(?m)^\s+path:\s*(.*)$", block)
+        path_m = re.search(r"(?m)^\s+path:[ \t]*(.*)$", block)
         path = path_m.group(1).strip().strip('"') if path_m else ""
         keys = []
         for km in re.finditer(
@@ -179,7 +179,7 @@ def _parse_animation_clip(text):
         for cm in re.finditer(
                 r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)", sm.group(1)):
             block = cm.group(1)
-            pm = re.search(r"(?m)^\s+path:\s*(.*)$", block)
+            pm = re.search(r"(?m)^\s+path:[ \t]*(.*)$", block)
             path = pm.group(1) if pm else ""
             keys = _parse_vec3_keyframes_full(block)
             if keys:
@@ -201,7 +201,7 @@ def _parse_animation_clip(text):
         for cm in re.finditer(
                 r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)", body):
             block = cm.group(1)
-            pm = re.search(r"(?m)^\s+path:\s*(.*)$", block)
+            pm = re.search(r"(?m)^\s+path:[ \t]*(.*)$", block)
             path = pm.group(1) if pm else ""
             if not _curve_path_is_root(path):
                 continue
