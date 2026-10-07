@@ -6541,6 +6541,39 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     return text
 
 
+# `public int Hp { get; private set; }`, `static Foo Instance { get; private set; }`, `float Speed { get; set; } = 2f;`: an
+# auto-property is a field with an access rule.  Nothing in a packed script can tell them apart (no reflection, no
+# interface or override on one), but the packer gave a property no storage, so every method that read one was
+# "not lowered yet" and the managed class (--hybrid) had no member of that name.  They are fields from here on,
+# one line to one line, so diagnostics keep their line numbers.  A property with a body (`get { .. }`), an abstract /
+# virtual / override / extern / `new` one and an interface member are left alone.
+_AUTO_PROPERTY = re.compile(
+    r"(?m)^([ \t]*)((?:(?:public|private|protected|internal)[ \t]+)?(?:static[ \t]+)?)"
+    r"([A-Za-z_][\w.]*(?:<[^;{}()=]*>)?(?:\[[,\s]*\])*\??)[ \t]+([A-Za-z_]\w*)[ \t]*"
+    r"\{[ \t]*get[ \t]*;[ \t]*(?:(?:private|protected|internal)[ \t]+)?(?:set[ \t]*;[ \t]*)?\}"
+    r"([ \t]*=[^;\n]+;)?")
+_NOT_A_TYPE = frozenset(("return", "new", "override", "abstract", "virtual", "extern", "sealed", "readonly", "const",
+                         "else", "case", "throw", "yield", "await", "in", "out", "ref"))
+
+
+def _auto_properties_to_fields(text):
+    scan = cs2cpp._blank(text)
+    edits = []
+    for m in _AUTO_PROPERTY.finditer(scan):
+        if m.group(3) in _NOT_A_TYPE:
+            continue
+        indent, access, ty, name, init = (text[m.start(i):m.end(i)] if m.group(i) is not None else ""
+                                          for i in (1, 2, 3, 4, 5))
+        if init:
+            init = " =" + init.split("=", 1)[1]
+        else:
+            init = ";"
+        edits.append((m.start(), m.end(), "%s%s%s %s%s" % (indent, access, ty, name, init)))
+    for a, b, new in reversed(edits):
+        text = text[:a] + new + text[b:]
+    return text
+
+
 def analyze_script(path, text=None, shallow=False):
     """Fields, methods, Unity API used, whether the script spawns.
 
@@ -6552,6 +6585,7 @@ def analyze_script(path, text=None, shallow=False):
         text = _read(path)
     # Player pack: editor-only regions are not code.
     text = _blank_unity_editor_regions(text)
+    text = _auto_properties_to_fields(text)
     if shallow:
         text = _blank_method_bodies(text)
     _check_csharp_lex(path, text)

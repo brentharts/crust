@@ -3127,5 +3127,24 @@ class TestSpriteSwapDropped(unittest.TestCase):
         self.assertNotIn("after", so)
 
 
+class TestAutoProperties(unittest.TestCase):
+    """`{ get; set; }` is a field to the packer: it used to give a property no storage, so every method that read one was left a CS8000 stub."""
+
+    def test_an_auto_property_becomes_a_field_on_the_same_line(self):
+        src = ("class A {\n  public int Hp { get; private set; }\n  public static A Instance { get; private set; }\n"
+               "  float Speed { get; set; } = 2f;\n  public List<int> Xs { get; } = new List<int>();\n}")
+        out = unity_pack._auto_properties_to_fields(src)
+        self.assertEqual(out.count("\n"), src.count("\n"))
+        self.assertIn("public int Hp;", out)
+        self.assertIn("public static A Instance;", out)
+        self.assertIn("float Speed = 2f;", out)
+        self.assertIn("public List<int> Xs = new List<int>();", out)
+
+    def test_a_property_with_a_body_a_comment_and_a_string_are_left_alone(self):
+        src = ("class A {\n  public bool Boss { get { return k != null; } }\n  // int Fake { get; set; }\n"
+               "  string s = \"int Q { get; set; }\";\n}")
+        self.assertEqual(unity_pack._auto_properties_to_fields(src), src)
+
+
 if __name__ == "__main__":
     unittest.main()
