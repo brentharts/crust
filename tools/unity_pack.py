@@ -10281,6 +10281,11 @@ def _emit_engine_gameobject_tables(
     if plan.get("collider2d"):
         # defined with the colliders, after the scripts that call it
         p("static int _col2d_go(int ci);")
+    else:
+        # no authored Collider2D (colliders are only added at runtime): a
+        # handler's `other.GetComponent<T>()` still calls it, and with nothing
+        # authored there is no GameObject to name
+        p("static int _col2d_go(int ci) { (void)ci; return -1; }")
     # Unity catches script exceptions: log + unwind the current method.
     p("static jmp_buf _engine_script_jmp;")
     p("static int _engine_in_script = 0;")
@@ -19445,13 +19450,14 @@ def emit_engine(plan, analyses, used_apis):
             collision2d_handlers[cname] = msgs
     touching = "Collider2D.IsTouchingLayers" in used_apis
     want_collision2d_msgs = (bool(collision2d_handlers) or touching
-                             or bool(plan.get("godot_signals"))) and want_col2d
+                             or bool(plan.get("godot_signals"))) \
+        and want_col2d and bool(col2d_list)
     trigger2d_handlers = {c: {k: v for k, v in msgs.items()
                               if k.startswith("OnTrigger")}
                           for c, msgs in collision2d_handlers.items()}
     trigger2d_handlers = {c: m for c, m in trigger2d_handlers.items() if m}
     plan["physics2d_triggers"] = (bool(trigger2d_handlers) or touching) \
-        and want_col2d and not plan.get("godot")
+        and want_col2d and bool(col2d_list) and not plan.get("godot")
     plan["_touching_layers"] = touching and want_col2d \
         and not plan.get("godot")
 
