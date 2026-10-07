@@ -233,6 +233,7 @@ class ClassGen(object):
         self.uses_go = False
         self.xf_fields = []
         self.uses_rb2d = False
+        self.uses_spr = False
         self.go_components = []
         self.src = self._build()
 
@@ -245,6 +246,8 @@ class ClassGen(object):
             return self._transform_field(f)
         if t == "Rigidbody2D":
             return self._rigidbody_field(f)
+        if t == "SpriteRenderer":
+            return self._spriterenderer_field(f)
         a = self.acc.get(f["name"])
         handle =t in self.class_names and a is not None and a[0] == "int" and a[1] == "int" and f["name"] in self._used
         if (t not in FIELD_TYPES and not handle) or a is None or a[1] is None:
@@ -294,6 +297,19 @@ class ClassGen(object):
         self.natives[set_ex] = ("void", ["uint", "int"], "void %s(unsigned i, int v) { %s_set_%s(i, v); }" % (set_ex, c, n))
         return ("    public UnityEngine.Rigidbody2D %s {\n        get { return UnityEngine.Rigidbody2D.__Wrap(HybridNative.%s(__i)); }\n"
                 "        set { HybridNative.%s(__i, value == null ? -1 : value.__rb); }\n    }" % (n, get_ex, set_ex))
+
+    def _spriterenderer_field(self, f):
+        """a `SpriteRenderer` field: the GameObject index the engine keeps for it (-1 for none), as a managed SpriteRenderer (_spriterenderer_class)
+        with the one member the engine stores per renderer, `color`.  Anything else asked of it (sprite, flipX, sortingOrder, ..) is not a member
+        of the managed class, so that code does not build and keeps its lowered C."""
+        n, c = f["name"], self.name
+        a = self.acc.get(n)
+        if not (a and a == ("int", "int")) or not re.search(r"^static void SpriteRenderer_set_color\(int go,", self.engine, re.M):
+            return None
+        self.uses_spr = True
+        get_ex = "ccs_x_%s_get_%s" % (c, n)
+        self.natives[get_ex] = ("int", ["uint"], "int %s(unsigned i) { return %s_get_%s(i); }" % (get_ex, c, n))
+        return ("    public UnityEngine.SpriteRenderer %s {\n        get { return UnityEngine.SpriteRenderer.__Wrap(HybridNative.%s(__i)); }\n    }" % (n, get_ex))
 
     def _transform_field(self, f):
         """a `Transform` field the packer resolved to an object (`_Class_f_target_class[i]` / `_target_inst[i]`: -1 for none): a read-only
@@ -803,6 +819,24 @@ def _rigidbody2d_class(engine, natives):
             + "\n".join(m) + "\n    }\n}\n")
 
 
+def _spriterenderer_class(engine, natives):
+    """UnityEngine.SpriteRenderer over the engine's `SpriteRenderer_color(go, k)` / `SpriteRenderer_set_color(go, r, g, b, a)`: the tint, the one
+    thing the packed engine keeps for a renderer that a script can write.  (The engine stops with a NullReferenceException on a GameObject that
+    has no renderer, as the lowered code does.)"""
+    natives["ccs_x_spr_color"] = ("float", ["int", "int"], "float ccs_x_spr_color(int go, int k) { return SpriteRenderer_color(go, k); }")
+    natives["ccs_x_spr_set_color"] = ("void", ["int", "float", "float", "float", "float"],
+                                      "void ccs_x_spr_set_color(int go, float r, float g, float b, float a) { SpriteRenderer_set_color(go, r, g, b, a); }")
+    return ("namespace UnityEngine\n{\n    public class SpriteRenderer\n    {\n        public readonly int __go;\n        SpriteRenderer(int go) { __go = go; }\n"
+            "        static SpriteRenderer[] __all = new SpriteRenderer[8];\n"
+            "        public static SpriteRenderer __Wrap(int go)\n        {\n            if (go < 0) return null;\n"
+            "            if (go >= __all.Length) {\n                SpriteRenderer[] bigger = new SpriteRenderer[go * 2 + 8];\n"
+            "                for (int k = 0; k < __all.Length; k++) bigger[k] = __all[k];\n                __all = bigger;\n            }\n"
+            "            if (__all[go] == null) __all[go] = new SpriteRenderer(go);\n            return __all[go];\n        }\n"
+            "        public Color color {\n"
+            "            get { return new Color(HybridNative.ccs_x_spr_color(__go, 0), HybridNative.ccs_x_spr_color(__go, 1), HybridNative.ccs_x_spr_color(__go, 2), HybridNative.ccs_x_spr_color(__go, 3)); }\n"
+            "            set { HybridNative.ccs_x_spr_set_color(__go, value.r, value.g, value.b, value.a); }\n        }\n    }\n}\n")
+
+
 def _keyboard_class(engine, natives):
     """UnityEngine.InputSystem.Keyboard over the engine's own `Keyboard_<name>Key_isPressed()` (and wasPressed/ReleasedThisFrame) functions: the
     keys some script of the project names (the packer emits exactly those).  `Keyboard.current` is null while the host says no keyboard is
@@ -872,6 +906,8 @@ def managed_source(gens, time_names):
                 parts[0] += "using UnityEngine.InputSystem;\n"
         if any(g.uses_rb2d for g in gens):
             body.append(_rigidbody2d_class(gens[0].engine, natives))
+        if any(g.uses_spr for g in gens):
+            body.append(_spriterenderer_class(gens[0].engine, natives))
         if any(g.xf_fields for g in gens):
             body.append(_target_transform_class(natives, gens[0].engine))
     body += [g.src for g in gens]

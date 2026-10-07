@@ -1922,6 +1922,41 @@ class TestHybrid(_PackHarness):
         # Update (lowered fine) still runs; Play is the empty stub the warning names
         self.assertEqual(self._play(out, 3, ["Spark_get_n(0)"]), ["1.0000", "2.0000", "3.0000"])
 
+    SPR_SCRIPT = """
+    public SpriteRenderer sr;
+    public float a;
+    public float b;
+    void Update() {
+        Func<int, int> f = q => q;
+        a = sr.color.g;
+        sr.color = new Color(0.25f, sr.color.g * 0.5f, 1f, 0.5f);
+        b = sr.color.a;
+    }"""
+
+    def test_a_spriterenderer_field_has_its_tint_managed(self):
+        """the one thing the engine keeps for a renderer, its colour: managed code reads and writes it through the engine's own functions,
+        and gets the same numbers the lowered code gets (the field is a GameObject index in both)"""
+        scene = self.SCENE.replace("  - component: {fileID: 3}\n", "  - component: {fileID: 3}\n  - component: {fileID: 4}\n")
+        values = ("  hp: 5\n  sr: {fileID: 4}\n--- !u!212 &4\nSpriteRenderer:\n  m_GameObject: {fileID: 1}\n"
+                  "  m_Enabled: 1\n  m_Color: {r: 1, g: 0.5, b: 1, a: 1}\n  m_Sprite: {fileID: 0}\n")
+        self.SCENE = scene
+        root = self._project(self._script(self.SPR_SCRIPT), values)
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("hybrid: 1 managed method(s)", err)
+        self.assertEqual(self._play(out, 3, ["Spark_get_a(0)", "Spark_get_b(0)"]),
+                         ["0.5000,0.5000", "0.2500,0.5000", "0.1250,0.5000"])
+
+    def test_a_spriterenderer_member_the_engine_has_no_storage_for_stays_lowered(self):
+        """flipX, sprite, sortingOrder: the packed engine keeps none, so the managed SpriteRenderer has none and the method keeps its stub and says why"""
+        scene = self.SCENE.replace("  - component: {fileID: 3}\n", "  - component: {fileID: 3}\n  - component: {fileID: 4}\n")
+        values = ("  hp: 5\n  sr: {fileID: 4}\n--- !u!212 &4\nSpriteRenderer:\n  m_GameObject: {fileID: 1}\n"
+                  "  m_Enabled: 1\n  m_Color: {r: 1, g: 0.5, b: 1, a: 1}\n  m_Sprite: {fileID: 0}\n")
+        self.SCENE = scene
+        body = self.SPR_SCRIPT.replace("a = sr.color.g;", "a = sr.color.g; sr.flipX = true;")
+        out, err = self._pack(self._project(self._script(body), values), hybrid=True)
+        self.assertNotIn("hybrid: 1 managed method(s)", err)
+        self.assertIn("flipX", err)
+
     XF_FIELD = """
     public Transform gt;
     public float a;
