@@ -14454,6 +14454,11 @@ def _emit_engine_class_groups(
                 if hit:
                     why = ("field of an embedded struct written (its rows are"
                            " shared by copies, so they stay read-only)", hit)
+            if why is None and plan.get("hybrid") and \
+                    (site.get("path") or "", cs_line) in _FORCE_MANAGED:
+                # crust refused this method's lowered C on an earlier round (pack): treat it as one the lowering could not do
+                why = ("the lowered C does not compile (%s)"
+                       % _FORCE_MANAGED[(site.get("path") or "", cs_line)], m["name"])
             hy_ok = False
             if plan.get("hybrid") and not coll_param:
                 import tools.unity_pack_hybrid as _hy
@@ -28382,6 +28387,12 @@ def emit_soa_positions_glsl(plan):
     return "\n".join(lines) + "\n"
 
 
+# --hybrid: a method whose lowered C does not compile (crust refuses it at a `unity_pack:site` marker) is retried as a stub, which the
+# hybrid pass then tries to run as managed code.  {(site path, C# line of the body): crust's message}; `pack` fills it between rounds.
+_FORCE_MANAGED = {}
+_LAST_CRUST_SITE = [None]
+
+
 def validate_emitted_c(text, path="engine.c", analyses=None):
     """Gate generated C through cpprust, then compile the result with crust.
 
@@ -28475,6 +28486,7 @@ def _crust_error_to_unity(err, source_text=None, analyses=None):
                 site_path, site_line = sm.group(1), int(sm.group(2))
                 break
         if site_path:
+            _LAST_CRUST_SITE[0] = (site_path, site_line, msg)
             return "%s(%d,1): error CS0000: %s" % (
                 _assets_rel_path(site_path), site_line, msg)
     # Last resort: still Unity-shaped, not a raw /tmp path dump.
@@ -29133,9 +29145,24 @@ def pack(root, outdir, *args, **kwargs):
     for fp, text in overlay.items():
         _common.SOURCE_OVERLAY[fp] = text
         _common.SOURCE_OVERLAY[os.path.abspath(fp)] = text
+    _FORCE_MANAGED.clear()
     try:
+        for _round in range(40):
+            _LAST_CRUST_SITE[0] = None
+            try:
+                return _pack_impl(root, outdir, *args, **kwargs)
+            except PackError:
+                site = _LAST_CRUST_SITE[0]
+                if not (kwargs.get("hybrid") or kwargs.get("managed")) or site is None \
+                        or (site[0], site[1]) in _FORCE_MANAGED:
+                    raise
+                # --hybrid: a method crust cannot compile is a method the lowering could not do (managed code, or a CS8000 stub)
+                _FORCE_MANAGED[(site[0], site[1])] = site[2]
+                _progress("hybrid: %s(%d): the lowered C does not compile (%s); trying managed code"
+                          % (site[0], site[1], site[2]))
         return _pack_impl(root, outdir, *args, **kwargs)
     finally:
+        _FORCE_MANAGED.clear()
         _common.SOURCE_OVERLAY.clear()
         _common.SOURCE_OVERLAY.update(saved)
 

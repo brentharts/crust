@@ -1902,6 +1902,26 @@ class TestHybrid(_PackHarness):
         self.assertEqual(self._play(man, 3, probes), self._play(low, 3, probes))
         self.assertEqual(self._play(man, 3, probes)[2], "12.0000,4.0000,8.0000")
 
+    COMPILE_FAIL = """
+    Sprite[] frames;
+    public int n;
+    void Update() { n += 1; }
+    public void Play(Sprite[] nf) { if (nf == frames) return; frames = nf; n += 10; }
+    """
+
+    def test_a_method_whose_lowered_c_does_not_compile_is_retried_not_fatal(self):
+        """`nf == frames` on two arrays lowers to C crust refuses.  A plain pack still fails there (nothing changes for it); with --hybrid the
+        method is treated as one the lowering could not do (managed code where that builds, else a CS8000 stub) and the rest of the class packs."""
+        root = self._project(self._script(self.COMPILE_FAIL))
+        with self.assertRaises(unity_pack.PackError) as plain:
+            self._pack(root)
+        self.assertIn("comparison between distinct pointer types", str(plain.exception))
+        out, err = self._pack(root, hybrid=True)
+        self.assertIn("the lowered C does not compile", err)
+        self.assertIn("`Spark.Play` is not lowered yet", err)
+        # Update (lowered fine) still runs; Play is the empty stub the warning names
+        self.assertEqual(self._play(out, 3, ["Spark_get_n(0)"]), ["1.0000", "2.0000", "3.0000"])
+
     XF_FIELD = """
     public Transform gt;
     public float a;
