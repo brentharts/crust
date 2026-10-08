@@ -1030,7 +1030,7 @@ def _unity_scenes_to_pack(root, asset_guids=None):
 #: keep their IDs.
 _SCENE_FILE_ID_SHIFT = 56
 _LOCAL_FILE_ID_RE = re.compile(
-    r"(^--- !u!\d+ &(?=\d+\s)|\{fileID: (?=\d+\}))(\d+)", re.M)
+    r"(^--- !u!\d+ &(?=-?\d+\s)|\{fileID: (?=-?\d+\}))(-?\d+)", re.M)
 
 
 def _scene_local_file_ids(text, scene_index):
@@ -27671,9 +27671,9 @@ def _script_guid_for_path(guids, script_path):
     return None
 
 
-_YAML_DOC_HEAD_RE = re.compile(r"(?m)^--- !u!(\d+) &(\d+)( stripped)?[^\n]*$")
+_YAML_DOC_HEAD_RE = re.compile(r"(?m)^--- !u!(\d+) &(-?\d+)( stripped)?[^\n]*$")
 _PREFAB_MOD_RE = re.compile(
-    r"-\s*target:\s*\{fileID:\s*(\d+)[^}]*\}\s*\n\s*propertyPath:\s*(.*?)\s*\n"
+    r"-\s*target:\s*\{fileID:\s*(-?\d+)[^}]*\}\s*\n\s*propertyPath:\s*(.*?)\s*\n"
     r"\s*value:\s*(.*?)\s*\n\s*objectReference:\s*(\{[^}]*\})")
 _FILE_ID_MASK = 0x7FFFFFFFFFFFFFFF
 
@@ -27695,7 +27695,7 @@ def _scene_prefab_instances(scene_text):
     for cls, fid, is_stripped, a, b in _yaml_docs(scene_text):
         doc = scene_text[a:b]
         if is_stripped:
-            src = re.search(r"m_CorrespondingSourceObject:\s*\{fileID:\s*(\d+)",
+            src = re.search(r"m_CorrespondingSourceObject:\s*\{fileID:\s*(-?\d+)",
                             doc)
             pi = re.search(r"m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", doc)
             if src and pi:
@@ -27807,7 +27807,7 @@ def _prefab_instance_text(prefab_text, inst):
         fid = new_id(src)
         if fid not in docs:
             continue
-        ref = re.match(r"\{fileID:\s*(\d+)", objref)
+        ref = re.match(r"\{fileID:\s*(-?\d+)", objref)
         if ref and ref.group(1) != "0":
             value = objref
         a, b = docs[fid]
