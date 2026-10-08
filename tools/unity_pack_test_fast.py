@@ -3201,5 +3201,107 @@ class TestAutoProperties(unittest.TestCase):
         self.assertEqual(unity_pack._auto_properties_to_fields(src), src)
 
 
+class TestSerializableGenericBase(unittest.TestCase):
+    """`FloatRange : Range<float>` is a plain [Serializable] value: its
+    generic project base gives it fields, it is no component."""
+
+    def test_a_generic_project_base_is_a_value_not_a_component(self):
+        root = tempfile.mkdtemp(prefix="upack-derive-")
+        srcs = {
+            "Range": "public class Range<T> { public T min; public T max; }",
+            "FloatRange": "[System.Serializable]\npublic class FloatRange : "
+                          "Range<float>, IComparable { }",
+            "Comp": "using UnityEngine;\npublic class Comp : MonoBehaviour { }",
+            "Mid": "public class Mid : Comp { }",
+        }
+        tmap = {}
+        for name, src in srcs.items():
+            tmap[name] = os.path.join(root, name + ".cs")
+            with open(tmap[name], "w") as f:
+                f.write(src + "\n")
+        derives = {n: unity_pack._derives_engine_type(
+            unity_pack.analyze_script(p), tmap) for n, p in tmap.items()}
+        self.assertEqual(derives, {"Range": False, "FloatRange": False,
+                                   "Comp": True, "Mid": True})
+
+
+class TestPrefabVariants(unittest.TestCase):
+    """A prefab variant places its base (negative component fileIDs) with
+    its overrides, as Unity does."""
+
+    def test_a_variant_places_its_base_with_the_override(self):
+        root = tempfile.mkdtemp(prefix="upack-variant-")
+        base = os.path.join(root, "Base.prefab")
+        var = os.path.join(root, "Variant.prefab")
+        with open(base, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &100\nGameObject:\n  m_Name: Base\n  m_IsActive: 1\n"
+                    "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_Father: {fileID: 0}\n"
+                    "--- !u!212 &-5\nSpriteRenderer:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_Sprite: {fileID: 0}\n")
+        with open(var, "w") as f:
+            f.write("%YAML 1.1\n--- !u!1001 &900\nPrefabInstance:\n"
+                    "  m_Modification:\n    m_TransformParent: {fileID: 0}\n"
+                    "    m_Modifications:\n"
+                    "    - target: {fileID: -5, guid: b0, type: 3}\n"
+                    "      propertyPath: m_Sprite\n      value: \n"
+                    "      objectReference: {fileID: -7, guid: ef, type: 3}\n"
+                    "  m_SourcePrefab: {fileID: 100100000, guid: b0, type: 3}\n")
+        scene = ("%YAML 1.1\n--- !u!1001 &50\nPrefabInstance:\n"
+                 "  m_Modification:\n    m_TransformParent: {fileID: 0}\n"
+                 "    m_Modifications: []\n"
+                 "  m_SourcePrefab: {fileID: 100100000, guid: cd, type: 3}\n")
+        out = unity_pack._expand_unstripped_prefab_instances(
+            scene, {"b0": base, "cd": var})
+        mask = unity_pack._FILE_ID_MASK
+        sid = (((-5 ^ 900) & mask) ^ 50) & mask
+        self.assertRegex(out, r"--- !u!212 &%d\n[^-]*m_Sprite: \{fileID: -7, "
+                              r"guid: ef, type: 3\}" % sid)
+        self.assertIn("m_Name: Base", out)
+
+
+class TestTilemapTiles(unittest.TestCase):
+    """Tilemap tiles baked into world-space sprite draws."""
+
+    def test_a_tile_lands_in_its_cell_through_a_flipped_tilemap(self):
+        yaml = (
+            "%YAML 1.1\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Grid\n  m_IsActive: 1\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 1, y: 0, z: 0}\n  m_Father: {fileID: 0}\n"
+            "--- !u!156049354 &12\nGrid:\n  m_GameObject: {fileID: 10}\n"
+            "  m_CellSize: {x: 2, y: 1, z: 1}\n  m_CellLayout: 0\n  m_CellSwizzle: 0\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: Tilemap\n  m_IsActive: 1\n"
+            "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+            "  m_LocalScale: {x: -1, y: 1, z: 1}\n  m_Father: {fileID: 11}\n"
+            "--- !u!1839735485 &22\nTilemap:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Tiles:\n"
+            "  - first: {x: 1, y: 0, z: 0}\n    second:\n      m_TileSpriteIndex: 0\n"
+            "      m_TileMatrixIndex: 0\n      m_TileColorIndex: 0\n"
+            "  - first: {x: 0, y: 0, z: 0}\n    second:\n      m_TileSpriteIndex: 1\n"
+            "      m_TileMatrixIndex: 0\n      m_TileColorIndex: 0\n"
+            "  m_TileSpriteArray:\n"
+            "  - m_RefCount: 1\n    m_Data: {fileID: 5, guid: aa, type: 3}\n"
+            "  - m_RefCount: 1\n    m_Data: {fileID: 0}\n"
+            "  m_TileMatrixArray:\n  - m_RefCount: 2\n    m_Data:\n      e00: 1\n"
+            "      e11: 1\n  m_TileColorArray:\n"
+            "  - m_RefCount: 2\n    m_Data: {r: 1, g: 0.5, b: 1, a: 1}\n"
+            "  m_Color: {r: 1, g: 1, b: 1, a: 0.5}\n"
+            "  m_TileAnchor: {x: 0.5, y: 0.5, z: 0}\n"
+            "--- !u!483693784 &23\nTilemapRenderer:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Enabled: 1\n  m_SortingOrder: -100\n")
+        unity_pack.parse_unity_yaml(yaml)
+        tiles = unity_pack.parse_unity_yaml.tiles
+        self.assertEqual(len(tiles), 1)   # the null-sprite tile is not drawn
+        t = tiles[0]
+        # cell 1 * width 2 + anchor 0.5 * 2 = 3, mirrored, then the Grid's x 1
+        self.assertAlmostEqual(t["x"], -2.0)
+        self.assertAlmostEqual(t["y"], 0.5)
+        self.assertAlmostEqual(t["m00"], -1.0)
+        self.assertEqual((t["sprite_file_id"], t["sprite_guid"]), (5, "aa"))
+        self.assertEqual((t["g"], t["a"], t["sorting_order"]), (0.5, 0.5, -100))
+
+
 if __name__ == "__main__":
     unittest.main()

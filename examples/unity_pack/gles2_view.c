@@ -47,7 +47,7 @@ int Camera_main_y_down __attribute__((weak)) = 0;
 #define WIDTH  96
 #define HEIGHT 64
 #ifndef MAX_DRAWS
-#define MAX_DRAWS 512
+#define MAX_DRAWS 4096
 #endif
 #ifndef MAX_TEX
 #define MAX_TEX 512
@@ -357,7 +357,7 @@ static int upload_textures(void)
 
 static int draw_scene(GLuint prog)
 {
-    EngineDraw draws[MAX_DRAWS];
+    static EngineDraw draws[MAX_DRAWS];
     int ndraw;
     int i;
     int vx, vy, vw, vh;

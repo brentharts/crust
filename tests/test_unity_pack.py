@@ -8670,7 +8670,7 @@ class TestSystems(unittest.TestCase):
             path = os.path.join(ROOT, "examples", "unity_pack", name)
             with open(path) as f:
                 src = f.read()
-            self.assertRegex(src, r"#define MAX_DRAWS\s+512")
+            self.assertRegex(src, r"#define MAX_DRAWS\s+4096")
             self.assertRegex(src, r"#define MAX_TEX\s+512")
 
     def test_sprite_mode_multiple_crops_by_file_id(self):
