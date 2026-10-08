@@ -4875,6 +4875,27 @@ def _analyze_static_refs(analyses, typename_map):
     return got
 
 
+def _derives_engine_type(a, typename_map, seen=None):
+    """Whether a class of analysis *a* derives, through project bases, from
+    a type outside the project (MonoBehaviour, ScriptableObject, ..): a
+    component, not a plain [Serializable] value (`FloatRange : Range<float>`).
+    ponytail: a non-project base named `I<Upper>..` is taken for an
+    interface"""
+    seen = set() if seen is None else seen
+    for c in a.get("classes") or []:
+        for b in c.get("bases") or ():
+            if b in seen or b in ("object", "Object", "System"):
+                continue
+            seen.add(b)
+            if b not in typename_map:
+                if not re.match(r"I[A-Z]", b):
+                    return True
+            elif _derives_engine_type(analyze_script(typename_map[b], shallow=True),
+                                      typename_map, seen):
+                return True
+    return False
+
+
 def _inherit_base_members(analyses, typename_map):
     """Copy what a class inherits from its authored bases into it.
 
@@ -28125,8 +28146,7 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
                 continue
             a = analyze_script(sp)
-            if t in spawned or all(
-                    not c.get("bases") for c in a.get("classes") or []):
+            if t in spawned or not _derives_engine_type(a, typename_map):
                 # a plain [Serializable] value (no component): its methods
                 # are what the objects embedding it call
                 analyses.append(a)

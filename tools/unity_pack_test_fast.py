@@ -3201,5 +3201,29 @@ class TestAutoProperties(unittest.TestCase):
         self.assertEqual(unity_pack._auto_properties_to_fields(src), src)
 
 
+class TestSerializableGenericBase(unittest.TestCase):
+    """`FloatRange : Range<float>` is a plain [Serializable] value: its
+    generic project base gives it fields, it is no component."""
+
+    def test_a_generic_project_base_is_a_value_not_a_component(self):
+        root = tempfile.mkdtemp(prefix="upack-derive-")
+        srcs = {
+            "Range": "public class Range<T> { public T min; public T max; }",
+            "FloatRange": "[System.Serializable]\npublic class FloatRange : "
+                          "Range<float>, IComparable { }",
+            "Comp": "using UnityEngine;\npublic class Comp : MonoBehaviour { }",
+            "Mid": "public class Mid : Comp { }",
+        }
+        tmap = {}
+        for name, src in srcs.items():
+            tmap[name] = os.path.join(root, name + ".cs")
+            with open(tmap[name], "w") as f:
+                f.write(src + "\n")
+        derives = {n: unity_pack._derives_engine_type(
+            unity_pack.analyze_script(p), tmap) for n, p in tmap.items()}
+        self.assertEqual(derives, {"Range": False, "FloatRange": False,
+                                   "Comp": True, "Mid": True})
+
+
 if __name__ == "__main__":
     unittest.main()
