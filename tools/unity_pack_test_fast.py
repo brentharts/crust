@@ -3225,5 +3225,41 @@ class TestSerializableGenericBase(unittest.TestCase):
                                    "Comp": True, "Mid": True})
 
 
+class TestPrefabVariants(unittest.TestCase):
+    """A prefab variant places its base (negative component fileIDs) with
+    its overrides, as Unity does."""
+
+    def test_a_variant_places_its_base_with_the_override(self):
+        root = tempfile.mkdtemp(prefix="upack-variant-")
+        base = os.path.join(root, "Base.prefab")
+        var = os.path.join(root, "Variant.prefab")
+        with open(base, "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &100\nGameObject:\n  m_Name: Base\n  m_IsActive: 1\n"
+                    "--- !u!4 &101\nTransform:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_Father: {fileID: 0}\n"
+                    "--- !u!212 &-5\nSpriteRenderer:\n  m_GameObject: {fileID: 100}\n"
+                    "  m_Sprite: {fileID: 0}\n")
+        with open(var, "w") as f:
+            f.write("%YAML 1.1\n--- !u!1001 &900\nPrefabInstance:\n"
+                    "  m_Modification:\n    m_TransformParent: {fileID: 0}\n"
+                    "    m_Modifications:\n"
+                    "    - target: {fileID: -5, guid: b0, type: 3}\n"
+                    "      propertyPath: m_Sprite\n      value: \n"
+                    "      objectReference: {fileID: -7, guid: ef, type: 3}\n"
+                    "  m_SourcePrefab: {fileID: 100100000, guid: b0, type: 3}\n")
+        scene = ("%YAML 1.1\n--- !u!1001 &50\nPrefabInstance:\n"
+                 "  m_Modification:\n    m_TransformParent: {fileID: 0}\n"
+                 "    m_Modifications: []\n"
+                 "  m_SourcePrefab: {fileID: 100100000, guid: cd, type: 3}\n")
+        out = unity_pack._expand_unstripped_prefab_instances(
+            scene, {"b0": base, "cd": var})
+        mask = unity_pack._FILE_ID_MASK
+        sid = (((-5 ^ 900) & mask) ^ 50) & mask
+        self.assertRegex(out, r"--- !u!212 &%d\n[^-]*m_Sprite: \{fileID: -7, "
+                              r"guid: ef, type: 3\}" % sid)
+        self.assertIn("m_Name: Base", out)
+
+
 if __name__ == "__main__":
     unittest.main()

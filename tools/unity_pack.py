@@ -27853,13 +27853,14 @@ def _prefab_instance_text(prefab_text, inst):
     return "".join(out)
 
 
-def _expand_unstripped_prefab_instances(scene_text, assets):
+def _expand_unstripped_prefab_instances(scene_text, assets, depth=0):
     """*scene_text* with the placed objects of every PrefabInstance. A
     stripped stub (kept when scene objects reference a prefab object, e.g.
     children under its Transform) is replaced by the placed doc, which keeps
     the stub's fileID. Instances with a stripped root RectTransform are left to
     `_append_prefab_instance_ui_objects` (onClick array overrides, components
-    added on the stripped GameObject)."""
+    added on the stripped GameObject). A prefab's own PrefabInstances (a
+    variant's base, nested prefabs) are placed in it first, as Unity does."""
     extra, drop = [], set()
     for inst in _scene_prefab_instances(scene_text):
         ppath = (assets or {}).get(inst["prefab_guid"])
@@ -27867,6 +27868,8 @@ def _expand_unstripped_prefab_instances(scene_text, assets):
                 or not os.path.isfile(ppath):
             continue
         raw = _read(ppath)
+        if depth < 16:
+            raw = _expand_unstripped_prefab_instances(raw, assets, depth + 1)
         # a UI prefab (root RectTransform stub); a stub on a child Canvas
         # (Game Camera's) still places the rest of the prefab here
         if any(cls == "224" and fid in inst["stripped"] and re.search(
