@@ -46,7 +46,7 @@ int engine_upload_handles(uint32_t *dst, int max_words)
 }
 
 #ifndef MAX_DRAWS
-#define MAX_DRAWS 512
+#define MAX_DRAWS 4096
 #endif
 #ifndef MAX_TEX
 #define MAX_TEX 512
@@ -341,7 +341,7 @@ static void g3_upload_handles(void)
  */
 static int g3_draw(int width, int height)
 {
-    EngineDraw draws[MAX_DRAWS];
+    static EngineDraw draws[MAX_DRAWS];
     int ndraw;
     int i;
     int vx, vy, vw, vh;

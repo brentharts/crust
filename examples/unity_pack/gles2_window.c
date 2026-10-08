@@ -139,7 +139,7 @@ extern const char engine_product_name[];
  * draws — e.g. Main Menu background never appears while early TMP labels do.
  */
 #ifndef MAX_DRAWS
-#define MAX_DRAWS 512
+#define MAX_DRAWS 4096
 #endif
 #ifndef MAX_TEX
 #define MAX_TEX 512
@@ -455,7 +455,7 @@ static void draw_one(const EngineDraw *d)
 
 static void frame(GLFWwindow *win)
 {
-    EngineDraw draws[MAX_DRAWS];
+    static EngineDraw draws[MAX_DRAWS];
     int ndraw, i;
     int fbw, fbh, ww, wh;
     int vx, vy, vw, vh;
