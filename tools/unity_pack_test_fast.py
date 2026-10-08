@@ -3368,6 +3368,64 @@ class TestTilemapTiles(unittest.TestCase):
         self.assertEqual((t["sprite_file_id"], t["sprite_guid"]), (5, "aa"))
         self.assertEqual((t["g"], t["a"], t["sorting_order"]), (0.5, 0.5, -100))
 
+    @needs_cc
+    def test_a_tie_in_layer_and_order_draws_the_farther_first(self):
+        """Slime Jump's background Tilemaps share layer and order at z 0, -1
+        and -2: Unity draws the farther first, a sprite between them in z
+        between them."""
+        import struct
+        import zlib
+        root = project(self, {"A": "using UnityEngine;\npublic class A :"
+                              " MonoBehaviour { }\n"}, [("A",)])
+        sd = os.path.join(root, "Assets", "Scripts")
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        for w, guid in ((4, "b"), (8, "c"), (16, "d")):
+            with open(os.path.join(sd, "t%d.png" % w), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n"
+                        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, 8, 8, 6, 0, 0, 0))
+                        + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 4 * w) * 8))
+                        + chunk(b"IEND", b""))
+            with open(os.path.join(sd, "t%d.png.meta" % w), "w") as f:
+                f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n"
+                        % (guid * 32))
+
+        def tilemap(fid, z, guid):
+            return (
+                "--- !u!1 &%d\nGameObject:\n  m_Name: TM%d\n  m_IsActive: 1\n"
+                "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: %s}\n  m_Father: {fileID: 0}\n"
+                "--- !u!1839735485 &%d\nTilemap:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Tiles:\n  - first: {x: 0, y: 0, z: 0}\n    second:\n"
+                "      m_TileSpriteIndex: 0\n      m_TileMatrixIndex: 0\n"
+                "      m_TileColorIndex: 0\n  m_TileSpriteArray:\n"
+                "  - m_RefCount: 1\n    m_Data: {fileID: 21300000, guid: %s, type: 3}\n"
+                "  m_TileMatrixArray:\n  - m_RefCount: 1\n    m_Data:\n      e00: 1\n"
+                "      e11: 1\n  m_TileColorArray:\n"
+                "  - m_RefCount: 1\n    m_Data: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!483693784 &%d\nTilemapRenderer:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Enabled: 1\n  m_SortingOrder: -100\n"
+                % (fid, fid, fid + 1, fid, z, fid + 2, fid, guid * 32, fid + 3, fid))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(tilemap(500, "-1", "d") + tilemap(600, "0", "c")
+                    + "--- !u!1 &700\nGameObject:\n  m_Name: Spr\n  m_IsActive: 1\n"
+                    "  m_Component:\n  - component: {fileID: 701}\n"
+                    "  - component: {fileID: 702}\n"
+                    "--- !u!4 &701\nTransform:\n  m_GameObject: {fileID: 700}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: -0.5}\n  m_Father: {fileID: 0}\n"
+                    "--- !u!212 &702\nSpriteRenderer:\n  m_GameObject: {fileID: 700}\n"
+                    "  m_Enabled: 1\n  m_SortingOrder: -100\n"
+                    "  m_Sprite: {fileID: 21300000, guid: %s, type: 3}\n"
+                    "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n" % ("b" * 32))
+        out = pack(self, root, strict=False)
+        self.assertEqual(run_frames(self, out, 1, body=(
+            "EngineDraw b[8]; int n = engine_collect_draws(b, 8), k;\n"
+            "  for (k = 0; k < n; k++) if (b[k].tex >= 0)"
+            " printf(\"w %d\\n\", engine_texture_width(b[k].tex));")),
+            ["w 8", "w 4", "w 16"])
+
 
 if __name__ == "__main__":
     unittest.main()

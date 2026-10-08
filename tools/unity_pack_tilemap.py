@@ -129,7 +129,7 @@ def bake_tiles(by_id, world_trs, quat_xy_basis):
         if not active:
             continue
         grid = grid or {"cell": (1.0, 1.0), "gap": (0.0, 0.0)}
-        (px, py, _pz), rot, scale = world_trs(xf["file_id"])
+        (px, py, pz), rot, scale = world_trs(xf["file_id"])
         r00, r01, r10, r11 = quat_xy_basis(*rot)
         sx, sy = float(scale[0]), float(scale[1])
         (cw, ch), (gw, gh), (ax, ay) = grid["cell"], grid["gap"], tm["anchor"]
@@ -150,7 +150,7 @@ def bake_tiles(by_id, world_trs, quat_xy_basis):
             out.append(dict(
                 rd, enabled=1, has_sprite=True, tile=True,
                 sprite_file_id=spr[0], sprite_guid=spr[1],
-                x=px + r00 * lx + r01 * ly, y=py + r10 * lx + r11 * ly,
+                x=px + r00 * lx + r01 * ly, y=py + r10 * lx + r11 * ly, z=pz,
                 m00=a00 / n0, m01=a01 / n1, m10=a10 / n0, m11=a11 / n1,
                 scale_x=n0, scale_y=n1,
                 r=col[0] * tm["color"][0], g=col[1] * tm["color"][1],
@@ -173,7 +173,9 @@ def emit_collect(p, plan, multi_scene):
 
     def table(ty, name, vals):
         p("static const %s %s[%d] = { %s };" % (ty, name, len(tiles), ", ".join(vals)))
-    for k in ("x", "y", "half_w", "half_h", "m00", "m01", "m10", "m11", "r", "g", "b", "a"):
+    # farther first: the GPU path keeps list order within a layer and order
+    tiles = sorted(tiles, key=lambda t: -float(t.get("z") or 0.0))
+    for k in ("x", "y", "z", "half_w", "half_h", "m00", "m01", "m10", "m11", "r", "g", "b", "a"):
         table("float", "_tm_" + k, [_f(t[k]) for t in tiles])
     table("float", "_tm_pvx", [_f(1.0 - 2.0 * float((t.get("pivot") or (0.5, 0.5))[0]))
                                for t in tiles])
@@ -212,6 +214,7 @@ def emit_collect(p, plan, multi_scene):
     p("        d->tex = _tm_tex_id[k];")
     p("        d->sorting_layer = _tm_sorting_layer[k];")
     p("        d->sorting_order = _tm_sorting_order[k];")
+    p("        d->z = _tm_z[k];")
     p("        d->flags = _tm_lit[k];")
     p("        d->go = -1;")
     p("        *n = *n + 1;")

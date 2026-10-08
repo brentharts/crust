@@ -18076,6 +18076,10 @@ def _emit_engine_class_draws(
             str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_lit[] = { %s };" % ", ".join(
             str(int(sp.get("lit") or 0)) for _i, sp in spr_idx))
+        # ponytail: the authored z; a script moving z does not re-sort
+        p("        static const float _spr_z[] = { %s };" % ", ".join(
+            "%rf" % float((tuple(cl["instances"][i].get("pos") or ()) + (0, 0, 0))[2])
+            for i, _sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
             str(i) for i, _sp in spr_idx))
         any_ui = any(sp.get("source") in ("ui", "ui_tmp")
@@ -18343,6 +18347,7 @@ def _emit_engine_class_draws(
             p("            }")
         p("            out[n].sorting_layer = _spr_layer[k];")
         p("            out[n].sorting_order = _spr_order[k];")
+        p("            out[n].z = _spr_z[k];")
         p("            out[n].flags = _spr_lit[k];")
         p("            out[n].go = %s;" % (("_engine_go_of_%s(i)" % idn)
                                          if plan.get("_go_of_fn") else "-1"))
@@ -20189,6 +20194,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    int sorting_order; /* SpriteRenderer.m_SortingOrder */")
     p("    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */")
     p("    int go; /* its GameObject (-1: unknown): the 2D effects' table */")
+    p("    float z; /* world z: a tie in layer and order draws the farther first */")
     p("} EngineDraw;")
     p("")
     p(_ENGINE_TRI_TYPEDEF)
@@ -20200,7 +20206,10 @@ def emit_engine(plan, analyses, used_apis):
         p("    const EngineDraw *db = (const EngineDraw *)b;")
         p("    if (da->sorting_layer != db->sorting_layer)")
         p("        return da->sorting_layer - db->sorting_layer;")
-        p("    return da->sorting_order - db->sorting_order;")
+        p("    if (da->sorting_order != db->sorting_order)")
+        p("        return da->sorting_order - db->sorting_order;")
+        # Unity's camera looks down +z: the farther (greater z) draws first
+        p("    return (da->z < db->z) - (da->z > db->z);")
         p("}")
         p("")
     tex_n = len(plan.get("textures") or [])
@@ -20516,6 +20525,7 @@ def _emit_engine_draw_h_base():
         "    int sorting_order; /* SpriteRenderer.m_SortingOrder */\n"
         "    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */\n"
         "    int go; /* its GameObject (-1: unknown): the 2D effects' table */\n"
+        "    float z; /* world z: a tie in layer and order draws the farther first */\n"
         "} EngineDraw;\n"
         "\n"
         + _ENGINE_TRI_TYPEDEF + "\n"
@@ -28940,7 +28950,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 10
+_SCENE_CACHE_VERSION = 11
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",

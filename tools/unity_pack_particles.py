@@ -347,6 +347,7 @@ def emit_collect(p, plan):
     p("            d->tex = -2; /* no texture: its color */")
     p("            d->sorting_layer = 0;")
     p("            d->sorting_order = 0;")
+    p("            d->flags = 0; d->go = -1; d->z = 0.f;")
     p("            *n = *n + 1;")
     p("        }")
     p("    }")
