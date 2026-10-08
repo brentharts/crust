@@ -4430,7 +4430,7 @@ class TestSystems(unittest.TestCase):
     def _emitted_body(self, eng, sym):
         """The lowered body of one emitted engine function."""
         m = re.search(
-            r"(?ms)^static (?:void|int) %s\([^)]*\)\s*\{\n(.*?)^\}"
+            r"(?ms)^static (?:void|int) %s(?:__b)?\([^)]*\)\s*\{\n(.*?)^\}"
             % re.escape(sym), eng)
         self.assertIsNotNone(m, "%s not emitted" % sym)
         return m.group(1)
@@ -5269,7 +5269,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Cam_instance = i;", eng)
         self.assertNotRegex(eng, r"(?<![\w.])instance\s*=\s*i")
         self.assertIn("static int Cam_Instance(void)", eng)
-        awake = eng.split("static void Cam_Awake(", 1)[1].split("\n}", 1)[0]
+        awake = eng.split("static void Cam_Awake__b(", 1)[1].split("\n}", 1)[0]
         self.assertNotIn("not lowered yet", awake)
         self.assertIn("Cam_instance = i", awake)
 
@@ -5380,7 +5380,7 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "engine.cpp")) as f:
             eng = f.read()
         self.assertIn("static int SM_isLoading = 0;", eng)
-        awake = eng.split("static void SM_Awake(", 1)[1].split("\n}", 1)[0]
+        awake = eng.split("static void SM_Awake__b(", 1)[1].split("\n}", 1)[0]
         self.assertIn("SM_isLoading = 0", awake)
 
     def test_toggle_is_on_does_not_span_prior_index_expr(self):
@@ -5443,7 +5443,7 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("static int Item_Rank(unsigned i", eng)
-        rank = eng[eng.find("static int Item_Rank(unsigned i, int other) {"):]
+        rank = eng[eng.find("static int Item_Rank__b(unsigned i, int other) {"):]
         rank = rank[:rank.find("\n}")]
         # Its returns kept, whether the body lowered or is a stub (which
         # returns 0): never a function that falls off its end.
@@ -15870,7 +15870,7 @@ class TestParamLists(_ScriptPackMixin, unittest.TestCase):
             "    }\n"
             "}\n")
         self.assertIn("Tally_Bump(unsigned i, int by)", eng)
-        self.assertIn('Tally_Note(i, "a,b", 2);', eng)
+        self.assertIn('Tally_Note(i, "a,b", 2))', eng)
         self.assertEqual(self._total_after_four_updates(d), 20)  # 4 x (3+2)
 
     @needs_cc
@@ -15888,9 +15888,9 @@ class TestParamLists(_ScriptPackMixin, unittest.TestCase):
             "        Grow();\n"
             "    }\n"
             "}\n")
-        self.assertIn("Tally_Bump(i, 1);", eng)
-        self.assertIn('Tally_Note(i, "a,b", 2);', eng)
-        self.assertIn("Tally_Grow(4);", eng)
+        self.assertIn("Tally_Bump(i, 1))", eng)
+        self.assertIn('Tally_Note(i, "a,b", 2))', eng)
+        self.assertIn("Tally_Grow(4))", eng)
         self.assertEqual(self._total_after_four_updates(d), 12)  # 4 x (1+2)
 
     @needs_cc
@@ -15909,9 +15909,9 @@ class TestParamLists(_ScriptPackMixin, unittest.TestCase):
             "        Hit();\n"
             "    }\n"
             "}\n")
-        self.assertIn("Tally_Bump(i, 2, 1);", eng)
-        self.assertIn("Tally_Bump(i, 1, 3);", eng)
-        self.assertIn("Tally_Hit(i, -1);", eng)  # null handle is -1
+        self.assertIn("Tally_Bump(i, 2, 1))", eng)
+        self.assertIn("Tally_Bump(i, 1, 3))", eng)
+        self.assertIn("Tally_Hit(i, -1))", eng)  # null handle is -1
         self.assertIn("other == -1", eng)
         self.assertEqual(self._total_after_four_updates(d), 420)
 
@@ -15928,7 +15928,7 @@ class TestParamLists(_ScriptPackMixin, unittest.TestCase):
             "    }\n"
             "    void Update() { Hit(); }\n"
             "}\n")
-        self.assertIn("Tally_Hit(i, -1, 0, 0);", eng)
+        self.assertIn("Tally_Hit(i, -1, 0, 0))", eng)
         self.assertEqual(self._total_after_four_updates(d), 20)
 
     def test_non_literal_default_is_still_refused(self):

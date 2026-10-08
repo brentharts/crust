@@ -406,6 +406,7 @@ def emit_collect(p, plan):
     p("            d->sorting_order = _lr_order[s];")
     p("            d->flags = 0;")
     p("            d->go = _lr_go[s];")
+    p("            d->z = 0.f;")
     p("            *n = *n + 1;")
     p("        }")
     p("    }")

@@ -1292,7 +1292,7 @@ class TestStopSite(unittest.TestCase):
                              text=True, timeout=60)
         self.assertEqual(run.returncode, 70, run.stderr[-2000:])
         self.assertIn("SpriteRenderer.bounds", run.stderr)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:5:19)", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:5)", run.stderr)
 
 
 class TestTwoScriptsOneGameObject(unittest.TestCase):
@@ -1356,9 +1356,44 @@ class TestNullFieldRead(unittest.TestCase):
                              text=True, timeout=60)
         self.assertEqual(run.returncode, 70, run.stderr[-2000:])
         self.assertIn("NullReferenceException", run.stderr)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:8:19)", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:8)", run.stderr)
         self.assertIn("tick 1", run.stdout)
         self.assertNotIn("read", run.stdout)
+
+    @needs_cc
+    def test_nre_stack_trace(self):
+        """Unity's trace: the faulting method, then each caller at the
+        line it called from, namespace-qualified."""
+        o = ("using UnityEngine;\npublic class O : MonoBehaviour {\n"
+             "    public Vector2 v;\n}\n")
+        a = ("using UnityEngine;\nnamespace Game {\n"
+             "public class A : MonoBehaviour {\n    public O other;\n"
+             "    float Read() {\n        return other.v.x;\n    }\n"
+             "    void Update() {\n        float x = Read();\n"
+             "        Debug.Log(\"read \" + x);\n    }\n}\n}\n")
+        root = project(self, {"O": o, "A": a}, [("A", None, "  other: {fileID: 0}\n"),
+                                                ("O",)])
+        out = pack(self, root)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f;\n"
+                    "  engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe,
+                            os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 70, run.stderr[-2000:])
+        self.assertIn("NullReferenceException: Object reference not set to an "
+                      "instance of an object\n"
+                      "Game.A.Read () (at Assets/Scripts/A.cs:6)\n"
+                      "Game.A.Update () (at Assets/Scripts/A.cs:9)\n",
+                      run.stderr)
 
 
 class TestMethodGroupStub(unittest.TestCase):
@@ -3000,7 +3035,7 @@ class TestPlayerAwakeItems(unittest.TestCase):
         rc, out, err = _run_rc(self, pack(self, root, strict=False))
         self.assertEqual(rc, 70, out + err)
         self.assertIn("GetComponentsInChildren<Gear> found a Blaster", err)
-        self.assertIn("A.Awake () (at Assets/Scripts/A.cs:7:", err)
+        self.assertIn("A.Awake () (at Assets/Scripts/A.cs:7)", err)
         self.assertNotIn("got", out)
 
 
@@ -3152,14 +3187,52 @@ class TestUnpackedClassCall(unittest.TestCase):
         rc, out, err = _run_rc(self, pack(self, root, strict=False), 2)
         self.assertIn("tick 1", out)
         self.assertNotIn("used", out)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:9)", err)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7)", err)
 
 
-class TestSpriteSwapDropped(unittest.TestCase):
-    """`s = img.sprite;` (Player.Awake's toggle images): the pack draws
-    each Image with its authored sprite, so the statement goes with a
-    CS8000 warning -- but a null Image is still Unity's NRE, at its
-    column."""
+class TestSpriteSwap(unittest.TestCase):
+    """`s = r.sprite;` / `r.sprite = s;` (Player's toggle images, Lasso's
+    hook, SavePoint's touched sprite): a `Sprite` is its texture, and a
+    SpriteRenderer swapped to another draws it at that sprite's size."""
+
+    @needs_cc
+    def test_swap_and_back(self):
+        import struct
+        import zlib
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public SpriteRenderer sr;\n    public Sprite other;\n"
+             "    Sprite orig;\n    int f;\n"
+             "    void Start() { orig = sr.sprite; }\n"
+             "    void Update() {\n        f++;\n"
+             "        if (f == 1) sr.sprite = other;\n"
+             "        else if (f == 2) sr.sprite = orig;\n    }\n}\n")
+        root = project(self, {"A": a}, [(
+            "A", "--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+            "  m_Enabled: 1\n  m_Sprite: {{fileID: 21300000, guid: %s, type: 3}}\n"
+            "  m_Color: {{r: 1, g: 1, b: 1, a: 1}}\n" % ("c" * 32),
+            "  sr: {fileID: 103}\n"
+            "  other: {fileID: 21300000, guid: %s, type: 3}\n" % ("d" * 32))])
+        sd = os.path.join(root, "Assets", "Scripts")
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        for name, w, guid in (("q", 8, "c"), ("r", 16, "d")):
+            with open(os.path.join(sd, name + ".png"), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n"
+                        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, 8, 8, 6, 0, 0, 0))
+                        + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 4 * w) * 8))
+                        + chunk(b"IEND", b""))
+            with open(os.path.join(sd, name + ".png.meta"), "w") as f:
+                f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n"
+                        % (guid * 32))
+        out = pack(self, root)
+        draw = ("EngineDraw b[8]; int n = engine_collect_draws(b, 8), k;\n"
+                "  for (k = 0; k < n; k++) if (b[k].tex >= 0)"
+                " printf(\"w %d half %g %g\\n\", engine_texture_width(b[k].tex),"
+                " b[k].half_w, b[k].half_h);")
+        self.assertEqual(run_frames(self, out, 1, body=draw), ["w 16 half 1 0.5"])
+        self.assertEqual(run_frames(self, out, 2, body=draw), ["w 8 half 0.5 0.5"])
 
     @needs_cc
     def test_null_image_nre(self):
@@ -3170,15 +3243,8 @@ class TestSpriteSwapDropped(unittest.TestCase):
              "        s = img.sprite;\n"
              "        Debug.Log(\"after\");\n    }\n}\n")
         root = project(self, {"A": a}, [("A", None, "  img: {fileID: 0}\n")])
-        err = io.StringIO()
-        out = tempfile.mkdtemp(prefix="upf-out-")
-        self.addCleanup(shutil.rmtree, out, True)
-        with contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            unity_pack.pack(root, out, force=True)
-        self.assertIn("A.cs(7,9): warning CS8000: sprite swaps", err.getvalue())
-        rc, so, se = _run_rc(self, out)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:13)", se)
+        rc, so, se = _run_rc(self, pack(self, root))
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7)", se)
         self.assertNotIn("after", so)
 
 
@@ -3301,6 +3367,64 @@ class TestTilemapTiles(unittest.TestCase):
         self.assertAlmostEqual(t["m00"], -1.0)
         self.assertEqual((t["sprite_file_id"], t["sprite_guid"]), (5, "aa"))
         self.assertEqual((t["g"], t["a"], t["sorting_order"]), (0.5, 0.5, -100))
+
+    @needs_cc
+    def test_a_tie_in_layer_and_order_draws_the_farther_first(self):
+        """Slime Jump's background Tilemaps share layer and order at z 0, -1
+        and -2: Unity draws the farther first, a sprite between them in z
+        between them."""
+        import struct
+        import zlib
+        root = project(self, {"A": "using UnityEngine;\npublic class A :"
+                              " MonoBehaviour { }\n"}, [("A",)])
+        sd = os.path.join(root, "Assets", "Scripts")
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        for w, guid in ((4, "b"), (8, "c"), (16, "d")):
+            with open(os.path.join(sd, "t%d.png" % w), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n"
+                        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, 8, 8, 6, 0, 0, 0))
+                        + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 4 * w) * 8))
+                        + chunk(b"IEND", b""))
+            with open(os.path.join(sd, "t%d.png.meta" % w), "w") as f:
+                f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n"
+                        % (guid * 32))
+
+        def tilemap(fid, z, guid):
+            return (
+                "--- !u!1 &%d\nGameObject:\n  m_Name: TM%d\n  m_IsActive: 1\n"
+                "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: %s}\n  m_Father: {fileID: 0}\n"
+                "--- !u!1839735485 &%d\nTilemap:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Tiles:\n  - first: {x: 0, y: 0, z: 0}\n    second:\n"
+                "      m_TileSpriteIndex: 0\n      m_TileMatrixIndex: 0\n"
+                "      m_TileColorIndex: 0\n  m_TileSpriteArray:\n"
+                "  - m_RefCount: 1\n    m_Data: {fileID: 21300000, guid: %s, type: 3}\n"
+                "  m_TileMatrixArray:\n  - m_RefCount: 1\n    m_Data:\n      e00: 1\n"
+                "      e11: 1\n  m_TileColorArray:\n"
+                "  - m_RefCount: 1\n    m_Data: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!483693784 &%d\nTilemapRenderer:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Enabled: 1\n  m_SortingOrder: -100\n"
+                % (fid, fid, fid + 1, fid, z, fid + 2, fid, guid * 32, fid + 3, fid))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
+            f.write(tilemap(500, "-1", "d") + tilemap(600, "0", "c")
+                    + "--- !u!1 &700\nGameObject:\n  m_Name: Spr\n  m_IsActive: 1\n"
+                    "  m_Component:\n  - component: {fileID: 701}\n"
+                    "  - component: {fileID: 702}\n"
+                    "--- !u!4 &701\nTransform:\n  m_GameObject: {fileID: 700}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: -0.5}\n  m_Father: {fileID: 0}\n"
+                    "--- !u!212 &702\nSpriteRenderer:\n  m_GameObject: {fileID: 700}\n"
+                    "  m_Enabled: 1\n  m_SortingOrder: -100\n"
+                    "  m_Sprite: {fileID: 21300000, guid: %s, type: 3}\n"
+                    "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n" % ("b" * 32))
+        out = pack(self, root, strict=False)
+        self.assertEqual(run_frames(self, out, 1, body=(
+            "EngineDraw b[8]; int n = engine_collect_draws(b, 8), k;\n"
+            "  for (k = 0; k < n; k++) if (b[k].tex >= 0)"
+            " printf(\"w %d\\n\", engine_texture_width(b[k].tex));")),
+            ["w 8", "w 4", "w 16"])
 
 
 if __name__ == "__main__":

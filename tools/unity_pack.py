@@ -4907,10 +4907,24 @@ def _derives_engine_type(a, typename_map, seen=None):
             if b not in typename_map:
                 if not re.match(r"I[A-Z]", b):
                     return True
-            elif _derives_engine_type(analyze_script(typename_map[b], shallow=True),
+            elif _derives_engine_type(_script_bases(typename_map[b]),
                                       typename_map, seen):
                 return True
     return False
+
+
+_SCRIPT_BASES = {}
+
+
+def _script_bases(path):
+    """``{"classes": [{"bases"}]}`` of the script at *path* (shallow, cached
+    by path and mtime)."""
+    key = (path, os.path.getmtime(path))
+    if key not in _SCRIPT_BASES:
+        _SCRIPT_BASES[key] = {"classes": [
+            {"bases": list(c.get("bases") or ())}
+            for c in analyze_script(path, shallow=True).get("classes") or []]}
+    return _SCRIPT_BASES[key]
 
 
 def _inherit_base_members(analyses, typename_map):
@@ -6314,6 +6328,51 @@ def _nre_at_expr(site, line):
     )
 
 
+def _cs_qualified_name(file_text, cls):
+    """*cls* as Unity's stack trace names it: within its namespaces
+    (`SlimeJump.ComplexTimer`)."""
+    scan = cs2cpp._blank(file_text or "")
+    cm = re.search(r"\b(?:class|struct)\s+%s\b" % re.escape(cls), scan)
+    if not cm:
+        return cls
+    names = []
+    for nm in re.finditer(r"\bnamespace\s+([\w.]+)\s*(\{|;)", scan):
+        if nm.start() > cm.start():
+            break
+        close = (_match_close(scan, nm.end() - 1, "{", "}")
+                 if nm.group(2) == "{" else len(scan))
+        if close is not None and close > cm.start():
+            names.append(nm.group(1))
+    return ".".join(names + [cls])
+
+
+def _emit_frame_wrapper(p, lines, hdr, sym, rty, site, m, coll_param):
+    """A lowered method's body becomes `sym__b`; `sym` pushes its stack
+    frame around it, so a script exception prints Unity's trace."""
+    head = lines[hdr]
+    lines[hdr] = head.replace(" %s(" % sym, " %s__b(" % sym, 1)
+    params = head[head.index("(") + 1:head.rindex(")")]
+    args = [] if m.get("static") else ["i"]
+    args += [coll_param] if coll_param else [
+        prm.name for prm in cs2cpp.parse_params(m.get("args") or "")]
+    name = m["name"]
+    cls = m.get("inherited_from") or site["class"]
+    bm = re.match(r"base__(\w+?)__(\w+)$", name)
+    if bm:
+        cls, name = bm.group(1), bm.group(2)
+    p(head)
+    if rty and rty != "void":
+        p("    %s _r;" % rty)
+    p("    _engine_push(%s, %s, %s);" % (
+        _c_string(_cs_qualified_name(site.get("file_text"), cls)),
+        _c_string(name), _c_string(site.get("path") or "")))
+    call = "%s__b(%s)" % (sym, ", ".join(args) if params.strip() != "void" else "")
+    p("    %s;" % (("_r = " + call) if rty and rty != "void" else call))
+    p("    _engine_depth = _engine_depth - 1;")
+    if rty and rty != "void":
+        p("    return _r;")
+
+
 def _nre_line_sites(line, site, ln, syms):
     """One emitted body line (C# line *ln*: the lowering keeps lines): an
     instance accessor in *syms* called on a receiver other than `i` checks
@@ -6699,6 +6758,9 @@ def analyze_script(path, text=None, shallow=False):
     if "SpriteRenderer" in scan and re.search(
             r"(?<![\w.])\w+\s*\.\s*color\s*=(?!=)", scan):
         apis.add("SpriteRenderer.color")
+    if re.search(r"(?<![\w.])Sprite\b", scan) and re.search(
+            r"\.\s*sprite\b", scan):
+        apis.add("Renderer.sprite")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
                  r"(?:eulerAngles\b|Translate\s*\()", scan):
         apis.add("transform.eulerAngles")
@@ -8911,7 +8973,7 @@ def _embedded_struct_rows(by_class, analyses):
             ty = (f.get("ty") or "").split(".")[-1]
             t = info.get(ty)
             if (f["name"] not in sv or f.get("static") or not t
-                    or t.get("bases")):
+                    or t.get("engine_derived", bool(t.get("bases")))):
                 continue
             v = sv[f["name"]]
             rid = "embedded:%d" % next(serial)
@@ -9185,6 +9247,9 @@ def plan_layouts(objects, analyses, two_d=None):
             elif ty in _COLLIDER2D_FIELD_TYPES:
                 # a row of the collider table (GetComponent<Collider2D>'s)
                 members.append((fname, "uint32_t", 32, "idx:" + ty))
+            elif ty == "Sprite":
+                # a texture index (`_sprite_ref_textures`)
+                members.append((fname, "uint32_t", 32, "idx:Sprite"))
             else:
                 # Foreign MonoBehaviour → index into that class's array, as
                 # wide as *that* class's index: the owner's could be
@@ -10361,19 +10426,14 @@ def _emit_engine_gameobject_tables(
     # Unity catches script exceptions: log + unwind the current method.
     p("static jmp_buf _engine_script_jmp;")
     p("static int _engine_in_script = 0;")
+    _emit_trace_runtime(p, plan)
     p("static void _engine_null_reference_at(")
     p("    const char *cls, const char *method,")
     p("    const char *path, int line, int col) {")
     p("    fprintf(stderr, \"NullReferenceException: Object reference "
       "not set to an instance of an object\\n\");")
-    p("    if (cls && method && path && path[0] && line > 0 && col > 0)")
-    p("        fprintf(stderr, \"%s.%s () (at %s:%d:%d)\\n\",")
-    p("                cls, method, path, line, col);")
-    p("    else if (cls && method && path && path[0] && line > 0)")
-    p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
-    p("                cls, method, path, line);")
-    p("    else if (cls && method)")
-    p("        fprintf(stderr, \"%s.%s ()\\n\", cls, method);")
+    p("    (void)col;")
+    p("    _engine_trace(cls, method, path, line);")
     p("    if (_engine_in_script)")
     p("        longjmp(_engine_script_jmp, 1);")
     p("}")
@@ -13572,6 +13632,8 @@ def _emit_engine_instantiate(
             p("    _engine_go_name[go] = \"(Clone)\";")
             if plan.get("_spr_color_cap"):
                 p("    _engine_spr_clone(go, _engine_%s_go_of[src]);" % idn)
+            if plan.get("_spr_tex_cap"):
+                p("    _engine_spr_tex_clone(go, _engine_%s_go_of[src]);" % idn)
             if _multi_scene(plan):
                 p("    _engine_go_scene[go] = _engine_scene_active;")
             if want_ui:
@@ -14281,6 +14343,61 @@ static unsigned _engine_nre_ix(unsigned i) {
 }
 """
 
+# Unity's stack trace: lowered script methods push a frame (`_engine_push`,
+# popped by their wrapper), call sites record the caller's line
+# (`_engine_ln`), and `_engine_trace` prints innermost first.
+# ponytail: frames past 256 deep go unrecorded (still counted).
+_TRACE_RUNTIME = """typedef struct { const char *cls, *method, *path; int line; } _EngineFrame;
+static _EngineFrame _engine_frames[256];
+static int _engine_depth = 0;
+static void _engine_push(const char *cls, const char *method, const char *path) {
+    if (_engine_depth >= 0 && _engine_depth < 256) {
+        _engine_frames[_engine_depth].cls = cls;
+        _engine_frames[_engine_depth].method = method;
+        _engine_frames[_engine_depth].path = path;
+        _engine_frames[_engine_depth].line = 0;
+    }
+    _engine_depth = _engine_depth + 1;
+}
+static int _engine_ln(int line) {
+    if (_engine_depth > 0 && _engine_depth <= 256)
+        _engine_frames[_engine_depth - 1].line = line;
+    return 0;
+}
+static void _engine_frame_print(const char *cls, const char *method,
+                                const char *path, int line) {
+    if (path && path[0] && line > 0)
+        fprintf(stderr, "%s.%s () (at %s:%d)\\n", cls, method, path, line);
+    else if (path && path[0])
+        fprintf(stderr, "%s.%s () (at %s)\\n", cls, method, path);
+    else
+        fprintf(stderr, "%s.%s ()\\n", cls, method);
+}
+static void _engine_trace(const char *cls, const char *method,
+                          const char *path, int line) {
+    int d = _engine_depth < 256 ? _engine_depth : 256;
+    if (d > 0 && line > 0) {
+        d = d - 1;
+        _engine_frame_print(_engine_frames[d].cls, _engine_frames[d].method,
+                            path ? path : _engine_frames[d].path, line);
+    } else if (d == 0 && cls && method)
+        _engine_frame_print(cls, method, path, line);
+    while (d > 0) {
+        d = d - 1;
+        _engine_frame_print(_engine_frames[d].cls, _engine_frames[d].method,
+                            _engine_frames[d].path, _engine_frames[d].line);
+    }
+}
+"""
+
+
+def _emit_trace_runtime(p, plan):
+    if not plan.get("_trace"):
+        plan["_trace"] = True
+        for line in _TRACE_RUNTIME.rstrip("\n").split("\n"):
+            p(line)
+
+
 _NRE_REPORT = ('fprintf(stderr, "NullReferenceException: Object reference '
                'not set to an instance of an object\\n");')
 
@@ -14290,10 +14407,12 @@ def _at_macro(idn, plan):
     if not plan.get("_nre_ix"):
         # no GameObject tables: no script unwinding to skip the method with
         plan["_nre_ix"] = True
-        pre = _NRE_GUARDS % (
-            _NRE_REPORT + '\n        fprintf(stderr, "%s.%s () (at %s:%d:%d)'
-            '\\n", cls, method, path, line, col);\n        exit(70);',
-            _NRE_REPORT + "\n        exit(70);")
+        pre = _TRACE_RUNTIME if not plan.get("_trace") else ""
+        plan["_trace"] = True
+        pre += _NRE_GUARDS % (
+            _NRE_REPORT + "\n        (void)col;"
+            "\n        _engine_trace(cls, method, path, line);\n        exit(70);",
+            _NRE_REPORT + "\n        _engine_trace(0, 0, 0, 0);\n        exit(70);")
     return pre + "#define %s_AT(i) (_%s_inst_array[_engine_nre_ix(i)])" % (
         idn, idn)
 
@@ -14302,6 +14421,7 @@ def _emit_engine_class_groups(
         class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
         want_go_tables):
     """emit_engine: Per-class groups: instance arrays, accessors, statics and script methods."""
+    _emit_trace_runtime(p, plan)
     nn_syms = {}
     for _cn, _cl in plan["classes"].items():
         _members = [m[0] for m in _cl.get("members") or []]
@@ -14310,6 +14430,8 @@ def _emit_engine_class_groups(
         for _mn in _members:
             for _acc in ("get", "set"):
                 nn_syms["%s_%s_%s" % (_c_ident(_cn), _acc, _mn)] = _mn
+    if plan.get("_spr_tex_cap"):
+        nn_syms.update(Renderer_sprite="sprite", Renderer_set_sprite="sprite")
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -14412,6 +14534,7 @@ def _emit_engine_class_groups(
             if not m.get("static") and not (m.get("args") or "").strip():
                 emitted_syms.setdefault((cname, m["name"]), sym)
             rty = _ret_c_ty(m.get("ret"), plan)
+            hdr = len(lines)
             if coll_param:
                 p("static void %s(unsigned i, int %s) {"
                   % (sym, coll_param))
@@ -14559,6 +14682,8 @@ def _emit_engine_class_groups(
                     if line.strip():
                         p("    " + _nre_line_sites(
                             line.rstrip(), site, cs_line + j, nn_syms))
+                p("}")
+                _emit_frame_wrapper(p, lines, hdr, sym, rty, site, m, coll_param)
             p("}")
             p("")
 
@@ -14570,6 +14695,7 @@ def _emit_engine_class_groups(
                 p(indent + "if (setjmp(_engine_script_jmp) == 0)")
                 p(indent + "    %s_%s((unsigned)n);" % (idn, method))
                 p(indent + "_engine_in_script = 0;")
+                p(indent + "_engine_depth = 0;")
             else:
                 p(indent + "%s_%s((unsigned)n);" % (idn, method))
 
@@ -14726,6 +14852,7 @@ def _emit_engine_class_groups(
             p("        if (setjmp(_engine_script_jmp) == 0)")
             p("            %s_Lifecycle((unsigned)n, 0);" % idn)
             p("        _engine_in_script = 0;")
+            p("        _engine_depth = 0;")
         else:
             p("        %s_Lifecycle((unsigned)n, 0);" % idn)
         p("    }")
@@ -14997,6 +15124,60 @@ def _emit_sprite_color_tables(p, plan, cap):
     p("    _engine_spr_set[go] = _engine_spr_has[go];")
     p("    for (k = 0; k < 4 && _engine_spr_has[go]; k = k + 1)")
     p("        _engine_spr_col[go][k] = SpriteRenderer_color(src, k);")
+    p("}")
+    p("")
+
+
+def _emit_sprite_tex_tables(p, plan, cap):
+    """`Image.sprite` / `SpriteRenderer.sprite` by GameObject: a Sprite is
+    its texture index (-1 null). The authored one per GameObject, a
+    script's swap, and whether the draw is sized by its sprite (a
+    SpriteRenderer; an Image keeps its rect); `engine_collect_draws`
+    applies a swap.
+
+    ponytail: reading `.sprite` gives the authored or swapped sprite, not
+    an Animator's current frame; a swapped sliced Image draws stretched."""
+    tex0, sized = {}, {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            sp, gi = o.get("sprite"), o.get("go_index")
+            if sp and gi is not None and 0 <= int(gi) < cap and "tex_id" in sp:
+                tex0[int(gi)] = int(sp["tex_id"])
+                sized[int(gi)] = 0 if sp.get("source") in ("ui", "ui_tmp") else 1
+    plan["_spr_tex_cap"] = cap
+    top = max(tex0) + 1 if tex0 else 1
+    texs = plan.get("textures") or [{"w": 1, "h": 1, "ppu": 1.0}]
+
+    def unit(t, k):
+        ppu = float(t.get("ppu") or 100.0)
+        return "%rf" % (float(t[k]) / (ppu if ppu > 0 else 100.0))
+    p("static int _engine_spr_tex[%d];" % cap)
+    p("static unsigned char _engine_spr_swap[%d];" % cap)
+    p("/* the authored sprite + 1 (0: none) */")
+    p("static int _engine_spr_tex0[%d] = { %s };" % (
+        cap, ", ".join(str(tex0.get(g, -1) + 1) for g in range(top))))
+    p("static unsigned char _engine_spr_sized[%d] = { %s };" % (
+        cap, ", ".join(str(sized.get(g, 0)) for g in range(top))))
+    p("static const float _engine_tex_uw[%d] = { %s };" % (
+        len(texs), ", ".join(unit(t, "w") for t in texs)))
+    p("static const float _engine_tex_uh[%d] = { %s };" % (
+        len(texs), ", ".join(unit(t, "h") for t in texs)))
+    p("static int Renderer_sprite(int go) {")
+    p("    if (go < 0 || go >= %d) return -1;" % cap)
+    p("    if (_engine_spr_swap[go]) return _engine_spr_tex[go];")
+    p("    return _engine_spr_tex0[go] - 1;")
+    p("}")
+    p("static void Renderer_set_sprite(int go, int tex) {")
+    p("    if (go < 0 || go >= %d) return;" % cap)
+    p("    _engine_spr_tex[go] = tex < %d ? tex : -1;" % len(texs))
+    p("    _engine_spr_swap[go] = 1;")
+    p("}")
+    p("static void _engine_spr_tex_clone(int go, int src) {")
+    p("    if (go < 0 || go >= %d || src < 0 || src >= %d) return;" % (cap, cap))
+    p("    _engine_spr_tex[go] = _engine_spr_tex[src];")
+    p("    _engine_spr_swap[go] = _engine_spr_swap[src];")
+    p("    _engine_spr_tex0[go] = _engine_spr_tex0[src];")
+    p("    _engine_spr_sized[go] = _engine_spr_sized[src];")
     p("}")
     p("")
 
@@ -16209,7 +16390,7 @@ def _emit_engine_colliders_2d(
                     return ["_engine_in_script = 1;",
                             "if (setjmp(_engine_script_jmp) == 0)",
                             "    " + call,
-                            "_engine_in_script = 0;"]
+                            "_engine_in_script = 0;", "_engine_depth = 0;"]
                 _godot.emit_signal_dispatch(
                     p, plan, col2d_list, _c_ident,
                     bool(want_destroy and plan.get("go_names")), _guard)
@@ -16249,6 +16430,7 @@ def _emit_engine_colliders_2d(
                         p("                %s_%s(oi, ci_other);"
                           % (idn, msg))
                         p("            _engine_in_script = 0;")
+                        p("            _engine_depth = 0;")
                     else:
                         p("            %s_%s(oi, ci_other);" % (idn, msg))
                     p("        }")
@@ -16393,6 +16575,7 @@ def _emit_engine_colliders_2d(
                     p("            if (setjmp(_engine_script_jmp) == 0)")
                     p("                %s_%s(oi, ci_other);" % (idn, msg))
                     p("            _engine_in_script = 0;")
+                    p("            _engine_depth = 0;")
                 else:
                     p("            %s_%s(oi, ci_other);" % (idn, msg))
                 p("        }")
@@ -17893,6 +18076,10 @@ def _emit_engine_class_draws(
             str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_lit[] = { %s };" % ", ".join(
             str(int(sp.get("lit") or 0)) for _i, sp in spr_idx))
+        # ponytail: the authored z; a script moving z does not re-sort
+        p("        static const float _spr_z[] = { %s };" % ", ".join(
+            "%rf" % float((tuple(cl["instances"][i].get("pos") or ()) + (0, 0, 0))[2])
+            for i, _sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
             str(i) for i, _sp in spr_idx))
         any_ui = any(sp.get("source") in ("ui", "ui_tmp")
@@ -18160,6 +18347,7 @@ def _emit_engine_class_draws(
             p("            }")
         p("            out[n].sorting_layer = _spr_layer[k];")
         p("            out[n].sorting_order = _spr_order[k];")
+        p("            out[n].z = _spr_z[k];")
         p("            out[n].flags = _spr_lit[k];")
         p("            out[n].go = %s;" % (("_engine_go_of_%s(i)" % idn)
                                          if plan.get("_go_of_fn") else "-1"))
@@ -18173,6 +18361,7 @@ def emit_engine(plan, analyses, used_apis):
     lines = []
     p = lines.append
     plan.pop("_nre_ix", None)
+    plan.pop("_trace", None)
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
@@ -18337,7 +18526,9 @@ def emit_engine(plan, analyses, used_apis):
         # a mesh draws while its GameObject is active (unity_pack_mesh)
         or bool(plan.get("mesh_draws"))
         # SpriteEffects2D: effects are per GameObject
-        or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0]))
+        or bool(__import__("tools.unity_pack_common", fromlist=["x"]).FX_USED[0])
+        # a script's sprite / tint applies to its GameObject's draws
+        or "Renderer.sprite" in used_apis or "SpriteRenderer.color" in used_apis)
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
     if want_inst_parent or want_gcic or plan.get("newgo_budget"):
         want_set_parent = True
@@ -18363,12 +18554,8 @@ def emit_engine(plan, analyses, used_apis):
             or want_file_io or soa or want_instantiate
             or plan.get("player_prefs")):
         p("#include <string.h>")
-    if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io or want_go_tables or want_ctor_forbidden
-            or want_app_open_url or plan.get("player_prefs")
-            or "GodotPrint" in used_apis or not plan.get("strict")
-            or plan.get("animators")):
-        p("#include <stdio.h>")
+    # the NRE guards and stack trace print in every engine
+    p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
     want_ref_array = False
@@ -19315,6 +19502,10 @@ def emit_engine(plan, analyses, used_apis):
     if "SpriteRenderer.color" in used_apis and plan.get("go_names"):
         _emit_sprite_color_tables(p, plan, max(
             1, len(plan.get("go_names") or []) + go_spawn_budget))
+    plan["_spr_tex_cap"] = 0
+    if "Renderer.sprite" in used_apis and plan.get("go_names"):
+        _emit_sprite_tex_tables(p, plan, max(
+            1, len(plan.get("go_names") or []) + go_spawn_budget))
     _emit_spawn_sprite_rows(p, plan)
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
     _emit_engine_instantiate(
@@ -20003,6 +20194,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    int sorting_order; /* SpriteRenderer.m_SortingOrder */")
     p("    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */")
     p("    int go; /* its GameObject (-1: unknown): the 2D effects' table */")
+    p("    float z; /* world z: a tie in layer and order draws the farther first */")
     p("} EngineDraw;")
     p("")
     p(_ENGINE_TRI_TYPEDEF)
@@ -20014,7 +20206,10 @@ def emit_engine(plan, analyses, used_apis):
         p("    const EngineDraw *db = (const EngineDraw *)b;")
         p("    if (da->sorting_layer != db->sorting_layer)")
         p("        return da->sorting_layer - db->sorting_layer;")
-        p("    return da->sorting_order - db->sorting_order;")
+        p("    if (da->sorting_order != db->sorting_order)")
+        p("        return da->sorting_order - db->sorting_order;")
+        # Unity's camera looks down +z: the farther (greater z) draws first
+        p("    return (da->z < db->z) - (da->z > db->z);")
         p("}")
         p("")
     tex_n = len(plan.get("textures") or [])
@@ -20088,6 +20283,30 @@ def emit_engine(plan, analyses, used_apis):
         p("                out[r].b = _engine_spr_col[out[r].go][2];")
         p("                out[r].a = _engine_spr_col[out[r].go][3];")
         p("            }")
+        p("    }")
+    if plan.get("_spr_tex_cap"):
+        # a swapped sprite: its texture, a SpriteRenderer at its size; a
+        # null one draws nothing
+        p("    {")
+        p("        int r, w = 0;")
+        p("        for (r = 0; r < n; r = r + 1) {")
+        p("            int go = out[r].go;")
+        p("            if (go >= 0 && go < %d && _engine_spr_swap[go]) {"
+          % plan["_spr_tex_cap"])
+        p("                int t = _engine_spr_tex[go];")
+        p("                if (t < 0) continue;")
+        p("                if (_engine_spr_sized[go] && out[r].tex >= 0) {")
+        p("                    out[r].half_w = out[r].half_w * _engine_tex_uw[t]"
+          " / _engine_tex_uw[out[r].tex];")
+        p("                    out[r].half_h = out[r].half_h * _engine_tex_uh[t]"
+          " / _engine_tex_uh[out[r].tex];")
+        p("                }")
+        p("                out[r].tex = t;")
+        p("            }")
+        p("            out[w] = out[r];")
+        p("            w = w + 1;")
+        p("        }")
+        p("        n = w;")
         p("    }")
     # The main camera's culling mask (Slime Jump hides its World Map layer).
     # ponytail: authored GOs' layers only -- a spawned object or a runtime
@@ -20209,6 +20428,7 @@ def _site_stops(text):
     stops = {n for n, (a, b) in defs.items()
              if n not in ("_engine_nn", "_engine_nre_ix")
              and any("exit(70)" in l for l in lines[a:b])}
+    framed = {n[:-3] for n in defs if n.endswith("__b") and n[:-3] in defs}
 
     def col_for(cs, name):
         for part in reversed(name.split("_")):
@@ -20236,6 +20456,17 @@ def _site_stops(text):
             line = "%s(_engine_at(%s, %d), %s)%s" % (
                 line[:m.start()], head, col_for(cs, m.group(1)),
                 line[m.start():close + 1], line[close + 1:])
+        # a framed method's caller records the line it calls from
+        ln = re.findall(r"-?\d+", head)[-1]
+        calls = [m for m in re.finditer(r"(?<![\w.])(\w+)\(",
+                                        cs2cpp._blank(line))
+                 if m.group(1) in framed]
+        for m in reversed(calls):
+            close = _match_close(cs2cpp._blank(line), m.end() - 1, "(", ")")
+            if close is not None:
+                line = "%s(_engine_ln(%s), %s)%s" % (
+                    line[:m.start()], ln, line[m.start():close + 1],
+                    line[close + 1:])
         lines[k] = line
     if stops:
         # the stopping helpers print the recorded site before they exit
@@ -20258,11 +20489,11 @@ static int _engine_at(const char *cls, const char *method, const char *path,
     _engine_site_path = path; _engine_site_line = line; _engine_site_col = col;
     return 0;
 }
+static void _engine_trace(const char *cls, const char *method,
+                          const char *path, int line);
 static void _engine_site_print(void) {
-    if (_engine_site_cls)
-        fprintf(stderr, "%s.%s () (at %s:%d:%d)\\n", _engine_site_cls,
-                _engine_site_method, _engine_site_path, _engine_site_line,
-                _engine_site_col);
+    _engine_trace(_engine_site_cls, _engine_site_method, _engine_site_path,
+                  _engine_site_line);
 }
 """
 
@@ -20294,6 +20525,7 @@ def _emit_engine_draw_h_base():
         "    int sorting_order; /* SpriteRenderer.m_SortingOrder */\n"
         "    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */\n"
         "    int go; /* its GameObject (-1: unknown): the 2D effects' table */\n"
+        "    float z; /* world z: a tie in layer and order draws the farther first */\n"
         "} EngineDraw;\n"
         "\n"
         + _ENGINE_TRI_TYPEDEF + "\n"
@@ -25454,8 +25686,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     # first: their warnings point into the source by offset
-    body = _trap_shallow_calls(_drop_sprite_swaps(
-        _drop_shader_params(body, plan, site), plan, site), plan, site)
+    body = _trap_shallow_calls(
+        _drop_shader_params(body, plan, site), plan, site)
     # the packed instance index is `i`: a C# local of that name (a loop
     # counter) would take its place in every field access below
     if any(m.group(1) not in ("return", "else", "case", "goto", "throw",
@@ -26395,54 +26627,6 @@ def _drop_shader_params(body, plan, site):
     return body
 
 
-def _drop_sprite_swaps(body, plan, site):
-    """`s = img.sprite;` / `img.sprite = s;` swap an Image's or
-    SpriteRenderer's sprite, and the pack draws each with its authored one:
-    the statement goes with a CS8000 warning, keeping the receiver's
-    NullReferenceException (`__nre(line, col)`, made `_engine_nn` once
-    lowered). Kept -- to stub -- under strict."""
-    if plan.get("strict") or not site or ".sprite" not in body:
-        return body
-    ft = site.get("file_text") or ""
-    at = int(site.get("body_abs") or 0)
-    if not ft:
-        return body
-    decl = cs2cpp._blank(ft)
-    recvs = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*(?:UI\s*\.\s*)?)?"
-                           r"(?:Image|SpriteRenderer)\s+(\w+)\s*[;=,]", decl))
-    sprites = set(re.findall(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?Sprite\s+"
-                             r"(\w+)\s*[;=,]", decl))
-    if not recvs or not sprites:
-        return body
-    alt = lambda names: "|".join(re.escape(n) for n in sorted(
-        names, key=len, reverse=True))
-    th = r"(?:this\s*\.\s*)?"
-    pat = re.compile(
-        r"%s(?:(?:%s)\s*=\s*%s(?P<r1>%s)\s*\.\s*sprite|%s(?P<r2>%s)\s*\.\s*"
-        r"sprite\s*=\s*%s(?:%s))\s*;" % (th, alt(sprites), th, alt(recvs),
-                                         th, alt(recvs), th, alt(sprites)))
-    scan = cs2cpp._blank(body)
-    out, last = [], 0
-    for m in pat.finditer(scan):
-        prev = scan[:m.start()].rstrip()
-        if prev and prev[-1] not in ";{})" and not re.search(r"\belse$", prev):
-            continue
-        g = "r1" if m.group("r1") else "r2"
-        off = _body_src_off(ft, at, body, m.start(g))
-        ln = ft.count("\n", 0, off) + 1
-        col = off - (ft.rfind("\n", 0, off) + 1) + 1
-        sys.stderr.write(_cs_diag(
-            site.get("path") or "<cs>", ft,
-            _body_src_off(ft, at, body, m.start()), "CS8000",
-            "sprite swaps are not drawn by the pack (each draws its authored "
-            "sprite); the statement is dropped", kind="warning") + "\n")
-        out.append(body[last:m.start()])
-        out.append("{ if (%s == null) __nre(%d, %d); }%s" % (
-            m.group(g), ln, col, "\n" * body.count("\n", m.start(), m.end())))
-        last = m.end()
-    return "".join(out) + body[last:]
-
-
 def _call_suffix_sub(text, funcs, suffix, build, args=False):
     """`f(..)<suffix>` for a C call *f* in *funcs*: *build*(call, match);
     with *args*, a *suffix* ending in `(` (a method of the result) is
@@ -26500,6 +26684,15 @@ def _late_call_members(text, plan):
             text = _fill_defaults_after(text, _method_c_symbol(
                 _c_ident(cn), m["name"], m.get("args") or "", False), prms,
                 receiver=True)
+    if plan.get("_spr_tex_cap") and ".sprite" in text:
+        # `r.sprite = s;` / `r.sprite` of an Image / SpriteRenderer field
+        text = _call_suffix_sub(
+            text, gos, r"\s*\.\s*sprite\s*=(?!=)",
+            lambda call, mm: "Renderer_set_sprite(%s, \x01" % call)
+        text = re.sub(r"\x01([^;]*);", r"\1);", text)
+        text = _call_suffix_sub(
+            text, gos, r"\s*\.\s*sprite\b(?!\s*[-+*/]?=(?!=))",
+            lambda call, mm: "Renderer_sprite(%s)" % call)
     if plan.get("go_layers"):
         text = _call_suffix_sub(
             text, gos | set(re.findall(r"\b_engine_go_of_\w+", text)),
@@ -27500,6 +27693,11 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:AudioSource":
                     parts.append(str(_audiosource_field_init_index(
                         plan, o, name)))
+                elif kind == "idx:Sprite":
+                    tex = (plan.get("sprite_ref_tex") or {}).get(
+                        (o.get("object_refs") or {}).get(name))
+                    parts.append(str(tex) if tex is not None
+                                 else "%du" % _idx_null(bits))
                 elif str(kind)[4:] in _COLLIDER2D_FIELD_TYPES:
                     # a collider the table does not hold (a second one on
                     # its GameObject) is null, not another collider
@@ -28194,6 +28392,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     analyses.extend(_inherit_base_members(analyses, typename_map))
     analyses.extend(_analyze_base_interfaces(root, guids, analyses))
+    for a in analyses:
+        for c in a.get("classes") or []:
+            c["engine_derived"] = _derives_engine_type({"classes": [c]}, typename_map)
 
     # Scene stripped MB fileIDs (Button onClick targets) → pack instance mb_ids.
     _alias_onclick_mb_file_ids(objects)
@@ -28749,7 +28950,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 10
+_SCENE_CACHE_VERSION = 11
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -29459,6 +29660,11 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     _ensure_texture_guids(
         plan["textures"], _anim_sprite_guids(objects)
         + _animator_sprite_guids(objects, asset_guids), asset_guids)
+    plan["sprite_ref_tex"] = _sprite_ref_textures(plan["textures"], sorted({
+        (o.get("object_refs") or {}).get(f["name"])
+        for cl in plan["classes"].values() for f in cl.get("fields") or []
+        if f.get("ty") == "Sprite" for o in cl.get("instances") or []}
+        - {None}), asset_guids)
     # a MeshRenderer's material's _MainTex (tools/unity_pack_mesh.py)
     for _o in objects:
         _md = _o.get("mesh_draw")
