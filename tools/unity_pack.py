@@ -619,6 +619,7 @@ _PARTICLE_COMPONENTS = frozenset(("ParticleSystem",))
 import tools.unity_pack_particles as _parts
 import tools.unity_pack_curves as _curves
 import tools.unity_pack_lines as _lines
+import tools.unity_pack_tilemap as _tm
 import tools.unity_pack_mesh as _mesh
 
 
@@ -2977,6 +2978,17 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "mute": int(mute.group(1)) if mute else 0,
                 "clip_guid": clip_g or "",
             }
+        part = {"1839735485": "tilemap", "483693784": "tilemap_renderer",
+                "156049354": "grid"}.get(type_id)
+        if part:
+            try:
+                rec["tilemap_part"] = part
+                rec[part] = (_tm.parse_tilemap(block) if part == "tilemap"
+                             else _tm.parse_renderer(block)
+                             if part == "tilemap_renderer"
+                             else _tm.parse_grid(block, file_id))
+            except _tm.TilemapError as e:
+                raise PackError(str(e))
         by_id[file_id] = rec
 
     # PrefabInstance.m_TransformParent applies to stripped Transforms that
@@ -3000,6 +3012,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
 
     world_cache = {}
     editor_only_xfs = _editor_only_transform_ids(by_id)
+    tiles = _tm.bake_tiles(
+        by_id, lambda xf: _resolve_world_trs(xf, by_id, world_cache),
+        _quat_xy_basis)
 
     # PrefabInstance m_AddedComponents (and any MB whose m_GameObject points
     # at a stripped GO) are not listed on the GO's m_Component — reverse-map
@@ -3752,6 +3767,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         objects, by_id, guid_to_script)
     _annotate_ui_toggle_onvaluechanged_targets(objects, by_id, guid_to_script)
     _annotate_ui_eventtrigger_targets(objects, by_id, guid_to_script)
+    # set last: the prefab parses above call this function too
+    parse_unity_yaml.tiles = tiles
     return objects, lights, cameras, hierarchy
 
 
@@ -18393,7 +18410,7 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <map>")
     if want_map_string:
         p("#include <string>")
-    want_draw_sort = False
+    want_draw_sort = bool(plan.get("tiles"))
     for cl in plan["classes"].values():
         for o in cl["instances"]:
             sp = o.get("sprite")
@@ -20039,6 +20056,7 @@ def emit_engine(plan, analyses, used_apis):
     p("")
     _parts.emit_collect(p, plan)
     _lines.emit_collect(p, plan)
+    _tm.emit_collect(p, plan, _multi_scene(plan))
     p("int _engine_draw_nosort = 0; /* the GPU sorts (gles3_batch.h GPU_SORT) */")
     p("int engine_collect_draws(EngineDraw *out, int max) {")
     p("    int n = 0;")
@@ -20056,6 +20074,9 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_collect(out, &n, max);")
     if plan.get("lines"):
         p("    _lr_collect(out, &n, max);")
+    if plan.get("tiles"):
+        p("    _tm_collect(out, &n, max);")
+        any_sprite = True
     if plan.get("_spr_color_cap"):
         p("    {")
         p("        int r;")
@@ -27987,6 +28008,7 @@ def _load_scenes_lights_cameras(root, assets):
     hierarchy = []
     scenes = _unity_scenes_to_pack(root, asset_guids=assets)
     _progress("packing %d build scene(s)" % len(scenes))
+    tiles = []
     for si, path in enumerate(scenes):
         _progress("  scene %d/%d %s" % (
             si + 1, len(scenes), os.path.relpath(path, root)))
@@ -27996,6 +28018,8 @@ def _load_scenes_lights_cameras(root, assets):
             guid_to_script=guids, asset_guids=assets)
         for rec in objs + scene_lights + scene_cams + scene_hier:
             rec["scene"] = si
+        tiles += [{"tile": True, "scene": si, "sprite": dict(t, scene=si)}
+                  for t in parse_unity_yaml.tiles]
         objects.extend(objs)
         lights.extend(scene_lights)
         cameras.extend(scene_cams)
@@ -28022,7 +28046,7 @@ def _load_scenes_lights_cameras(root, assets):
     # Snapshot rect onto hierarchy before dropping layout-only scaffolds so
     # live RT / GO parent chains still see Canvas / plain Rect parents.
     _snapshot_ui_rects_onto_hierarchy(objects, hierarchy)
-    objects = [o for o in objects if not o.get("ui_scaffold")]
+    objects = [o for o in objects if not o.get("ui_scaffold")] + tiles
     _apply_sprite_sorting(objects, sorting_layers)
     _attach_sprite_textures(objects, assets)
     # Bake layout size (CanvasScaler may live only on dropped Canvas scaffold).
@@ -28232,6 +28256,8 @@ def load_project(root, asset_guids=None):
     load_project.asset_guids = assets
     objects, lights, cameras, hierarchy = _load_scenes_lights_cameras(
         root, assets)
+    # ponytail: Tilemap tiles are drawn by pack() only
+    objects = [o for o in objects if not o.get("tile")]
     analyses = _analyze_scripts_and_prefabs(root, objects, assets)
     return objects, analyses, lights, cameras, hierarchy
 
@@ -28723,7 +28749,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 9
+_SCENE_CACHE_VERSION = 10
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -29236,7 +29262,6 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         objects, lights, cameras, hierarchy, asset_guids = cached
         _attach_sprite_textures(objects, asset_guids)
         load_project.asset_guids = asset_guids
-        analyses = _analyze_scripts_and_prefabs(root, objects, asset_guids)
     else:
         _progress("scanning %s" % os.path.abspath(root))
         _progress("reading .meta guid maps")
@@ -29250,7 +29275,9 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
                 objects, lights, cameras, hierarchy, asset_guids)
         except OSError:
             pass
-        analyses = _analyze_scripts_and_prefabs(root, objects, asset_guids)
+    tiles = [o for o in objects if o.get("tile")]
+    objects = [o for o in objects if not o.get("tile")]
+    analyses = _analyze_scripts_and_prefabs(root, objects, asset_guids)
     used_apis = set()
     for a in analyses:
         used_apis |= a["apis"]
@@ -29420,7 +29447,10 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
         main_cam = cameras[0]
     plan["camera"] = main_cam
     plan["cameras"] = list(cameras)
-    plan["textures"] = _collect_textures(objects)
+    plan["textures"] = _collect_textures(objects + tiles)
+    plan["tiles"] = [{k: v for k, v in o["sprite"].items() if k != "tex_rgba"}
+                     for o in tiles
+                     if o.get("sprite") and "tex_id" in o["sprite"]]
     import tools.unity_pack_common as _cmn
     if _cmn.GPU_BATCH[0]:
         # the 2D GPU path's atlas (tools/unity_pack_gpu2d.py) -- built once

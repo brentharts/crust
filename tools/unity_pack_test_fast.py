@@ -3261,5 +3261,47 @@ class TestPrefabVariants(unittest.TestCase):
         self.assertIn("m_Name: Base", out)
 
 
+class TestTilemapTiles(unittest.TestCase):
+    """Tilemap tiles baked into world-space sprite draws."""
+
+    def test_a_tile_lands_in_its_cell_through_a_flipped_tilemap(self):
+        yaml = (
+            "%YAML 1.1\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Grid\n  m_IsActive: 1\n"
+            "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 1, y: 0, z: 0}\n  m_Father: {fileID: 0}\n"
+            "--- !u!156049354 &12\nGrid:\n  m_GameObject: {fileID: 10}\n"
+            "  m_CellSize: {x: 2, y: 1, z: 1}\n  m_CellLayout: 0\n  m_CellSwizzle: 0\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: Tilemap\n  m_IsActive: 1\n"
+            "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+            "  m_LocalScale: {x: -1, y: 1, z: 1}\n  m_Father: {fileID: 11}\n"
+            "--- !u!1839735485 &22\nTilemap:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Tiles:\n"
+            "  - first: {x: 1, y: 0, z: 0}\n    second:\n      m_TileSpriteIndex: 0\n"
+            "      m_TileMatrixIndex: 0\n      m_TileColorIndex: 0\n"
+            "  - first: {x: 0, y: 0, z: 0}\n    second:\n      m_TileSpriteIndex: 1\n"
+            "      m_TileMatrixIndex: 0\n      m_TileColorIndex: 0\n"
+            "  m_TileSpriteArray:\n"
+            "  - m_RefCount: 1\n    m_Data: {fileID: 5, guid: aa, type: 3}\n"
+            "  - m_RefCount: 1\n    m_Data: {fileID: 0}\n"
+            "  m_TileMatrixArray:\n  - m_RefCount: 2\n    m_Data:\n      e00: 1\n"
+            "      e11: 1\n  m_TileColorArray:\n"
+            "  - m_RefCount: 2\n    m_Data: {r: 1, g: 0.5, b: 1, a: 1}\n"
+            "  m_Color: {r: 1, g: 1, b: 1, a: 0.5}\n"
+            "  m_TileAnchor: {x: 0.5, y: 0.5, z: 0}\n"
+            "--- !u!483693784 &23\nTilemapRenderer:\n  m_GameObject: {fileID: 20}\n"
+            "  m_Enabled: 1\n  m_SortingOrder: -100\n")
+        unity_pack.parse_unity_yaml(yaml)
+        tiles = unity_pack.parse_unity_yaml.tiles
+        self.assertEqual(len(tiles), 1)   # the null-sprite tile is not drawn
+        t = tiles[0]
+        # cell 1 * width 2 + anchor 0.5 * 2 = 3, mirrored, then the Grid's x 1
+        self.assertAlmostEqual(t["x"], -2.0)
+        self.assertAlmostEqual(t["y"], 0.5)
+        self.assertAlmostEqual(t["m00"], -1.0)
+        self.assertEqual((t["sprite_file_id"], t["sprite_guid"]), (5, "aa"))
+        self.assertEqual((t["g"], t["a"], t["sorting_order"]), (0.5, 0.5, -100))
+
+
 if __name__ == "__main__":
     unittest.main()
