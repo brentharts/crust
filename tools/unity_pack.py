@@ -6328,6 +6328,51 @@ def _nre_at_expr(site, line):
     )
 
 
+def _cs_qualified_name(file_text, cls):
+    """*cls* as Unity's stack trace names it: within its namespaces
+    (`SlimeJump.ComplexTimer`)."""
+    scan = cs2cpp._blank(file_text or "")
+    cm = re.search(r"\b(?:class|struct)\s+%s\b" % re.escape(cls), scan)
+    if not cm:
+        return cls
+    names = []
+    for nm in re.finditer(r"\bnamespace\s+([\w.]+)\s*(\{|;)", scan):
+        if nm.start() > cm.start():
+            break
+        close = (_match_close(scan, nm.end() - 1, "{", "}")
+                 if nm.group(2) == "{" else len(scan))
+        if close is not None and close > cm.start():
+            names.append(nm.group(1))
+    return ".".join(names + [cls])
+
+
+def _emit_frame_wrapper(p, lines, hdr, sym, rty, site, m, coll_param):
+    """A lowered method's body becomes `sym__b`; `sym` pushes its stack
+    frame around it, so a script exception prints Unity's trace."""
+    head = lines[hdr]
+    lines[hdr] = head.replace(" %s(" % sym, " %s__b(" % sym, 1)
+    params = head[head.index("(") + 1:head.rindex(")")]
+    args = [] if m.get("static") else ["i"]
+    args += [coll_param] if coll_param else [
+        prm.name for prm in cs2cpp.parse_params(m.get("args") or "")]
+    name = m["name"]
+    cls = m.get("inherited_from") or site["class"]
+    bm = re.match(r"base__(\w+?)__(\w+)$", name)
+    if bm:
+        cls, name = bm.group(1), bm.group(2)
+    p(head)
+    if rty and rty != "void":
+        p("    %s _r;" % rty)
+    p("    _engine_push(%s, %s, %s);" % (
+        _c_string(_cs_qualified_name(site.get("file_text"), cls)),
+        _c_string(name), _c_string(site.get("path") or "")))
+    call = "%s__b(%s)" % (sym, ", ".join(args) if params.strip() != "void" else "")
+    p("    %s;" % (("_r = " + call) if rty and rty != "void" else call))
+    p("    _engine_depth = _engine_depth - 1;")
+    if rty and rty != "void":
+        p("    return _r;")
+
+
 def _nre_line_sites(line, site, ln, syms):
     """One emitted body line (C# line *ln*: the lowering keeps lines): an
     instance accessor in *syms* called on a receiver other than `i` checks
@@ -10375,19 +10420,14 @@ def _emit_engine_gameobject_tables(
     # Unity catches script exceptions: log + unwind the current method.
     p("static jmp_buf _engine_script_jmp;")
     p("static int _engine_in_script = 0;")
+    _emit_trace_runtime(p, plan)
     p("static void _engine_null_reference_at(")
     p("    const char *cls, const char *method,")
     p("    const char *path, int line, int col) {")
     p("    fprintf(stderr, \"NullReferenceException: Object reference "
       "not set to an instance of an object\\n\");")
-    p("    if (cls && method && path && path[0] && line > 0 && col > 0)")
-    p("        fprintf(stderr, \"%s.%s () (at %s:%d:%d)\\n\",")
-    p("                cls, method, path, line, col);")
-    p("    else if (cls && method && path && path[0] && line > 0)")
-    p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
-    p("                cls, method, path, line);")
-    p("    else if (cls && method)")
-    p("        fprintf(stderr, \"%s.%s ()\\n\", cls, method);")
+    p("    (void)col;")
+    p("    _engine_trace(cls, method, path, line);")
     p("    if (_engine_in_script)")
     p("        longjmp(_engine_script_jmp, 1);")
     p("}")
@@ -14295,6 +14335,61 @@ static unsigned _engine_nre_ix(unsigned i) {
 }
 """
 
+# Unity's stack trace: lowered script methods push a frame (`_engine_push`,
+# popped by their wrapper), call sites record the caller's line
+# (`_engine_ln`), and `_engine_trace` prints innermost first.
+# ponytail: frames past 256 deep go unrecorded (still counted).
+_TRACE_RUNTIME = """typedef struct { const char *cls, *method, *path; int line; } _EngineFrame;
+static _EngineFrame _engine_frames[256];
+static int _engine_depth = 0;
+static void _engine_push(const char *cls, const char *method, const char *path) {
+    if (_engine_depth >= 0 && _engine_depth < 256) {
+        _engine_frames[_engine_depth].cls = cls;
+        _engine_frames[_engine_depth].method = method;
+        _engine_frames[_engine_depth].path = path;
+        _engine_frames[_engine_depth].line = 0;
+    }
+    _engine_depth = _engine_depth + 1;
+}
+static int _engine_ln(int line) {
+    if (_engine_depth > 0 && _engine_depth <= 256)
+        _engine_frames[_engine_depth - 1].line = line;
+    return 0;
+}
+static void _engine_frame_print(const char *cls, const char *method,
+                                const char *path, int line) {
+    if (path && path[0] && line > 0)
+        fprintf(stderr, "%s.%s () (at %s:%d)\\n", cls, method, path, line);
+    else if (path && path[0])
+        fprintf(stderr, "%s.%s () (at %s)\\n", cls, method, path);
+    else
+        fprintf(stderr, "%s.%s ()\\n", cls, method);
+}
+static void _engine_trace(const char *cls, const char *method,
+                          const char *path, int line) {
+    int d = _engine_depth < 256 ? _engine_depth : 256;
+    if (d > 0 && line > 0) {
+        d = d - 1;
+        _engine_frame_print(_engine_frames[d].cls, _engine_frames[d].method,
+                            path ? path : _engine_frames[d].path, line);
+    } else if (d == 0 && cls && method)
+        _engine_frame_print(cls, method, path, line);
+    while (d > 0) {
+        d = d - 1;
+        _engine_frame_print(_engine_frames[d].cls, _engine_frames[d].method,
+                            _engine_frames[d].path, _engine_frames[d].line);
+    }
+}
+"""
+
+
+def _emit_trace_runtime(p, plan):
+    if not plan.get("_trace"):
+        plan["_trace"] = True
+        for line in _TRACE_RUNTIME.rstrip("\n").split("\n"):
+            p(line)
+
+
 _NRE_REPORT = ('fprintf(stderr, "NullReferenceException: Object reference '
                'not set to an instance of an object\\n");')
 
@@ -14304,10 +14399,12 @@ def _at_macro(idn, plan):
     if not plan.get("_nre_ix"):
         # no GameObject tables: no script unwinding to skip the method with
         plan["_nre_ix"] = True
-        pre = _NRE_GUARDS % (
-            _NRE_REPORT + '\n        fprintf(stderr, "%s.%s () (at %s:%d:%d)'
-            '\\n", cls, method, path, line, col);\n        exit(70);',
-            _NRE_REPORT + "\n        exit(70);")
+        pre = _TRACE_RUNTIME if not plan.get("_trace") else ""
+        plan["_trace"] = True
+        pre += _NRE_GUARDS % (
+            _NRE_REPORT + "\n        (void)col;"
+            "\n        _engine_trace(cls, method, path, line);\n        exit(70);",
+            _NRE_REPORT + "\n        _engine_trace(0, 0, 0, 0);\n        exit(70);")
     return pre + "#define %s_AT(i) (_%s_inst_array[_engine_nre_ix(i)])" % (
         idn, idn)
 
@@ -14316,6 +14413,7 @@ def _emit_engine_class_groups(
         class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
         want_go_tables):
     """emit_engine: Per-class groups: instance arrays, accessors, statics and script methods."""
+    _emit_trace_runtime(p, plan)
     nn_syms = {}
     for _cn, _cl in plan["classes"].items():
         _members = [m[0] for m in _cl.get("members") or []]
@@ -14426,6 +14524,7 @@ def _emit_engine_class_groups(
             if not m.get("static") and not (m.get("args") or "").strip():
                 emitted_syms.setdefault((cname, m["name"]), sym)
             rty = _ret_c_ty(m.get("ret"), plan)
+            hdr = len(lines)
             if coll_param:
                 p("static void %s(unsigned i, int %s) {"
                   % (sym, coll_param))
@@ -14573,6 +14672,8 @@ def _emit_engine_class_groups(
                     if line.strip():
                         p("    " + _nre_line_sites(
                             line.rstrip(), site, cs_line + j, nn_syms))
+                p("}")
+                _emit_frame_wrapper(p, lines, hdr, sym, rty, site, m, coll_param)
             p("}")
             p("")
 
@@ -14584,6 +14685,7 @@ def _emit_engine_class_groups(
                 p(indent + "if (setjmp(_engine_script_jmp) == 0)")
                 p(indent + "    %s_%s((unsigned)n);" % (idn, method))
                 p(indent + "_engine_in_script = 0;")
+                p(indent + "_engine_depth = 0;")
             else:
                 p(indent + "%s_%s((unsigned)n);" % (idn, method))
 
@@ -14740,6 +14842,7 @@ def _emit_engine_class_groups(
             p("        if (setjmp(_engine_script_jmp) == 0)")
             p("            %s_Lifecycle((unsigned)n, 0);" % idn)
             p("        _engine_in_script = 0;")
+            p("        _engine_depth = 0;")
         else:
             p("        %s_Lifecycle((unsigned)n, 0);" % idn)
         p("    }")
@@ -16223,7 +16326,7 @@ def _emit_engine_colliders_2d(
                     return ["_engine_in_script = 1;",
                             "if (setjmp(_engine_script_jmp) == 0)",
                             "    " + call,
-                            "_engine_in_script = 0;"]
+                            "_engine_in_script = 0;", "_engine_depth = 0;"]
                 _godot.emit_signal_dispatch(
                     p, plan, col2d_list, _c_ident,
                     bool(want_destroy and plan.get("go_names")), _guard)
@@ -16263,6 +16366,7 @@ def _emit_engine_colliders_2d(
                         p("                %s_%s(oi, ci_other);"
                           % (idn, msg))
                         p("            _engine_in_script = 0;")
+                        p("            _engine_depth = 0;")
                     else:
                         p("            %s_%s(oi, ci_other);" % (idn, msg))
                     p("        }")
@@ -16407,6 +16511,7 @@ def _emit_engine_colliders_2d(
                     p("            if (setjmp(_engine_script_jmp) == 0)")
                     p("                %s_%s(oi, ci_other);" % (idn, msg))
                     p("            _engine_in_script = 0;")
+                    p("            _engine_depth = 0;")
                 else:
                     p("            %s_%s(oi, ci_other);" % (idn, msg))
                 p("        }")
@@ -18187,6 +18292,7 @@ def emit_engine(plan, analyses, used_apis):
     lines = []
     p = lines.append
     plan.pop("_nre_ix", None)
+    plan.pop("_trace", None)
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
@@ -18377,12 +18483,8 @@ def emit_engine(plan, analyses, used_apis):
             or want_file_io or soa or want_instantiate
             or plan.get("player_prefs")):
         p("#include <string.h>")
-    if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io or want_go_tables or want_ctor_forbidden
-            or want_app_open_url or plan.get("player_prefs")
-            or "GodotPrint" in used_apis or not plan.get("strict")
-            or plan.get("animators")):
-        p("#include <stdio.h>")
+    # the NRE guards and stack trace print in every engine
+    p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
     want_ref_array = False
@@ -20223,6 +20325,7 @@ def _site_stops(text):
     stops = {n for n, (a, b) in defs.items()
              if n not in ("_engine_nn", "_engine_nre_ix")
              and any("exit(70)" in l for l in lines[a:b])}
+    framed = {n[:-3] for n in defs if n.endswith("__b") and n[:-3] in defs}
 
     def col_for(cs, name):
         for part in reversed(name.split("_")):
@@ -20250,6 +20353,17 @@ def _site_stops(text):
             line = "%s(_engine_at(%s, %d), %s)%s" % (
                 line[:m.start()], head, col_for(cs, m.group(1)),
                 line[m.start():close + 1], line[close + 1:])
+        # a framed method's caller records the line it calls from
+        ln = re.findall(r"-?\d+", head)[-1]
+        calls = [m for m in re.finditer(r"(?<![\w.])(\w+)\(",
+                                        cs2cpp._blank(line))
+                 if m.group(1) in framed]
+        for m in reversed(calls):
+            close = _match_close(cs2cpp._blank(line), m.end() - 1, "(", ")")
+            if close is not None:
+                line = "%s(_engine_ln(%s), %s)%s" % (
+                    line[:m.start()], ln, line[m.start():close + 1],
+                    line[close + 1:])
         lines[k] = line
     if stops:
         # the stopping helpers print the recorded site before they exit
@@ -20272,11 +20386,11 @@ static int _engine_at(const char *cls, const char *method, const char *path,
     _engine_site_path = path; _engine_site_line = line; _engine_site_col = col;
     return 0;
 }
+static void _engine_trace(const char *cls, const char *method,
+                          const char *path, int line);
 static void _engine_site_print(void) {
-    if (_engine_site_cls)
-        fprintf(stderr, "%s.%s () (at %s:%d:%d)\\n", _engine_site_cls,
-                _engine_site_method, _engine_site_path, _engine_site_line,
-                _engine_site_col);
+    _engine_trace(_engine_site_cls, _engine_site_method, _engine_site_path,
+                  _engine_site_line);
 }
 """
 

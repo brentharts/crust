@@ -1292,7 +1292,7 @@ class TestStopSite(unittest.TestCase):
                              text=True, timeout=60)
         self.assertEqual(run.returncode, 70, run.stderr[-2000:])
         self.assertIn("SpriteRenderer.bounds", run.stderr)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:5:19)", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:5)", run.stderr)
 
 
 class TestTwoScriptsOneGameObject(unittest.TestCase):
@@ -1356,9 +1356,44 @@ class TestNullFieldRead(unittest.TestCase):
                              text=True, timeout=60)
         self.assertEqual(run.returncode, 70, run.stderr[-2000:])
         self.assertIn("NullReferenceException", run.stderr)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:8:19)", run.stderr)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:8)", run.stderr)
         self.assertIn("tick 1", run.stdout)
         self.assertNotIn("read", run.stdout)
+
+    @needs_cc
+    def test_nre_stack_trace(self):
+        """Unity's trace: the faulting method, then each caller at the
+        line it called from, namespace-qualified."""
+        o = ("using UnityEngine;\npublic class O : MonoBehaviour {\n"
+             "    public Vector2 v;\n}\n")
+        a = ("using UnityEngine;\nnamespace Game {\n"
+             "public class A : MonoBehaviour {\n    public O other;\n"
+             "    float Read() {\n        return other.v.x;\n    }\n"
+             "    void Update() {\n        float x = Read();\n"
+             "        Debug.Log(\"read \" + x);\n    }\n}\n}\n")
+        root = project(self, {"O": o, "A": a}, [("A", None, "  other: {fileID: 0}\n"),
+                                                ("O",)])
+        out = pack(self, root)
+        with open(os.path.join(out, "h.c"), "w") as f:
+            f.write('#include "engine_draw.h"\nextern float Time_deltaTime;\n'
+                    "int main(int c, char **v) { engine_apply_argv(c, v);\n"
+                    "  Time_deltaTime = 1.f / 60.f;\n"
+                    "  engine_tick(); return 0; }\n")
+        exe = os.path.join(out, "h")
+        r = subprocess.run([_CC, "-O1", "-w", "-I", out, "-o", exe,
+                            os.path.join(out, "h.c"),
+                            os.path.join(out, "engine.c"),
+                            os.path.join(out, "data.c"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        run = subprocess.run([exe, "-logFile", "-"], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(run.returncode, 70, run.stderr[-2000:])
+        self.assertIn("NullReferenceException: Object reference not set to an "
+                      "instance of an object\n"
+                      "Game.A.Read () (at Assets/Scripts/A.cs:6)\n"
+                      "Game.A.Update () (at Assets/Scripts/A.cs:9)\n",
+                      run.stderr)
 
 
 class TestMethodGroupStub(unittest.TestCase):
@@ -3000,7 +3035,7 @@ class TestPlayerAwakeItems(unittest.TestCase):
         rc, out, err = _run_rc(self, pack(self, root, strict=False))
         self.assertEqual(rc, 70, out + err)
         self.assertIn("GetComponentsInChildren<Gear> found a Blaster", err)
-        self.assertIn("A.Awake () (at Assets/Scripts/A.cs:7:", err)
+        self.assertIn("A.Awake () (at Assets/Scripts/A.cs:7)", err)
         self.assertNotIn("got", out)
 
 
@@ -3152,7 +3187,7 @@ class TestUnpackedClassCall(unittest.TestCase):
         rc, out, err = _run_rc(self, pack(self, root, strict=False), 2)
         self.assertIn("tick 1", out)
         self.assertNotIn("used", out)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:9)", err)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7)", err)
 
 
 class TestSpriteSwapDropped(unittest.TestCase):
@@ -3178,7 +3213,7 @@ class TestSpriteSwapDropped(unittest.TestCase):
             unity_pack.pack(root, out, force=True)
         self.assertIn("A.cs(7,9): warning CS8000: sprite swaps", err.getvalue())
         rc, so, se = _run_rc(self, out)
-        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7:13)", se)
+        self.assertIn("A.Update () (at Assets/Scripts/A.cs:7)", se)
         self.assertNotIn("after", so)
 
 
