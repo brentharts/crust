@@ -4907,10 +4907,24 @@ def _derives_engine_type(a, typename_map, seen=None):
             if b not in typename_map:
                 if not re.match(r"I[A-Z]", b):
                     return True
-            elif _derives_engine_type(analyze_script(typename_map[b], shallow=True),
+            elif _derives_engine_type(_script_bases(typename_map[b]),
                                       typename_map, seen):
                 return True
     return False
+
+
+_SCRIPT_BASES = {}
+
+
+def _script_bases(path):
+    """``{"classes": [{"bases"}]}`` of the script at *path* (shallow, cached
+    by path and mtime)."""
+    key = (path, os.path.getmtime(path))
+    if key not in _SCRIPT_BASES:
+        _SCRIPT_BASES[key] = {"classes": [
+            {"bases": list(c.get("bases") or ())}
+            for c in analyze_script(path, shallow=True).get("classes") or []]}
+    return _SCRIPT_BASES[key]
 
 
 def _inherit_base_members(analyses, typename_map):
@@ -8911,7 +8925,7 @@ def _embedded_struct_rows(by_class, analyses):
             ty = (f.get("ty") or "").split(".")[-1]
             t = info.get(ty)
             if (f["name"] not in sv or f.get("static") or not t
-                    or t.get("bases")):
+                    or t.get("engine_derived", bool(t.get("bases")))):
                 continue
             v = sv[f["name"]]
             rid = "embedded:%d" % next(serial)
@@ -28194,6 +28208,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
 
     analyses.extend(_inherit_base_members(analyses, typename_map))
     analyses.extend(_analyze_base_interfaces(root, guids, analyses))
+    for a in analyses:
+        for c in a.get("classes") or []:
+            c["engine_derived"] = _derives_engine_type({"classes": [c]}, typename_map)
 
     # Scene stripped MB fileIDs (Button onClick targets) → pack instance mb_ids.
     _alias_onclick_mb_file_ids(objects)
