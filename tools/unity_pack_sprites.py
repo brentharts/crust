@@ -28,6 +28,7 @@ __all__ = [
     '_collect_textures',
     '_crop_rgba',
     '_ensure_texture_guids',
+    '_sprite_ref_textures',
     '_gos_with_sprite',
     '_layout_parent_pixel_size',
     '_load_png_rgba',
@@ -431,6 +432,36 @@ def _collect_textures(objects):
             })
         sp["tex_id"] = by_key[key]
     return textures
+
+
+def _sprite_ref_textures(textures, refs, asset_guids):
+    """`fid@guid` Sprite asset references (a script's `Sprite` field) →
+    texture index, loading any the table lacks (a sheet slice cropped)."""
+    out = {}
+    for ref in refs:
+        fid, _, g = str(ref).partition("@")
+        if not g or not fid.lstrip("-").isdigit():
+            continue
+        fid, g = int(fid), g.lower()
+        whole = (0, 21300000)
+        hit = next((i for i, t in enumerate(textures) if t.get("guid") == g
+                    and (int(t.get("file_id") or 0) == fid
+                         or fid in whole and int(t.get("file_id") or 0) in whole)),
+                   None)
+        if hit is None:
+            path = (asset_guids or {}).get(g)
+            if not path or not path.lower().endswith(".png"):
+                continue
+            try:
+                w, h, rgba, _border = _load_sprite_rgba(path, fid)
+            except (PackError, IOError):
+                continue
+            hit = len(textures)
+            textures.append({"guid": g, "file_id": fid, "path": path, "w": w,
+                             "h": h, "rgba": rgba,
+                             "ppu": float(_pixels_per_unit(path))})
+        out[ref] = hit
+    return out
 
 
 def _ensure_texture_guids(textures, guids, asset_guids):

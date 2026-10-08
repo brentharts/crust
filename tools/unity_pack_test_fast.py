@@ -3190,11 +3190,49 @@ class TestUnpackedClassCall(unittest.TestCase):
         self.assertIn("A.Update () (at Assets/Scripts/A.cs:7)", err)
 
 
-class TestSpriteSwapDropped(unittest.TestCase):
-    """`s = img.sprite;` (Player.Awake's toggle images): the pack draws
-    each Image with its authored sprite, so the statement goes with a
-    CS8000 warning -- but a null Image is still Unity's NRE, at its
-    column."""
+class TestSpriteSwap(unittest.TestCase):
+    """`s = r.sprite;` / `r.sprite = s;` (Player's toggle images, Lasso's
+    hook, SavePoint's touched sprite): a `Sprite` is its texture, and a
+    SpriteRenderer swapped to another draws it at that sprite's size."""
+
+    @needs_cc
+    def test_swap_and_back(self):
+        import struct
+        import zlib
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    public SpriteRenderer sr;\n    public Sprite other;\n"
+             "    Sprite orig;\n    int f;\n"
+             "    void Start() { orig = sr.sprite; }\n"
+             "    void Update() {\n        f++;\n"
+             "        if (f == 1) sr.sprite = other;\n"
+             "        else if (f == 2) sr.sprite = orig;\n    }\n}\n")
+        root = project(self, {"A": a}, [(
+            "A", "--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+            "  m_Enabled: 1\n  m_Sprite: {{fileID: 21300000, guid: %s, type: 3}}\n"
+            "  m_Color: {{r: 1, g: 1, b: 1, a: 1}}\n" % ("c" * 32),
+            "  sr: {fileID: 103}\n"
+            "  other: {fileID: 21300000, guid: %s, type: 3}\n" % ("d" * 32))])
+        sd = os.path.join(root, "Assets", "Scripts")
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        for name, w, guid in (("q", 8, "c"), ("r", 16, "d")):
+            with open(os.path.join(sd, name + ".png"), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n"
+                        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, 8, 8, 6, 0, 0, 0))
+                        + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 4 * w) * 8))
+                        + chunk(b"IEND", b""))
+            with open(os.path.join(sd, name + ".png.meta"), "w") as f:
+                f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n"
+                        % (guid * 32))
+        out = pack(self, root)
+        draw = ("EngineDraw b[8]; int n = engine_collect_draws(b, 8), k;\n"
+                "  for (k = 0; k < n; k++) if (b[k].tex >= 0)"
+                " printf(\"w %d half %g %g\\n\", engine_texture_width(b[k].tex),"
+                " b[k].half_w, b[k].half_h);")
+        self.assertEqual(run_frames(self, out, 1, body=draw), ["w 16 half 1 0.5"])
+        self.assertEqual(run_frames(self, out, 2, body=draw), ["w 8 half 0.5 0.5"])
 
     @needs_cc
     def test_null_image_nre(self):
@@ -3205,14 +3243,7 @@ class TestSpriteSwapDropped(unittest.TestCase):
              "        s = img.sprite;\n"
              "        Debug.Log(\"after\");\n    }\n}\n")
         root = project(self, {"A": a}, [("A", None, "  img: {fileID: 0}\n")])
-        err = io.StringIO()
-        out = tempfile.mkdtemp(prefix="upf-out-")
-        self.addCleanup(shutil.rmtree, out, True)
-        with contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            unity_pack.pack(root, out, force=True)
-        self.assertIn("A.cs(7,9): warning CS8000: sprite swaps", err.getvalue())
-        rc, so, se = _run_rc(self, out)
+        rc, so, se = _run_rc(self, pack(self, root))
         self.assertIn("A.Update () (at Assets/Scripts/A.cs:7)", se)
         self.assertNotIn("after", so)
 
