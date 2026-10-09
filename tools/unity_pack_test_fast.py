@@ -1059,6 +1059,18 @@ AnimationClip:
         self.assertIn("f5 1 75", out)
         self.assertTrue(any(l.startswith("f20 0 ") for l in out), out)
 
+    @needs_cc
+    def test_speed_zero_freezes(self):
+        """`animator.speed = 0` (Slime Jump's Player.Death) stops the clock."""
+        self.MGR = self.MGR.replace(
+            'if (f == 2) anim.Play("Squash");',
+            'if (f == 2) anim.Play("Squash");\n        if (f == 3) anim.speed = 0;'
+            '\n        if (f == 5) Debug.Log("speed " + anim.speed);')
+        out = run_frames(self, pack(self, self._project()), 5)
+        self.assertIn("f3 1 92", out)
+        self.assertIn("f5 1 92", out)
+        self.assertIn("speed 0", out)
+
     def test_parameters_are_refused(self):
         ctrl = self.CTRL.replace(
             "  m_AnimatorParameters: []\n",
@@ -1175,6 +1187,70 @@ class TestSpriteRendererColor(unittest.TestCase):
         out = run_frames(self, pack(self, root), 2)
         self.assertIn("a1 50 50", out)
         self.assertIn("a2 25 50", out)
+
+    @needs_cc
+    def test_respawn_resets_through_locals(self):
+        """Slime Jump's Respawn loops: `b.spriteRenderer.color =
+        b.spriteRenderer.color.Multiply(f)` (a mutate-and-return
+        extension), `b.trs.position = b.initPos`, `b.gameObject
+        .activeInHierarchy` on a local of a packed class, then `= new T[0]`
+        on a static array and on one of a struct (no storage). `Multiply`
+        is also VectorExtensions', told apart by the receiver's type."""
+        ext = ("using UnityEngine;\npublic static class ColorExtensions {\n"
+               "    public static Color Multiply(this Color c, float f) {\n"
+               "        c.r *= f;\n        c.g *= f;\n        c.b *= f;\n"
+               "        return c;\n    }\n}\n")
+        vext = ("using UnityEngine;\npublic static class VectorExtensions {\n"
+                "    public static Vector3 Multiply(this Vector3 v, float f) {\n"
+                "        return v * f * 3;\n    }\n}\n")
+        rec = ("public struct Rec { public int n;\n"
+               "    public Rec Multiply(Rec o) { return o; }\n}\n")
+        box = ("using UnityEngine;\npublic class Box : MonoBehaviour {\n"
+               "    public SpriteRenderer spriteRenderer;\n"
+               "    public Transform trs;\n    public Vector2 initPos;\n"
+               "    public static Box[] instances = new Box[0];\n"
+               "    public static Rec[] recs = new Rec[0];\n"
+               "    void Awake() { transform.SetParent(null); }\n"
+               "    void LateUpdate() { Debug.Log(\"x \" + Mathf.RoundToInt("
+               "transform.position.x) + \" g \" + Mathf.RoundToInt("
+               "spriteRenderer.color.g * 100f)); }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    int f;\n    void Update() {\n        f++; if (f > 1) return;\n"
+               "        Box.instances = FindObjectsOfType<Box>();\n"
+               "        for (int i = 0; i < Box.instances.Length; i ++) {\n"
+               "            Box b = Box.instances[i];\n"
+               "            b.spriteRenderer.color = b.spriteRenderer.color.Multiply(0.5f);\n"
+               "            b.trs.position = b.initPos;\n"
+               "            if (b.gameObject.activeInHierarchy) Debug.Log(\"act\");\n"
+               "        }\n"
+               "        Box.instances = new Box[0];\n"
+               "        Debug.Log(\"n \" + Box.instances.Length);\n"
+               "        Box.recs = new Rec[0];\n    }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Color: {{r: 1, g: 0.8, b: 1, a: 1}}\n"
+               "  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"ColorExtensions": ext, "VectorExtensions": vext,
+                              "Rec": rec, "Box": box, "Mgr": mgr}, [
+            ("Mgr",), ("Box", spr, "  spriteRenderer: {fileID: 113}\n"
+                       "  trs: {fileID: 111}\n  initPos: {x: 5, y: 2}\n")])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertEqual([l for l in out if l[:2] in ("x ", "ac", "n ")],
+                         ["act", "n 0", "x 5 g 40"])
+
+    @needs_cc
+    def test_enabled(self):
+        """`spriteRenderer.enabled = false` (Slime Jump's Player.Death)."""
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public SpriteRenderer sr;\n    int f;\n"
+               "    void Update() {\n        f++;\n"
+               "        Debug.Log(\"e\" + f + \" \" + (sr.enabled ? 1 : 0));\n"
+               "        sr.enabled = f > 1;\n    }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"Mgr": mgr}, [("Mgr", spr, "  sr: {fileID: 103}\n")])
+        out = run_frames(self, pack(self, root), 3)
+        for want in ("e1 1", "e2 0", "e3 1"):
+            self.assertIn(want, out)
 
 
 class TestHandleEulerZ(unittest.TestCase):
@@ -2947,13 +3023,35 @@ class TestLayerMaskAwake(unittest.TestCase):
         out = run_frames(self, pack(self, root), 1)
         self.assertIn("m 224 4", out)
 
-    def test_written_enabled_refused(self):
+    def test_enabled_writes(self):
+        """Slime Jump's Death / Respawn: `Other.instance.enabled`, a handle
+        field's and its own `enabled` written; OnEnable / OnDisable run at
+        the write, a disabled script does not update, and an authored
+        `m_Enabled: 0` script wakes but is not enabled."""
         a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
-             "    void Start() { if (!enabled) return; Debug.Log(\"on\"); }\n"
-             "    void OnDisable() { enabled = true; }\n}\n")
-        root = project(self, {"A": a}, [("A",)])
-        with self.assertRaises(unity_pack.PackError):
-            pack(self, root)
+             "    public static A instance;\n"
+             "    void Awake() { instance = this; }\n"
+             "    void OnEnable() { Debug.Log(\"a on\"); }\n"
+             "    void OnDisable() { Debug.Log(\"a off\"); }\n"
+             "    void Update() { Debug.Log(\"a upd\"); }\n}\n")
+        b = ("using UnityEngine;\npublic class B : MonoBehaviour {\n"
+             "    public A a;\n"
+             "    void Start() {\n"
+             "        A.instance.enabled = false;\n"
+             "        if (!a.enabled) Debug.Log(\"b sees off\");\n"
+             "        a.enabled = true;\n    }\n"
+             "    void Update() { Debug.Log(\"b upd\"); enabled = false; }\n}\n")
+        c = ("using UnityEngine;\npublic class C : MonoBehaviour {\n"
+             "    void Awake() { Debug.Log(\"c awake\"); }\n"
+             "    void OnEnable() { Debug.Log(\"c on\"); }\n"
+             "    void Update() { Debug.Log(\"c upd\"); }\n}\n")
+        root = project(self, {"A": a, "B": b, "C": c}, [
+            ("A",), ("B", None, "  a: {fileID: 102}\n"),
+            ("C", None, "  m_Enabled: 0\n")])
+        out = run_frames(self, pack(self, root), 2)
+        logs = [l for l in out if l.startswith(("a ", "b ", "c "))]
+        self.assertEqual(logs, ["a on", "c awake", "a off", "b sees off",
+                                "a on", "a upd", "b upd", "a upd"])
 
 
 def _run_rc(test, out, frames=1):
@@ -3393,6 +3491,61 @@ class TestCameraField(unittest.TestCase):
             pack(self, self._project(2, main_tag=1))
 
 
+class TestRigidbodyRowWins(unittest.TestCase):
+    """Two scripts on one GameObject each keep a position copy; physics
+    moves the Rigidbody owner's, so `x.trs.position` reads that one
+    (GameCamera following `Player.instance.trs`, beside AffectedByVortex)."""
+
+    @needs_cc
+    def test_a_transform_read_follows_the_body(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    float x;\n    void Update() { x = transform.position.x; }\n}\n")
+        pl = ("using UnityEngine;\npublic class P : MonoBehaviour {\n"
+              "    public Transform trs;\n    public Rigidbody2D rb;\n    float x;\n"
+              "    void Update() { x = transform.position.x; }\n}\n")
+        r = ("using UnityEngine;\npublic class R : MonoBehaviour {\n"
+             "    public P p;\n"
+             "    void Start() { transform.SetParent(null); }\n"
+             "    void Update() { Vector2 v = p.trs.position; Debug.Log(v.x); }\n}\n")
+        extra = ("--- !u!114 &{fid}\nMonoBehaviour:\n  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_Script: {{fileID: 11500000, guid: %032x}}\n"
+                 "--- !u!50 &104\nRigidbody2D:\n  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 0\n" % 1)
+        root = project(self, {"A": a, "P": pl, "R": r}, [
+            ("P", extra, "  trs: {fileID: 101}\n  rb: {fileID: 104}\n"),
+            ("R", None, "  p: {fileID: 102}\n")])
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            t = f.read()
+        with open(sc, "w") as f:
+            f.write(t.replace("  - component: {fileID: 103}\n",
+                              "  - component: {fileID: 103}\n  - component: {fileID: 104}\n", 1))
+        out = pack(self, root)
+        got = run_frames(self, out, 1, body="engine_rb2d_set_pos(0, 7.f, 0.f); engine_tick();",
+                         pre="void engine_rb2d_set_pos(int rb, float x, float y);\n"
+                             "void engine_box2d_step(void) { }\n")
+        self.assertEqual(got[-1], "7")
+
+    @needs_cc
+    def test_simulated_takes_the_body_out(self):
+        """`rigid.simulated = false` (Slime Jump's Player.Death): the glue's
+        live gate disables the body until it is set again."""
+        pl = ("using UnityEngine;\npublic class P : MonoBehaviour {\n"
+              "    public Rigidbody2D rb;\n    int f;\n"
+              "    void Update() { f++; rb.simulated = f != 1;"
+              " Debug.Log(\"s\" + f + \" \" + (rb.simulated ? 1 : 0)); }\n}\n")
+        rb = ("--- !u!50 &{fid}\nRigidbody2D:\n  m_GameObject: {{fileID: {go}}}\n"
+              "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 0\n")
+        root = project(self, {"P": pl}, [("P", rb, "  rb: {fileID: 103}\n")])
+        got = run_frames(self, pack(self, root), 1, body=(
+            'printf("live %d\\n", engine_rb2d_live(0)); engine_tick();'
+            ' printf("live %d\\n", engine_rb2d_live(0));'),
+            pre="int engine_rb2d_live(int rb);\n"
+                "void engine_box2d_step(void) { }\n")
+        self.assertEqual([l for l in got if l[:1] in "sl"],
+                         ["s1 0", "live 0", "s2 1", "live 1"])
+
+
 class TestMultipleCameras(unittest.TestCase):
     """Every enabled camera renders, lowest depth first: its own view,
     viewport and clear, and only the layers in its culling mask; the main
@@ -3457,6 +3610,130 @@ class TestMultipleCameras(unittest.TestCase):
             "cam 3 size 2 clear 0 rect 0.5: 1",     # depth -1: layer 8 only
             "cam 5 size 5 clear 1 rect 0: 0",       # the main camera, moved
             "all 1"])                                # no pass: the main's view
+
+
+class TestHeartBar(unittest.TestCase):
+    """Slime Jump's Player.Respawn / TakeDamage heart bar: a layout group's
+    children counted, destroyed and cloned through a Transform field, laid
+    out again, and dimmed through their Image."""
+
+    P = """using UnityEngine;
+using UnityEngine.UI;
+public static class ColorExtensions {
+    public static Color SetAlpha (this Color c, float a) { return new Color(c.r, c.g, c.b, a); }
+}
+public class P : MonoBehaviour {
+    public uint maxHp;
+    public Transform hpBarTrs;
+    float hp;
+    void Start() { Respawn(); Respawn(); TakeDamage(1); }
+    void Respawn() {
+        hp = maxHp;
+        if (hpBarTrs.childCount > 1)
+            for (int i = 1; i < maxHp; i ++)
+                DestroyImmediate(hpBarTrs.GetChild(0).gameObject);
+        for (int i = 0; i < hp; i ++)
+        {
+            if (i > hpBarTrs.childCount - 1)
+                Instantiate(hpBarTrs.GetChild(0).gameObject, hpBarTrs);
+            else
+            {
+                Image image = hpBarTrs.GetChild(i).GetComponent<Image>();
+                image.color = image.color.SetAlpha(1);
+            }
+        }
+    }
+    public void TakeDamage (float amount) {
+        float prevHp = hp;
+        hp = Mathf.Clamp(hp - amount, 0, maxHp);
+        if (prevHp > hp && hp > 0)
+            for (int i = 0; i < prevHp - hp; i ++)
+            {
+                Image image = hpBarTrs.GetChild((int) hp - i).GetComponent<Image>();
+                image.color = image.color.SetAlpha(0.25f);
+            }
+    }
+}
+"""
+
+    @staticmethod
+    def _go(fid, name, comps, extra=""):
+        return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_IsActive: 1\n%s"
+                "  m_Component:\n%s" % (fid, name, extra, "".join(
+                    "  - component: {fileID: %d}\n" % c for c in comps)))
+
+    @staticmethod
+    def _rt(fid, go, father, apos, size, pivot, kids=()):
+        return ("--- !u!224 &%d\nRectTransform:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Father: {fileID: %d}\n  m_Children:%s\n"
+                "  m_AnchorMin: {x: 0, y: %d}\n  m_AnchorMax: {x: 0, y: %d}\n"
+                "  m_AnchoredPosition: {x: %s, y: %s}\n"
+                "  m_SizeDelta: {x: %s, y: %s}\n  m_Pivot: {x: %s, y: %s}\n"
+                % (fid, go, father, "".join("\n  - {fileID: %d}" % k for k in kids)
+                   or " []", father != 0, father != 0, apos[0], apos[1],
+                   size[0], size[1], pivot[0], pivot[1]))
+
+    @needs_cc
+    def test_respawn_clones_lays_out_and_dims(self):
+        import struct
+        import zlib
+        root = tempfile.mkdtemp(prefix="upf-hearts-")
+        self.addCleanup(shutil.rmtree, root, True)
+        sd = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(sd)
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(sd, "P.cs"), "w") as f:
+            f.write(self.P)
+        with open(os.path.join(sd, "P.cs.meta"), "w") as f:
+            f.write("guid: %032x\n" % 1)
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        with open(os.path.join(sd, "heart.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 32) * 8))
+                    + chunk(b"IEND", b""))
+        with open(os.path.join(sd, "heart.png.meta"), "w") as f:
+            f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 100\n" % ("c" * 32))
+        mb = ("--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n"
+              "  m_Enabled: 1\n  m_Script: {fileID: 11500000, guid: %s, type: 3}\n")
+        scene = "".join((
+            "%YAML 1.1\n",
+            self._go(1, "Canvas", (2, 3)),
+            self._rt(2, 1, 0, (400, 300), (800, 600), (0.5, 0.5), (11,)),
+            "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n  m_Enabled: 1\n"
+            "  m_RenderMode: 0\n",
+            self._go(10, "Bar", (11, 12)),
+            self._rt(11, 10, 2, (5, -100), (300, 90), (0, 1), (21,)),
+            mb % (12, 10, "30649d3a9faa99c48a7b1166b86bf2a0"),
+            "  m_Padding:\n    m_Left: 0\n    m_Right: 0\n    m_Top: 0\n    m_Bottom: 0\n"
+            "  m_ChildAlignment: 0\n  m_Spacing: 10\n  m_ChildForceExpandWidth: 0\n"
+            "  m_ChildForceExpandHeight: 0\n  m_ChildControlWidth: 0\n"
+            "  m_ChildControlHeight: 0\n",
+            self._go(20, "Heart", (21, 23)),
+            self._rt(21, 20, 11, (45, -45), (90, 90), (0.5, 0.5)),
+            mb % (23, 20, "fe87c0e1cc204ed48ad3b37840f39efc"),
+            "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            "  m_Sprite: {fileID: 21300000, guid: %s, type: 3}\n" % ("c" * 32),
+            self._go(30, "Player", (31, 32)),
+            "--- !u!4 &31\nTransform:\n  m_GameObject: {fileID: 30}\n  m_Father: {fileID: 0}\n",
+            mb % (32, 30, "%032x" % 1), "  maxHp: 3\n  hpBarTrs: {fileID: 11}\n",
+            self._go(40, "Main Camera", (41, 42), "  m_TagString: MainCamera\n"),
+            "--- !u!4 &41\nTransform:\n  m_GameObject: {fileID: 40}\n  m_Father: {fileID: 0}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: -10}\n",
+            "--- !u!20 &42\nCamera:\n  m_GameObject: {fileID: 40}\n  m_Enabled: 1\n"
+            "  orthographic: 1\n  orthographic size: 5\n"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(scene)
+        out = pack(self, root)
+        lines = run_frames(self, out, 1, body=(
+            "EngineDraw b[8]; int n = engine_collect_draws(b, 8), j;\n"
+            "  for (j = 0; j < n; j++) printf(\"%.3f %g\\n\", b[j].x, b[j].a);"))
+        # the second Respawn keeps the last clone and clones it twice; one
+        # heart (90 px) + spacing (10 px) apart; TakeDamage dims the third
+        self.assertEqual(lines, ["-6.016 1", "-4.714 1", "-3.411 0.25"])
 
 
 class TestTilemapTiles(unittest.TestCase):
@@ -3557,6 +3834,18 @@ class TestTilemapTiles(unittest.TestCase):
             "  for (k = 0; k < n; k++) if (b[k].tex >= 0)"
             " printf(\"w %d\\n\", engine_texture_width(b[k].tex));")),
             ["w 8", "w 4", "w 16"])
+
+
+class TestOtherInstanceMap(unittest.TestCase):
+    def test_members_on_the_row(self):
+        """Slime Jump's `vortex.affectedByVortexVelocitiesDict.Clear()`:
+        another object's map is its class's table at the object's row."""
+        import tools.cs2cpp as cs2cpp
+        out = cs2cpp.lower_map_members_named(
+            "V_d[v].Clear(); n = V_d[v].Count; V_d[v].Remove(k);",
+            (), {}, {"V_d"})
+        self.assertEqual(
+            out, "V_d[v].clear(); n = V_d[v].size(); V_d[v].erase(k);")
 
 
 if __name__ == "__main__":

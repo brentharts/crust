@@ -17033,7 +17033,8 @@ class TestProjectPhysicsSettings(unittest.TestCase):
 
     def test_float_and_rational_timestep(self):
         s = unity_pack.unity_physics_settings(
-            self._root("TimeManager:\n  Fixed Timestep: 0.0125\n"))
+            self._root("TimeManager:\n  Fixed Timestep: 0.0125\n  m_TimeScale: 0.7\n"))
+        self.assertEqual(s["time_scale"], 0.7)
         self.assertEqual(s["gravity2d"], (1.5, -25.0))
         self.assertEqual(s["gravity3d"], (0.0, -3.0, 2.0))
         self.assertEqual(s["fixed_dt"], 0.0125)
@@ -17051,7 +17052,7 @@ class TestProjectPhysicsSettings(unittest.TestCase):
     def test_packed_gravity_is_authored(self):
         root = TestBox2DPhysicsBackend()._project()
         shutil.copytree(
-            os.path.join(self._root("TimeManager:\n  Fixed Timestep: 0.01\n"),
+            os.path.join(self._root("TimeManager:\n  Fixed Timestep: 0.01\n  m_TimeScale: 0.7\n"),
                          "ProjectSettings"),
             os.path.join(root, "ProjectSettings"))
         d = tempfile.mkdtemp(prefix="upack-physset-out-")
@@ -17062,6 +17063,7 @@ class TestProjectPhysicsSettings(unittest.TestCase):
         self.assertIn("float Physics2D_gravity_x = 1.5f;", data)
         self.assertIn("float Physics2D_gravity_y = -25.0f;", data)
         self.assertIn("float Time_fixedDeltaTime = 0.01f;", data)
+        self.assertIn("float Time_timeScale = 0.7f;", data)
 
 
 class TestSceneManager(unittest.TestCase):

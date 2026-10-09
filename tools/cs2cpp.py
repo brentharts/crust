@@ -1399,30 +1399,32 @@ def lower_map_types(text, model):
     return text, names
 
 
-def lower_map_members_named(text, names, key_types):
+def lower_map_members_named(text, names, key_types, tables=()):
     """Map members on receivers known by name: `Add`, `Clear`, `Count`,
     `ContainsKey`, `Remove`. `Add(k, v)` binds the key to a local of its
     type first (`key_types[name]`, default `int`), then assigns through the
-    indexer -- a temporary key has no address to pass."""
-    for name in sorted(names, key=len, reverse=True):
-        n = re.escape(name)
+    indexer -- a temporary key has no address to pass. A name of `tables`
+    is a per-instance table, a map only at a row (`Cls_f[o].Clear()`)."""
+    for name in sorted(set(names) | set(tables), key=len, reverse=True):
+        n = "(%s%s)" % (re.escape(name),
+                        r"\s*\[[^\[\]]+\]" if name in tables else "")
         kt = key_types.get(name, "int")
         text = _sub_orig(
             r"(?<![.\w])%s\.Add\s*\(([^,]+),\s*([^)]+)\)" % n,
-            lambda g, nm=name, k=kt: "{ %s __dk = %s; %s[__dk] = %s; }"
-            % (k, g(1).strip(), nm, g(2).strip()), text)
-        text = cpprust._sub_code(
+            lambda g, k=kt: "{ %s __dk = %s; %s[__dk] = %s; }"
+            % (k, g(2).strip(), g(1), g(3).strip()), text)
+        text = _sub_orig(
             r"(?<![.\w])%s\.Clear\s*\(\s*\)" % n,
-            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Clear"]), text)
-        text = cpprust._sub_code(
+            lambda g: "%s.%s()" % (g(1), LIST_METHODS["Clear"]), text)
+        text = _sub_orig(
             r"(?<![.\w])%s\.Count\b" % n,
-            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Count"]), text)
+            lambda g: "%s.%s()" % (g(1), LIST_METHODS["Count"]), text)
         text = _sub_orig(
             r"(?<![.\w])%s\.ContainsKey\s*\(([^)]+)\)" % n,
-            lambda g, nm=name: "(%s.count(%s) != 0)" % (nm, g(1)), text)
+            lambda g: "(%s.count(%s) != 0)" % (g(1), g(2)), text)
         text = _sub_orig(
             r"(?<![.\w])%s\.Remove\s*\(([^)]+)\)" % n,
-            lambda g, nm=name: "%s.erase(%s)" % (nm, g(1)), text)
+            lambda g: "%s.erase(%s)" % (g(1), g(2)), text)
     return text
 
 
@@ -1641,7 +1643,9 @@ def lower_packed_collections(text, owner, others, model, receiver="i"):
                     cls=owner.ident, f=fname, r=receiver)))
     if aliases:
         text = "\n".join(aliases) + "\n" + text
-    text = lower_map_members_named(text, map_names, key_types)
+    text = lower_map_members_named(
+        text, map_names, key_types,
+        {"%s_%s" % (o.ident, f) for o in others for f, _k, _v in o.inst_maps})
     for o in [owner] + others:
         for fname, k, v in o.inst_maps:
             if elem(k) == "std::string":
@@ -5929,6 +5933,53 @@ def static_setter_stmts(body, bscan, member_names=()):
     return _static_property_accessors(body, bscan, member_names)[1]
 
 
+_VALUE_FIELDS = {"Color": "rgba", "Vector2": "xy", "Vector3": "xyz",
+                 "Vector4": "xyzw"}
+
+
+def _mutate_return_expr(ret, params, body, bscan):
+    """`{ c.r *= f; c.g *= f; return c; }` on a by-value Color / Vector
+    parameter of the return type: the copy it returns, as one expression,
+    `new Color((c.r * (f)), (c.g * (f)), c.b, c.a)`. None for any other
+    body."""
+    prms = parse_params(re.sub(r"^\s*this\s+", "", params))
+    fields = _VALUE_FIELDS.get(ret)
+    if not fields or not prms:
+        return None
+    stmts = [s.strip() for s in bscan.split(";")]
+    if stmts[-1] or len(stmts) < 2:
+        return None
+    rm = re.fullmatch(r"return\s+(\w+)", stmts[-2])
+    p = rm and next((q for q in prms if q.name == rm.group(1)
+                     and q.type == ret), None)
+    if not p or "{" in bscan:
+        return None
+    cur = {f: "%s.%s" % (p.name, f) for f in fields}
+    ref = re.compile(r"(?<![\w.])%s\b(?:\s*\.\s*([%s])\b)?" % (
+        re.escape(p.name), fields))
+    pos = 0
+    for s in stmts[:-2]:
+        at = bscan.index(s, pos)
+        pos = at + len(s)
+        sm = re.fullmatch(r"%s\s*\.\s*([%s])\s*([-+*/]?)=\s*(.+)" % (
+            re.escape(p.name), fields), s, re.S)
+        if not sm:
+            return None
+        rhs = body[at + sm.start(3):at + sm.end(3)]
+
+        def sub(m):
+            if not m.group(1):
+                raise ValueError
+            return "(%s)" % cur[m.group(1)]
+        try:
+            rhs = code_sub(ref.pattern, sub, rhs)
+        except ValueError:
+            return None
+        f, op = sm.group(1), sm.group(2)
+        cur[f] = "(%s %s (%s))" % (cur[f], op, rhs) if op else "(%s)" % rhs
+    return "new %s(%s)" % (ret, ", ".join(cur[f] for f in fields))
+
+
 def static_method_exprs(body, bscan, member_names=(), prefer_first=None):
     """``{Name: (params, text, is_void)}`` for static methods declared once
     whose body is one ``return expr;`` / ``=> expr`` (or, for ``void``, one
@@ -5986,9 +6037,15 @@ def static_method_exprs(body, bscan, member_names=(), prefer_first=None):
                 continue
             sm = re.fullmatch(r"\s*(return\s+)?(.+?)\s*;\s*",
                               bscan[at + 1:close], re.S)
-            if not sm or bool(sm.group(1)) == (ret == "void"):
+            if not sm or ";" in sm.group(2):
+                text = _mutate_return_expr(
+                    ret, params, body[at + 1:close], bscan[at + 1:close])
+                if text is None:
+                    continue
+            elif bool(sm.group(1)) == (ret == "void"):
                 continue
-            text = body[at + 1 + sm.start(2):at + 1 + sm.end(2)].strip()
+            else:
+                text = body[at + 1 + sm.start(2):at + 1 + sm.end(2)].strip()
         if not text or ";" in text or "{" in text:
             continue
         prms = parse_params(params)
