@@ -3836,5 +3836,17 @@ class TestTilemapTiles(unittest.TestCase):
             ["w 8", "w 4", "w 16"])
 
 
+class TestOtherInstanceMap(unittest.TestCase):
+    def test_members_on_the_row(self):
+        """Slime Jump's `vortex.affectedByVortexVelocitiesDict.Clear()`:
+        another object's map is its class's table at the object's row."""
+        import tools.cs2cpp as cs2cpp
+        out = cs2cpp.lower_map_members_named(
+            "V_d[v].Clear(); n = V_d[v].Count; V_d[v].Remove(k);",
+            (), {}, {"V_d"})
+        self.assertEqual(
+            out, "V_d[v].clear(); n = V_d[v].size(); V_d[v].erase(k);")
+
+
 if __name__ == "__main__":
     unittest.main()

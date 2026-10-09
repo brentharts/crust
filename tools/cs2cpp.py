@@ -1399,30 +1399,32 @@ def lower_map_types(text, model):
     return text, names
 
 
-def lower_map_members_named(text, names, key_types):
+def lower_map_members_named(text, names, key_types, tables=()):
     """Map members on receivers known by name: `Add`, `Clear`, `Count`,
     `ContainsKey`, `Remove`. `Add(k, v)` binds the key to a local of its
     type first (`key_types[name]`, default `int`), then assigns through the
-    indexer -- a temporary key has no address to pass."""
-    for name in sorted(names, key=len, reverse=True):
-        n = re.escape(name)
+    indexer -- a temporary key has no address to pass. A name of `tables`
+    is a per-instance table, a map only at a row (`Cls_f[o].Clear()`)."""
+    for name in sorted(set(names) | set(tables), key=len, reverse=True):
+        n = "(%s%s)" % (re.escape(name),
+                        r"\s*\[[^\[\]]+\]" if name in tables else "")
         kt = key_types.get(name, "int")
         text = _sub_orig(
             r"(?<![.\w])%s\.Add\s*\(([^,]+),\s*([^)]+)\)" % n,
-            lambda g, nm=name, k=kt: "{ %s __dk = %s; %s[__dk] = %s; }"
-            % (k, g(1).strip(), nm, g(2).strip()), text)
-        text = cpprust._sub_code(
+            lambda g, k=kt: "{ %s __dk = %s; %s[__dk] = %s; }"
+            % (k, g(2).strip(), g(1), g(3).strip()), text)
+        text = _sub_orig(
             r"(?<![.\w])%s\.Clear\s*\(\s*\)" % n,
-            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Clear"]), text)
-        text = cpprust._sub_code(
+            lambda g: "%s.%s()" % (g(1), LIST_METHODS["Clear"]), text)
+        text = _sub_orig(
             r"(?<![.\w])%s\.Count\b" % n,
-            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Count"]), text)
+            lambda g: "%s.%s()" % (g(1), LIST_METHODS["Count"]), text)
         text = _sub_orig(
             r"(?<![.\w])%s\.ContainsKey\s*\(([^)]+)\)" % n,
-            lambda g, nm=name: "(%s.count(%s) != 0)" % (nm, g(1)), text)
+            lambda g: "(%s.count(%s) != 0)" % (g(1), g(2)), text)
         text = _sub_orig(
             r"(?<![.\w])%s\.Remove\s*\(([^)]+)\)" % n,
-            lambda g, nm=name: "%s.erase(%s)" % (nm, g(1)), text)
+            lambda g: "%s.erase(%s)" % (g(1), g(2)), text)
     return text
 
 
@@ -1641,7 +1643,9 @@ def lower_packed_collections(text, owner, others, model, receiver="i"):
                     cls=owner.ident, f=fname, r=receiver)))
     if aliases:
         text = "\n".join(aliases) + "\n" + text
-    text = lower_map_members_named(text, map_names, key_types)
+    text = lower_map_members_named(
+        text, map_names, key_types,
+        {"%s_%s" % (o.ident, f) for o in others for f, _k, _v in o.inst_maps})
     for o in [owner] + others:
         for fname, k, v in o.inst_maps:
             if elem(k) == "std::string":
