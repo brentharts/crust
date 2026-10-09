@@ -2048,6 +2048,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             "sorting_layer_yaml": 0,
             "sorting_order": so,
             "source": source,
+            "ui_mode": int(canvas.get("render_mode") or 0),
             "scale_x": 1.0,
             "scale_y": 1.0,
             "cos_z": 1.0,
@@ -4554,6 +4555,19 @@ def _build_go_tags(plan, go_names):
             continue
         tags[gi] = h.get("tag") or "Untagged"
     return tags
+
+
+def _draw_layer(plan, gi, sp=None):
+    """`EngineDraw.layer`: the layer of GameObject *gi* (go_names index)
+    that the cameras' culling masks test -- or, for a uGUI draw (*sp* its
+    sprite), -1 Screen Space Overlay (drawn after every camera) / -2
+    Screen Space Camera (the main camera's).
+
+    ponytail: the authored layer; `gameObject.layer =` does not re-cull."""
+    if sp and sp.get("source") in ("ui", "ui_tmp"):
+        return -1 if int(sp.get("ui_mode") or 0) == 0 else -2
+    gl = plan.get("go_layers") or []
+    return int(gl[gi]) if gi is not None and 0 <= int(gi) < len(gl) else 0
 
 
 def _build_go_layers(plan, go_names):
@@ -18095,6 +18109,9 @@ def _emit_engine_class_draws(
             str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_lit[] = { %s };" % ", ".join(
             str(int(sp.get("lit") or 0)) for _i, sp in spr_idx))
+        p("        static const int _spr_glayer[] = { %s };" % ", ".join(
+            str(_draw_layer(plan, cl["instances"][i].get("go_index"), sp))
+            for i, sp in spr_idx))
         # ponytail: the authored z; a script moving z does not re-sort
         p("        static const float _spr_z[] = { %s };" % ", ".join(
             "%rf" % float((tuple(cl["instances"][i].get("pos") or ()) + (0, 0, 0))[2])
@@ -18368,6 +18385,7 @@ def _emit_engine_class_draws(
         p("            out[n].sorting_order = _spr_order[k];")
         p("            out[n].z = _spr_z[k];")
         p("            out[n].flags = _spr_lit[k];")
+        p("            out[n].layer = _spr_glayer[k];")
         p("            out[n].go = %s;" % (("_engine_go_of_%s(i)" % idn)
                                          if plan.get("_go_of_fn") else "-1"))
         p("            n = n + 1;")
@@ -20230,6 +20248,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */")
     p("    int go; /* its GameObject (-1: unknown): the 2D effects' table */")
     p("    float z; /* world z: a tie in layer and order draws the farther first */")
+    p("    int layer; /* its GameObject's layer: the cameras' culling masks; -1 Screen")
+    p("                  Space Overlay UI (after every camera), -2 Screen Space Camera UI */")
     p("} EngineDraw;")
     p("")
     p(_ENGINE_TRI_TYPEDEF)
@@ -20561,6 +20581,8 @@ def _emit_engine_draw_h_base():
         "    int flags; /* 1: lit by the 2D lights (URP Sprite-Lit-Default) */\n"
         "    int go; /* its GameObject (-1: unknown): the 2D effects' table */\n"
         "    float z; /* world z: a tie in layer and order draws the farther first */\n"
+        "    int layer; /* its GameObject's layer: the cameras' culling masks; -1 Screen\n"
+        "                  Space Overlay UI (after every camera), -2 Screen Space Camera UI */\n"
         "} EngineDraw;\n"
         "\n"
         + _ENGINE_TRI_TYPEDEF + "\n"
