@@ -3393,6 +3393,72 @@ class TestCameraField(unittest.TestCase):
             pack(self, self._project(2, main_tag=1))
 
 
+class TestMultipleCameras(unittest.TestCase):
+    """Every enabled camera renders, lowest depth first: its own view,
+    viewport and clear, and only the layers in its culling mask; the main
+    camera's view follows its GameObject (GameCamera.HandlePosition)."""
+
+    @needs_cc
+    def test_passes_by_depth_and_mask(self):
+        import struct
+        import zlib
+        noop = "using UnityEngine;\npublic class N : MonoBehaviour { void Update() {} }\n"
+        sprite = ("using UnityEngine;\npublic class S : MonoBehaviour {\n"
+                  "    float x;\n    void Update() { x = transform.position.x; }\n}\n")
+        mover = ("using UnityEngine;\npublic class M : MonoBehaviour {\n"
+                 "    void Update() { transform.position = new Vector3(5f, 0f, -10f); }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Sprite: {{fileID: 21300000, guid: %s, type: 3}}\n"
+               "  m_Color: {{r: 1, g: 1, b: 1, a: 1}}\n" % ("c" * 32))
+
+        def cam(depth, bits, clear, x0, size):
+            return ("--- !u!20 &{fid}\nCamera:\n  m_GameObject: {{fileID: {go}}}\n"
+                    "  m_Enabled: 1\n  m_ClearFlags: %d\n"
+                    "  m_NormalizedViewPortRect:\n    serializedVersion: 2\n"
+                    "    x: %s\n    y: 0\n    width: %s\n    height: 1\n"
+                    "  orthographic: 1\n  orthographic size: %s\n  m_Depth: %s\n"
+                    "  m_CullingMask:\n    serializedVersion: 2\n    m_Bits: %d\n"
+                    % (clear, x0, 1 - x0, size, depth, bits))
+        root = project(self, {"N": noop, "S": sprite, "M": mover}, [
+            ("S", spr), ("S", spr), ("M", cam(0, 1, 2, 0, 5)),
+            ("N", cam(-1, 256, 3, 0.5, 2))])
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(scene) as f:
+            text = f.read()
+        with open(scene, "w") as f:
+            f.write(text.replace("m_Name: S1\n", "m_Name: S1\n  m_Layer: 8\n")
+                    .replace("m_Name: M2\n", "m_Name: M2\n  m_TagString: MainCamera\n")
+                    .replace("{x: 2, y: 0, z: 0}", "{x: 2, y: 0, z: -10}")
+                    .replace("{x: 3, y: 0, z: 0}", "{x: 3, y: 0, z: -10}"))
+        sd = os.path.join(root, "Assets", "Scripts")
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        with open(os.path.join(sd, "q.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 32) * 8))
+                    + chunk(b"IEND", b""))
+        with open(os.path.join(sd, "q.png.meta"), "w") as f:
+            f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n" % ("c" * 32))
+        out = pack(self, root)
+        passes = (
+            "EngineCamera cm[4]; EngineDraw b[8];\n"
+            "  int nc = engine_collect_cameras(cm, 4), k, j, n;\n"
+            "  for (k = 0; k < nc; k++) {\n"
+            "    engine_draw_camera(k); n = engine_collect_draws(b, 8);\n"
+            "    printf(\"cam %g size %g clear %d rect %g:\", cm[k].x, cm[k].half_h,"
+            " cm[k].clear, cm[k].rect_x);\n"
+            "    for (j = 0; j < n; j++) printf(\" %g\", b[j].x);\n"
+            "    printf(\"\\n\");\n  }\n"
+            "  engine_draw_camera(-1); printf(\"all %d\\n\", engine_collect_draws(b, 8));")
+        self.assertEqual(run_frames(self, out, 1, body=passes), [
+            "cam 3 size 2 clear 0 rect 0.5: 1",     # depth -1: layer 8 only
+            "cam 5 size 5 clear 1 rect 0: 0",       # the main camera, moved
+            "all 1"])                                # no pass: the main's view
+
+
 class TestTilemapTiles(unittest.TestCase):
     """Tilemap tiles baked into world-space sprite draws."""
 

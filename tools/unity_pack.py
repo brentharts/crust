@@ -2754,7 +2754,20 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             cull = re.search(
                 r"m_CullingMask:\s*\n\s+serializedVersion:\s*\d+\s*\n"
                 r"\s+m_Bits:\s*(-?\d+)", block)
+            vp = re.search(
+                r"m_NormalizedViewPortRect:\s*\n(?:\s+serializedVersion:.*\n)?"
+                r"\s+x:\s*(\S+)\s*\n\s+y:\s*(\S+)\s*\n\s+width:\s*(\S+)\s*\n"
+                r"\s+height:\s*(\S+)", block)
+            num = lambda k, d: float(  # noqa: E731
+                (re.search(r"(?m)^\s+%s:\s*(-?[0-9.eE+-]+)" % k, block)
+                 or [0, d])[1])
             rec["camera"] = {
+                "enabled": int(num("m_Enabled", 1)),
+                "depth": num("m_Depth", 0),
+                # 1 Skybox, 2 Solid Color: cleared; 3 Depth only, 4 Nothing
+                "clear": int(num("m_ClearFlags", 1)) in (1, 2),
+                "viewport": tuple(float(v) for v in vp.groups())
+                if vp else (0.0, 0.0, 1.0, 1.0),
                 "orthographic": int(ortho.group(1)) if ortho else 1,
                 "orthographic_size": (
                     float(osize.group(1)) if osize else 5.0),
@@ -3429,6 +3442,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "near_clip": cam["near_clip"],
                 "far_clip": cam["far_clip"],
                 "culling_mask": cam.get("culling_mask", 0xFFFFFFFF),
+                "renders": bool(active and cam.get("enabled", 1)),
+                "depth": cam.get("depth", 0.0),
+                "clear": cam.get("clear", True),
+                "viewport": cam.get("viewport", (0.0, 0.0, 1.0, 1.0)),
             })
         # Camera-only GOs are not packed as scripted instances.
         if (cam is not None and script is None and sprite is None
@@ -12964,11 +12981,7 @@ def _emit_engine_scene_camera(p, plan):
         p("static void _engine_scene_set_camera(int s) { (void)s; }")
         return
     sn = len(plan["scenes"])
-    per = []
-    for s in range(sn):
-        cams = [c for c in (plan.get("cameras") or []) if int(c.get("scene") or 0) == s]
-        main = next((c for c in cams if c.get("main")), cams[0] if cams else None)
-        per.append(main)
+    per = _scene_main_cameras(plan)
     fields = (
         ("pos_x", lambda c: c["pos"][0]), ("pos_y", lambda c: c["pos"][1]),
         ("pos_z", lambda c: c["pos"][2]),
@@ -12991,7 +13004,243 @@ def _emit_engine_scene_camera(p, plan):
     for fname, _get in fields:
         p("    Camera_main_%s = _engine_scene_cam_%s[s];" % (fname, fname))
     p("    Camera_main_orthographic = _engine_scene_cam_orthographic[s];")
+    p("    _engine_cam_main = _engine_cam_main_of[s];")
     p("}")
+
+
+def _emit_camera_pass(p, plan):
+    """engine_draw_camera(k): the Camera_main_* globals become entry k's
+    view (its position, size, clip planes, viewport, background) until the
+    next call -- so a host's single-camera pass draws it unchanged -- and
+    engine_collect_draws keeps the draws its culling mask does; the overlay
+    pass, the Screen Space Overlay UI."""
+    main_mask = int(plan["camera"].get("culling_mask", 0xFFFFFFFF)) & 0xFFFFFFFF
+    globs = ["pos_x", "pos_y", "pos_z", "orthographicSize", "aspect",
+             "nearClipPlane", "farClipPlane", "rect_x", "rect_y", "rect_w",
+             "rect_h", "background_r", "background_g", "background_b"]
+    p("static float *const _engine_cam_globals[%d] = { %s };" % (
+        len(globs), ", ".join("&Camera_main_" + g for g in globs)))
+    p("static float _engine_cam_saved[%d];" % len(globs))
+    p("static int _engine_cam_swapped;")
+    p("void engine_draw_camera(int k) {")
+    p("    int r, i;")
+    p("    if (_engine_cam_swapped)")
+    p("        for (i = 0; i < %d; i = i + 1) *_engine_cam_globals[i] = _engine_cam_saved[i];" % len(globs))
+    p("    _engine_cam_swapped = 0;")
+    p("    r = k >= 0 && k < _engine_cam_list_n ? _engine_cam_list[k] : -1;")
+    p("    _engine_cam_pass = r;")
+    p("    if (r < 0 || r == _engine_cam_main) return;")
+    p("    for (i = 0; i < %d; i = i + 1) _engine_cam_saved[i] = *_engine_cam_globals[i];" % len(globs))
+    p("    _engine_cam_swapped = 1;")
+    p("    _engine_cam_pos(r, &Camera_main_pos_x, &Camera_main_pos_y, &Camera_main_pos_z);")
+    p("    Camera_main_orthographicSize = _engine_cam_ortho[r];")
+    p("    Camera_main_aspect = _engine_cam_aspect[r];")
+    p("    if (Camera_main_aspect < 1e-6f && _engine_cam_rect_h[r] > 0.f && Screen_height > 0)")
+    p("        Camera_main_aspect = _engine_cam_rect_w[r] * (float)Screen_width")
+    p("            / (_engine_cam_rect_h[r] * (float)Screen_height);")
+    p("    Camera_main_nearClipPlane = _engine_cam_near[r];")
+    p("    Camera_main_farClipPlane = _engine_cam_far[r];")
+    p("    Camera_main_rect_x = _engine_cam_rect_x[r]; Camera_main_rect_y = _engine_cam_rect_y[r];")
+    p("    Camera_main_rect_w = _engine_cam_rect_w[r]; Camera_main_rect_h = _engine_cam_rect_h[r];")
+    p("    Camera_main_background_r = _engine_cam_bg_r[r];")
+    p("    Camera_main_background_g = _engine_cam_bg_g[r];")
+    p("    Camera_main_background_b = _engine_cam_bg_b[r];")
+    p("}")
+    p("int engine_collect_draws(EngineDraw *out, int max) {")
+    p("    int r = _engine_cam_pass, n = _engine_collect_draws_all(out, max), k, w = 0;")
+    p("    unsigned mask = r >= 0 ? _engine_cam_mask[r] : %uu;" % main_mask)
+    p("    for (k = 0; k < n; k = k + 1) {")
+    p("        int l = out[k].layer;")
+    p("        int keep = r == -2 ? l == -1")
+    p("            : l >= 0 ? (int)((mask >> (l & 31)) & 1u)")
+    p("            : r == -1 || (l == -2 && r == _engine_cam_main);")
+    p("        if (keep) {")
+    p("            out[w] = out[k];")
+    p("            w = w + 1;")
+    p("        }")
+    p("    }")
+    p("    return w;")
+    p("}")
+    p("")
+
+
+def _scene_main_cameras(plan):
+    """Per build scene, the camera Camera.main is there: its MainCamera,
+    else its first Camera (None: the scene has none)."""
+    out = []
+    for s in range(max(1, len(plan.get("scenes") or []))):
+        cams = [c for c in (plan.get("cameras") or []) if int(c.get("scene") or 0) == s]
+        out.append(next((c for c in cams if c.get("main")), cams[0] if cams else None))
+    return out
+
+
+def _emit_engine_cameras(p, plan, class_ids, want_ui, want_destroy):
+    """Every camera that renders (authored enabled and active), for the
+    hosts' per-camera passes: engine_collect_cameras lists the live ones
+    by depth, engine_draw_camera picks the next engine_collect_draws's.
+    Camera.main's row is the Camera_main_* globals (scripts write them);
+    another's position is its GameObject's: its own packed row, else its
+    packed parent's plus its localPosition, else where it was authored."""
+    rows = [c for c in plan.get("cameras") or [] if c.get("renders", True)]
+    n = max(1, len(rows))
+    main_of = [next((k for k, r in enumerate(rows) if r is m), -1)
+               for m in _scene_main_cameras(plan)]
+    go_of = {str(h.get("xf_id")): h.get("go_index")
+             for h in plan.get("scene_hierarchy") or []}
+    xf_to = _xf_rows(plan)
+    world = bool(plan.get("has_transform_parents"))
+
+    def tab(ty, name, vals, const=True):
+        p("static %s%s _engine_cam_%s[%d] = { %s };" % (
+            "const " if const else "", ty, name, n, ", ".join(vals) or "0"))
+
+    def f(v):
+        return "%sf" % repr(float(v))
+
+    def clip(vp):
+        x0, y0 = max(0.0, vp[0]), max(0.0, vp[1])
+        x1, y1 = min(1.0, vp[0] + vp[2]), min(1.0, vp[1] + vp[3])
+        return x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)
+    p("/* ---- cameras: one pass each, by depth (engine_collect_cameras) ---- */")
+    p(_ENGINE_CAMERA_TYPEDEF)
+    p("extern int Screen_width, Screen_height;")
+    tab("int", "scene", [str(int(c.get("scene") or 0)) for c in rows])
+    gos = [go_of.get(str(c.get("xf_id"))) for c in rows]
+    tab("int", "go", [str(int(g)) if g is not None else "-1" for g in gos])
+    tab("float", "depth", [f(c.get("depth", 0.0)) for c in rows])
+    tab("unsigned", "mask", ["%uu" % (int(c.get("culling_mask", 0xFFFFFFFF))
+                                     & 0xFFFFFFFF) for c in rows])
+    tab("int", "clear", [str(int(bool(c.get("clear", True)))) for c in rows])
+    for k, ax in enumerate("xyz"):
+        tab("float", "p" + ax, [f((tuple(c["pos"]) + (0, 0, 0))[k]) for c in rows])
+    tab("float", "near", [f(c.get("near_clip", 0.3)) for c in rows])
+    tab("float", "far", [f(c.get("far_clip", 1000.0)) for c in rows])
+    for k, ch in enumerate("rgb"):
+        tab("float", "bg_" + ch, [f(c["bg_" + ch]) for c in rows])
+    # what a script may set on a camera that is not Camera.main
+    tab("float", "ortho", [f(c["orthographic_size"]) for c in rows], False)
+    tab("float", "aspect", ["0.f" for _c in rows], False)
+    for k, ax in enumerate(("x", "y", "w", "h")):
+        tab("float", "rect_" + ax, [f(clip(c.get("viewport") or (0, 0, 1, 1))[k])
+                                    for c in rows], False)
+    p("static const int _engine_cam_main_of[%d] = { %s };" % (
+        len(main_of), ", ".join(map(str, main_of))))
+    p("static int _engine_cam_main = %d;" % main_of[0])
+    p("static int _engine_cam_n = %d;" % len(rows))
+
+    def pos_of(cname, inst):
+        cl = plan["classes"][cname]
+        if world:
+            return "_engine_world_pos(%d, %d, x, y, z, 0);" % (class_ids[cname], inst)
+        idn = _c_ident(cname)
+        z = ("*z = %s_get_pos_z(%d);" % (idn, inst)
+             if "pos_z" in {m[0] for m in cl["members"]} else "")
+        return "*x = %s_get_pos_x(%d); *y = %s_get_pos_y(%d); %s" % (
+            idn, inst, idn, inst, z)
+    p("/* its live world position */")
+    p("static void _engine_cam_pos(int r, float *x, float *y, float *z) {")
+    p("    *x = _engine_cam_px[r]; *y = _engine_cam_py[r]; *z = _engine_cam_pz[r];")
+    p("    switch (r) {")
+    moves = []
+    for k, c in enumerate(rows):
+        own = xf_to.get(str(c.get("xf_id")))
+        par = xf_to.get(str(c.get("father_id"))) if c.get("father_id") else None
+        if own and _class_has_position(plan["classes"][own[0]]):
+            p("    case %d: %s break;" % (k, pos_of(*own)))
+        elif par and _class_has_position(plan["classes"][par[0]]):
+            lp = tuple(c.get("local_pos") or (0.0, 0.0, 0.0)) + (0.0, 0.0, 0.0)
+            p("    case %d: %s *x = *x + %s; *y = *y + %s; *z = *z + %s; break;" % (
+                k, pos_of(*par), f(lp[0]), f(lp[1]), f(lp[2])))
+        else:
+            continue
+        moves.append(k)
+    p("    default: break;")
+    p("    }")
+    p("}")
+    p("static int _engine_cam_live(int r) {")
+    p("    int go = _engine_cam_go[r];")
+    p("    (void)go;")
+    if _multi_scene(plan):
+        p("    if (!_engine_scene_loaded[_engine_cam_scene[r]]) return 0;")
+    if want_ui:
+        p("    if (go >= 0 && !_engine_go_active_in_hierarchy(go)) return 0;")
+    if want_destroy and plan.get("go_names"):
+        p("    if (go >= 0 && _engine_go_destroyed[go]) return 0;")
+    p("    return 1;")
+    p("}")
+    # Camera.main follows its GameObject -- unless a script moved it (a
+    # write to Camera.main.transform.position) since the GameObject last did
+    skip = (main_of[0] if plan.get("camera_follows_parent") else -1)
+    p("/* Camera.main's GameObject moved since last time: the view follows")
+    p("   (a script's Camera.main.transform.position write stands until then) */")
+    p("static void _engine_cam_sync_main(void) {")
+    p("    static float lx, ly, lz;")
+    p("    static int lr = -1;")
+    p("    float x, y, z;")
+    p("    int r = _engine_cam_main;")
+    p("    if (r < 0 || r == %d) return;" % skip)
+    p("    switch (r) { %sbreak; default: return; }" % "".join(
+        "case %d: " % k for k in moves) if moves else "    return;")
+    p("    _engine_cam_pos(r, &x, &y, &z);")
+    p("    if (lr != r || x != lx || y != ly || z != lz) {")
+    p("        Camera_main_pos_x = x; Camera_main_pos_y = y; Camera_main_pos_z = z;")
+    p("    }")
+    p("    lx = x; ly = y; lz = z; lr = r;")
+    p("}")
+    overlay = any(
+        (o.get("sprite") or {}).get("source") in ("ui", "ui_tmp")
+        and _draw_layer(plan, None, o["sprite"]) == -1
+        for cl in plan["classes"].values() for o in cl.get("instances") or [])
+    p("/* -1: no pass picked (the main camera and the overlay UI); -2: the")
+    p("   overlay pass; else a row */")
+    p("static int _engine_cam_pass = -1;")
+    p("static int _engine_cam_list[%d];" % (n + 1))
+    p("static int _engine_cam_list_n;")
+    p("void engine_draw_camera(int k);")
+    p("int engine_collect_cameras(EngineCamera *out, int max) {")
+    p("    int r, k, m = 0;")
+    p("    engine_draw_camera(-1);")
+    p("    _engine_cam_sync_main();")
+    p("    for (r = 0; r < _engine_cam_n; r = r + 1) {")
+    p("        if (!_engine_cam_live(r)) continue;")
+    p("        /* by depth, a tie in row order (insertion) */")
+    p("        for (k = m; k > 0 && _engine_cam_depth[_engine_cam_list[k - 1]]"
+      " > _engine_cam_depth[r]; k = k - 1)")
+    p("            _engine_cam_list[k] = _engine_cam_list[k - 1];")
+    p("        _engine_cam_list[k] = r;")
+    p("        m = m + 1;")
+    p("    }")
+    if overlay:
+        p("    _engine_cam_list[m] = -2;")
+        p("    m = m + 1;")
+    p("    _engine_cam_list_n = m;")
+    p("    for (k = 0; k < m && k < max; k = k + 1) {")
+    p("        EngineCamera *c = &out[k];")
+    p("        float z;")
+    p("        r = _engine_cam_list[k];")
+    p("        if (r < 0 || r == _engine_cam_main) {")
+    p("            c->x = Camera_main_pos_x; c->y = Camera_main_pos_y;")
+    p("            c->half_h = Camera_main_orthographicSize;")
+    p("            c->aspect = Camera_main_aspect;")
+    p("            c->rect_x = Camera_main_rect_x; c->rect_y = Camera_main_rect_y;")
+    p("            c->rect_w = Camera_main_rect_w; c->rect_h = Camera_main_rect_h;")
+    p("            c->bg_r = Camera_main_background_r;")
+    p("            c->bg_g = Camera_main_background_g;")
+    p("            c->bg_b = Camera_main_background_b;")
+    p("        } else {")
+    p("            _engine_cam_pos(r, &c->x, &c->y, &z);")
+    p("            c->half_h = _engine_cam_ortho[r];")
+    p("            c->aspect = _engine_cam_aspect[r];")
+    p("            c->rect_x = _engine_cam_rect_x[r]; c->rect_y = _engine_cam_rect_y[r];")
+    p("            c->rect_w = _engine_cam_rect_w[r]; c->rect_h = _engine_cam_rect_h[r];")
+    p("            c->bg_r = _engine_cam_bg_r[r]; c->bg_g = _engine_cam_bg_g[r];")
+    p("            c->bg_b = _engine_cam_bg_b[r];")
+    p("        }")
+    p("        c->clear = r >= 0 && _engine_cam_clear[r];")
+    p("    }")
+    p("    return m < max ? m : max;")
+    p("}")
+    p("")
 
 
 def _emit_engine_ui(
@@ -20047,6 +20296,10 @@ def emit_engine(plan, analyses, used_apis):
             p("    Camera_main_pos_z = pz + Camera_main_local_z;")
         p("}")
         p("")
+    if plan.get("camera"):
+        if want_ui:
+            p("static int _engine_go_active_in_hierarchy(int go);")
+        _emit_engine_cameras(p, plan, class_ids, want_ui, want_destroy)
 
     if want_col3d:
         # 2D friction / bounciness combine in Box2D-Packed (box2d_unity.py).
@@ -20228,6 +20481,8 @@ def emit_engine(plan, analyses, used_apis):
         p("    _ps_update(Time_deltaTime); /* after LateUpdate, as Unity's */")
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
+    if plan.get("camera"):
+        p("    _engine_cam_sync_main();")
     p("    Time_deltaTime = Time_unscaledDeltaTime; /* the host's dt again */")
     p("}")
     p("")
@@ -20308,11 +20563,15 @@ def emit_engine(plan, analyses, used_apis):
     _lines.emit_collect(p, plan)
     _tm.emit_collect(p, plan, _multi_scene(plan))
     p("int _engine_draw_nosort = 0; /* the GPU sorts (gles3_batch.h GPU_SORT) */")
-    p("int engine_collect_draws(EngineDraw *out, int max) {")
+    p("%s(EngineDraw *out, int max) {" % (
+        "static int _engine_collect_draws_all" if plan.get("camera")
+        else "int engine_collect_draws"))
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
+    if plan.get("camera"):
+        p("    _engine_cam_sync_main();")
     any_sprite = False
     has_cam = bool(plan.get("camera"))
     mutable_spr = set(plan.get("sprite_draw_mutable") or [])
@@ -20363,25 +20622,6 @@ def emit_engine(plan, analyses, used_apis):
         p("        }")
         p("        n = w;")
         p("    }")
-    # The main camera's culling mask (Slime Jump hides its World Map layer).
-    # ponytail: authored GOs' layers only -- a spawned object or a runtime
-    # `gameObject.layer =` is always drawn; a live layer table if needed
-    mask = int((plan.get("camera") or {}).get("culling_mask", 0xFFFFFFFF))
-    gl = plan.get("go_layers") or []
-    culled = [0 if mask >> (int(l) & 31) & 1 else 1 for l in gl]
-    if any(culled):
-        p("    {")
-        p("        static const unsigned char culled[%d] = { %s };"
-          % (len(culled), ", ".join(map(str, culled))))
-        p("        int r, w = 0;")
-        p("        for (r = 0; r < n; r = r + 1)")
-        p("            if (out[r].go < 0 || out[r].go >= %d || !culled[out[r].go]) {"
-          % len(culled))
-        p("                out[w] = out[r];")
-        p("                w = w + 1;")
-        p("            }")
-        p("        n = w;")
-        p("    }")
     _want_gpu_sprites = bool(plan.get("gpu_atlas"))
     if not any_sprite and not plan.get("particles"):
         p("    /* no authored SpriteRenderers — nothing to draw */")
@@ -20391,6 +20631,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    return n;")
     p("}")
     p("")
+    if plan.get("camera"):
+        _emit_camera_pass(p, plan)
     _emit_bounds(p, plan)
     if _want_gpu_sprites:
         import tools.unity_pack_gpu2d as _gpu
@@ -20553,6 +20795,17 @@ static void _engine_site_print(void) {
 """
 
 
+_ENGINE_CAMERA_TYPEDEF = """typedef struct EngineCamera {
+    float x, y;                         /* world position: the view's centre */
+    float half_h;                       /* orthographicSize */
+    float aspect;                       /* Camera.aspect; 0: the viewport's */
+    float rect_x, rect_y, rect_w, rect_h; /* Camera.rect, normalized */
+    float bg_r, bg_g, bg_b;             /* backgroundColor */
+    int clear;                          /* 1: clear to bg first (Solid Color / Skybox) */
+} EngineCamera;
+"""
+
+
 def emit_engine_draw_h():
     """Public draw-list API written next to engine.c so hosts stay in sync."""
     import tools.unity_pack_common as _cmn
@@ -20585,6 +20838,14 @@ def _emit_engine_draw_h_base():
         "                  Space Overlay UI (after every camera), -2 Screen Space Camera UI */\n"
         "} EngineDraw;\n"
         "\n"
+        + _ENGINE_CAMERA_TYPEDEF +
+        "/* The cameras that render this frame, lowest depth first, and last an\n"
+        " * overlay pass (Screen Space Overlay UI) when there is one; 0: no camera\n"
+        " * (draw the Camera_main_* view). engine_draw_camera(k) makes the\n"
+        " * Camera_main_* globals entry k's view and the next engine_collect_draws\n"
+        " * what it sees; -1 restores the main camera's (with the overlay UI). */\n"
+        "int engine_collect_cameras(EngineCamera *out, int max);\n"
+        "void engine_draw_camera(int k);\n"
         + _ENGINE_TRI_TYPEDEF + "\n"
         "/* MeshFilter / MeshRenderer triangles, world space, active only */\n"
         "int engine_collect_tris(EngineTri *out, int max);\n"
@@ -29095,7 +29356,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 11
+_SCENE_CACHE_VERSION = 12
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
