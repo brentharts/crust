@@ -328,6 +328,8 @@ static GLuint build_program(void)
     return p;
 }
 
+static GLuint white_tex;
+
 static int upload_textures(void)
 {
     int i;
@@ -420,8 +422,6 @@ static void poll_input_axes(GLFWwindow *win)
             glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     }
 }
-
-static GLuint white_tex;
 
 static void draw_one(const EngineDraw *d)
 {
