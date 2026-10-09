@@ -43,6 +43,16 @@ float Camera_main_rect_w __attribute__((weak)) = 1.f;
 float Camera_main_rect_h __attribute__((weak)) = 1.f;
 /* 1: world y points down the screen (Godot's pixels) */
 int Camera_main_y_down __attribute__((weak)) = 0;
+/* A pack with no Camera: no passes, the Camera_main_* view alone. */
+int engine_collect_cameras(EngineCamera *out, int max) __attribute__((weak));
+int engine_collect_cameras(EngineCamera *out, int max)
+{
+    (void)out;
+    (void)max;
+    return 0;
+}
+void engine_draw_camera(int k) __attribute__((weak));
+void engine_draw_camera(int k) { (void)k; }
 
 #define WIDTH  96
 #define HEIGHT 64
@@ -355,58 +365,54 @@ static int upload_textures(void)
 #include "gles2_batch.h"
 #endif
 
-static int draw_scene(GLuint prog)
+/* Camera.rect's pixels for the camera the Camera_main_* globals are,
+ * cleared to its background when it clears (Solid Color / Skybox); the
+ * scissor keeps the clear inside the rect (the letterbox stays black). */
+static void camera_viewport(int clear)
 {
-    static EngineDraw draws[MAX_DRAWS];
-    int ndraw;
-    int i;
-    int vx, vy, vw, vh;
-    float aspect;
-    GLuint vbo;
-    GLsizei stride = (GLsizei)(VERT_STRIDE * sizeof(GLfloat));
-
-    ndraw = engine_collect_draws(draws, MAX_DRAWS);
-    if (ndraw < 1) {
-        printf("engine_collect_draws returned %d\n", ndraw);
-        return 0;
-    }
-    printf("draws=%d classes=%d textures=%d\n",
-           ndraw, engine_class_count(), engine_texture_count());
-
-    aspect = Camera_main_aspect;
-    if (aspect < 1e-6f)
-        aspect = (float)WIDTH / (float)HEIGHT;
-    refresh_camera_bounds(aspect);
-    handle_view_size(WIDTH, HEIGHT);
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-
-    vx = (int)(Camera_main_rect_x * (float)WIDTH + 0.5f);
-    vy = (int)(Camera_main_rect_y * (float)HEIGHT + 0.5f);
-    vw = (int)(Camera_main_rect_w * (float)WIDTH + 0.5f);
-    vh = (int)(Camera_main_rect_h * (float)HEIGHT + 0.5f);
+    int vx = (int)(Camera_main_rect_x * (float)WIDTH + 0.5f);
+    int vy = (int)(Camera_main_rect_y * (float)HEIGHT + 0.5f);
+    int vw = (int)(Camera_main_rect_w * (float)WIDTH + 0.5f);
+    int vh = (int)(Camera_main_rect_h * (float)HEIGHT + 0.5f);
+    float aspect = Camera_main_aspect;
     if (vw < 1)
         vw = 1;
     if (vh < 1)
         vh = 1;
-    glViewport(0, 0, WIDTH, HEIGHT);
-    glClearColor(0.f, 0.f, 0.f, 1.f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    if (aspect < 1e-6f)
+        aspect = (float)vw / (float)vh;
+    refresh_camera_bounds(aspect);
     glViewport(vx, vy, vw, vh);
+    if (!clear)
+        return;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(vx, vy, vw, vh);
     glClearColor(Camera_main_background_r, Camera_main_background_g,
                  Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+/* One camera's pass: its view, its clear, the draws it sees. */
+static int draw_pass(GLuint prog, int clear)
+{
+    static EngineDraw draws[MAX_DRAWS];
+    int ndraw;
+    int i;
+    GLsizei stride = (GLsizei)(VERT_STRIDE * sizeof(GLfloat));
+
+    ndraw = engine_collect_draws(draws, MAX_DRAWS);
+    camera_viewport(clear);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
 #ifdef BATCH
-    (void)i; (void)stride;
+    (void)i; (void)stride; (void)prog;
     {
         int drawn = gb2_draw(draws, ndraw);
         printf("batch: %d sprites in %d draw call(s)\n", drawn, gb2_draw_calls);
     }
-    glFinish();
-    return 1;
+    return ndraw;
 #endif
     glUseProgram(prog);
     glActiveTexture(GL_TEXTURE0);
@@ -433,7 +439,37 @@ static int draw_scene(GLuint prog)
                               (const void *)(6 * sizeof(GLfloat)));
         glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);
     }
+    return ndraw;
+}
+
+static int draw_scene(GLuint prog)
+{
+    static EngineCamera cams[32];
+    int ncam, k, ndraw = 0;
+    GLuint vbo;
+
+    handle_view_size(WIDTH, HEIGHT);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glViewport(0, 0, WIDTH, HEIGHT);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    /* every camera that renders, lowest depth first */
+    ncam = engine_collect_cameras(cams, 32);
+    if (ncam < 1)
+        ndraw = draw_pass(prog, 1);
+    for (k = 0; k < ncam; k++) {
+        engine_draw_camera(k);
+        ndraw += draw_pass(prog, cams[k].clear);
+    }
+    engine_draw_camera(-1);
     glFinish();
+    if (ndraw < 1) {
+        printf("engine_collect_draws returned %d\n", ndraw);
+        return 0;
+    }
+    printf("draws=%d classes=%d textures=%d\n",
+           ndraw, engine_class_count(), engine_texture_count());
     return 1;
 }
 

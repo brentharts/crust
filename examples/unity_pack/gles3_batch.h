@@ -578,38 +578,18 @@ static void gb_upload_lights(void)
         glUniform2fv(gb_u_pts, npts, pts);
 }
 
-/* The frame: gles3_render.h's camera, letterbox and clear, then every
- * sprite in one instanced draw. Returns how many sprites it drew. */
-static int gb_draw(int width, int height)
+/* One camera's pass: gles3_render.h's view and clear, then every sprite
+ * it sees in one instanced draw. Returns how many sprites it drew. */
+static int gb_draw_pass(int width, int height, int clear)
 {
-    int n, vx, vy, vw, vh;
-    float aspect;
+    int n;
     if (gb_gpu_sort)
         n = engine_collect_gpu_sprites_stable(gb_sprites, gb_key, GB_MAX_SPRITES);
     else
         n = engine_collect_gpu_sprites(gb_sprites, GB_MAX_SPRITES);
-    aspect = Camera_main_aspect;
-    if (aspect < 1e-6f)
-        aspect = height > 0 ? (float)width / (float)height : 1.0f;
-    g3_refresh_camera_bounds(aspect);
-    g3_handle_view_size(width, height);
-    vx = (int)(Camera_main_rect_x * (float)width + 0.5f);
-    vy = (int)(Camera_main_rect_y * (float)height + 0.5f);
-    vw = (int)(Camera_main_rect_w * (float)width + 0.5f);
-    vh = (int)(Camera_main_rect_h * (float)height + 0.5f);
-    if (vw < 1)
-        vw = 1;
-    if (vh < 1)
-        vh = 1;
+    g3_camera_viewport(width, height, clear);
     if (gb_gpu_sort && n > 0)
         gb_sort(n);
-    glViewport(0, 0, width, height);
-    glClearColor(0.f, 0.f, 0.f, 1.f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(vx, vy, vw, vh);
-    glClearColor(Camera_main_background_r, Camera_main_background_g,
-                 Camera_main_background_b, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(gb_prog);
@@ -631,7 +611,6 @@ static int gb_draw(int width, int height)
     glUniform1f(gb_u_side, (float)engine_atlas_side());
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(gb_vao);
-    gb_draw_calls = 0;
     if (n > 0) {
         if (gb_gpu_sort) {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, gb_vbo);
@@ -643,9 +622,16 @@ static int gb_draw(int width, int height)
             gb_upload_changed(GL_ARRAY_BUFFER, n);
         }
         glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, n);
-        gb_draw_calls = 1;
+        gb_draw_calls++;
     }
     return n;
+}
+
+/* The frame: one pass per camera (gles3_render.h's g3_each_camera). */
+static int gb_draw(int width, int height)
+{
+    gb_draw_calls = 0;
+    return g3_each_camera(width, height, gb_draw_pass);
 }
 
 #endif

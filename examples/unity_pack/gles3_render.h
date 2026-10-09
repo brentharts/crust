@@ -37,6 +37,16 @@ extern float Camera_main_background_b;
  * defaults say so, and the engine's own definitions win when it has. */
 int engine_handle_words(void) __attribute__((weak));
 int engine_handle_words(void) { return 0; }
+/* A pack with no Camera: no passes, the Camera_main_* view alone. */
+int engine_collect_cameras(EngineCamera *out, int max) __attribute__((weak));
+int engine_collect_cameras(EngineCamera *out, int max)
+{
+    (void)out;
+    (void)max;
+    return 0;
+}
+void engine_draw_camera(int k) __attribute__((weak));
+void engine_draw_camera(int k) { (void)k; }
 int engine_upload_handles(uint32_t *dst, int max_words) __attribute__((weak));
 int engine_upload_handles(uint32_t *dst, int max_words)
 {
@@ -333,44 +343,68 @@ static void g3_upload_handles(void)
                     (GLsizeiptr)(n * (int)sizeof(uint32_t)), g3_handles);
 }
 
-/* Clear to the camera background and draw every sprite. Returns the draw
- * count (0: nothing to draw).
- *
- * CameraScript.HandleViewSize seeds Camera_main_aspect / Camera_main_rect_*;
- * letterbox like gles2_window so Screen Space Camera UI matches Unity.
- */
-static int g3_draw(int width, int height)
+/* Camera.rect's pixels for the camera the Camera_main_* globals are,
+ * cleared to its background when it clears (Solid Color / Skybox); the
+ * scissor keeps the clear inside the rect (the letterbox stays black). */
+static void g3_camera_viewport(int width, int height, int clear)
 {
-    static EngineDraw draws[MAX_DRAWS];
-    int ndraw;
-    int i;
-    int vx, vy, vw, vh;
-    float aspect;
-
-    ndraw = engine_collect_draws(draws, MAX_DRAWS);
-    aspect = Camera_main_aspect;
-    if (aspect < 1e-6f)
-        aspect = height > 0 ? (float)width / (float)height : 1.0f;
-    g3_refresh_camera_bounds(aspect);
-    g3_upload_handles();
-    /* Recompute letterbox for this framebuffer (HandleViewSize). */
-    g3_handle_view_size(width, height);
-    /* Camera.rect letterbox: black bars outside the authored pixel rect. */
-    vx = (int)(Camera_main_rect_x * (float)width + 0.5f);
-    vy = (int)(Camera_main_rect_y * (float)height + 0.5f);
-    vw = (int)(Camera_main_rect_w * (float)width + 0.5f);
-    vh = (int)(Camera_main_rect_h * (float)height + 0.5f);
+    int vx = (int)(Camera_main_rect_x * (float)width + 0.5f);
+    int vy = (int)(Camera_main_rect_y * (float)height + 0.5f);
+    int vw = (int)(Camera_main_rect_w * (float)width + 0.5f);
+    int vh = (int)(Camera_main_rect_h * (float)height + 0.5f);
+    float aspect = Camera_main_aspect;
     if (vw < 1)
         vw = 1;
     if (vh < 1)
         vh = 1;
-    glViewport(0, 0, width, height);
-    glClearColor(0.f, 0.f, 0.f, 1.f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    if (aspect < 1e-6f)
+        aspect = (float)vw / (float)vh;
+    g3_refresh_camera_bounds(aspect);
     glViewport(vx, vy, vw, vh);
+    if (!clear)
+        return;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(vx, vy, vw, vh);
     glClearColor(Camera_main_background_r, Camera_main_background_g,
                  Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+/* Every camera that renders, lowest depth first (Unity's order): each
+ * pass makes the Camera_main_* globals that camera's view and calls
+ * draw_pass(width, height, clear). Returns the passes' summed result. */
+#define G3_MAX_CAMERAS 32
+static int g3_each_camera(int width, int height,
+                          int (*draw_pass)(int, int, int))
+{
+    static EngineCamera cams[G3_MAX_CAMERAS];
+    int ncam, k, n = 0;
+    /* Recompute letterbox for this framebuffer (HandleViewSize). */
+    g3_handle_view_size(width, height);
+    ncam = engine_collect_cameras(cams, G3_MAX_CAMERAS);
+    glViewport(0, 0, width, height);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (ncam < 1)
+        return draw_pass(width, height, 1);
+    for (k = 0; k < ncam; k++) {
+        engine_draw_camera(k);
+        n += draw_pass(width, height, cams[k].clear);
+    }
+    engine_draw_camera(-1);
+    return n;
+}
+
+static int g3_draw_pass(int width, int height, int clear)
+{
+    static EngineDraw draws[MAX_DRAWS];
+    int ndraw;
+    int i;
+
+    ndraw = engine_collect_draws(draws, MAX_DRAWS);
+    g3_camera_viewport(width, height, clear);
+    g3_upload_handles();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(g3_prog);
@@ -391,6 +425,17 @@ static int g3_draw(int width, int height)
         glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);
     }
     return ndraw < 0 ? 0 : ndraw;
+}
+
+/* Clear and draw every sprite, once per camera. Returns the draw count
+ * (0: nothing to draw).
+ *
+ * CameraScript.HandleViewSize seeds Camera_main_aspect / Camera_main_rect_*;
+ * letterbox like gles2_window so Screen Space Camera UI matches Unity.
+ */
+static int g3_draw(int width, int height)
+{
+    return g3_each_camera(width, height, g3_draw_pass);
 }
 
 #endif
