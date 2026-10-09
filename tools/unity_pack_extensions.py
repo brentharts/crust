@@ -222,7 +222,10 @@ def _blank_copied_methods(seg):
             if e is None:
                 continue
             stm = [x for x in scan[k + 1:e].split(";") if x.strip()]
-            single = len(stm) == 1 and "{" not in scan[k + 1:e]
+            single = (len(stm) == 1 and "{" not in scan[k + 1:e]) or (
+                cs2cpp._mutate_return_expr(
+                    h.group(1), seg[h.end():cp], seg[k + 1:e], scan[k + 1:e])
+                is not None)
         else:
             continue
         if single and not h.group(3):
@@ -306,7 +309,10 @@ def static_classes(text):
                 btxt = body[k:e + 1]
                 stm = [x for x in cs2cpp._blank(btxt)[1:-1].split(";")
                        if x.strip()]
-                single = len(stm) == 1 and "{" not in btxt[1:-1]
+                single = (len(stm) == 1 and "{" not in btxt[1:-1]) or (
+                    cs2cpp._mutate_return_expr(
+                        h.group(1), params, btxt[1:-1],
+                        cs2cpp._blank(btxt)[1:-1]) is not None)
             else:
                 continue
             gens = [g.strip() for g in (h.group(3) or "<>")[1:-1].split(",")
@@ -377,6 +383,15 @@ def _arity(params):
     return (sum("=" not in p for p in ps), len(ps))
 
 
+#: The type of a Unity member, for an extension name several static classes
+#: define (`x.color.Multiply(2)` is ColorExtensions').
+_MEMBER_TYPES = {"color": "Color", "position": "Vector3",
+                 "localPosition": "Vector3", "localScale": "Vector3",
+                 "eulerAngles": "Vector3", "localEulerAngles": "Vector3",
+                 "lossyScale": "Vector3", "velocity": "Vector2",
+                 "linearVelocity": "Vector2"}
+
+
 def rewrite_extension_calls(text, exts, props, skip_names=()):
     """`x.M(a)` -> `Cls.M(x, a)`, `x.M<T>(a)` -> `Cls.M<T>(x, a)`, `x.P` ->
     `Cls.get_P(x)`. `exts` / `props`: name -> class. A name that is also a
@@ -406,9 +421,17 @@ def rewrite_extension_calls(text, exts, props, skip_names=()):
                     continue
                 args = text[op + 1:cp].strip()
                 n = len(cs2cpp._split_top_level(args)) if args else 0
-                if any(lo <= n <= hi for lo, hi in arities.get(m.group(1), ())):
-                    continue
                 cls = names[m.group(1)]
+                if isinstance(cls, dict):
+                    # ponytail: the receiver's type only from the Unity
+                    # member it ends in (a Color is no own class's `this`);
+                    # any other is left (the stub check)
+                    mt = re.search(r"\.\s*(\w+)\s*$", recv)
+                    cls = cls.get(_MEMBER_TYPES.get(mt.group(1) if mt else ""))
+                    if cls is None:
+                        continue
+                elif any(lo <= n <= hi for lo, hi in arities.get(m.group(1), ())):
+                    continue
                 rep = "%s.%s%s(%s%s)" % (cls, m.group(1), m.group(2) or "",
                                          recv, (", " + args) if args else "")
                 text = text[:rs] + rep + text[cp + 1:]
@@ -470,7 +493,12 @@ def desugar_project(files):
                     if mname.startswith("get_") and not m.params.count(","):
                         props[mname[4:]] = cname
                     else:
-                        exts[mname] = cname
+                        recv_ty = re.sub(r"^this\s+", "", m.params).split()[0]
+                        exts.setdefault(mname, {})[recv_ty] = cname
+    # one class: any receiver; several (`Multiply` of Color and of Vector2):
+    # {receiver type: class}, told apart in `rewrite_extension_calls`
+    exts = {n: (next(iter(set(by.values()))) if len(set(by.values())) == 1
+                else by) for n, by in exts.items()}
     # Methods of the project's own (non-static) classes shadow extensions.
     own = {}
     for p, t in texts.items():

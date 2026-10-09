@@ -1189,6 +1189,55 @@ class TestSpriteRendererColor(unittest.TestCase):
         self.assertIn("a2 25 50", out)
 
     @needs_cc
+    def test_respawn_resets_through_locals(self):
+        """Slime Jump's Respawn loops: `b.spriteRenderer.color =
+        b.spriteRenderer.color.Multiply(f)` (a mutate-and-return
+        extension), `b.trs.position = b.initPos`, `b.gameObject
+        .activeInHierarchy` on a local of a packed class, then `= new T[0]`
+        on a static array and on one of a struct (no storage). `Multiply`
+        is also VectorExtensions', told apart by the receiver's type."""
+        ext = ("using UnityEngine;\npublic static class ColorExtensions {\n"
+               "    public static Color Multiply(this Color c, float f) {\n"
+               "        c.r *= f;\n        c.g *= f;\n        c.b *= f;\n"
+               "        return c;\n    }\n}\n")
+        vext = ("using UnityEngine;\npublic static class VectorExtensions {\n"
+                "    public static Vector3 Multiply(this Vector3 v, float f) {\n"
+                "        return v * f * 3;\n    }\n}\n")
+        rec = ("public struct Rec { public int n;\n"
+               "    public Rec Multiply(Rec o) { return o; }\n}\n")
+        box = ("using UnityEngine;\npublic class Box : MonoBehaviour {\n"
+               "    public SpriteRenderer spriteRenderer;\n"
+               "    public Transform trs;\n    public Vector2 initPos;\n"
+               "    public static Box[] instances = new Box[0];\n"
+               "    public static Rec[] recs = new Rec[0];\n"
+               "    void Awake() { transform.SetParent(null); }\n"
+               "    void LateUpdate() { Debug.Log(\"x \" + Mathf.RoundToInt("
+               "transform.position.x) + \" g \" + Mathf.RoundToInt("
+               "spriteRenderer.color.g * 100f)); }\n}\n")
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    int f;\n    void Update() {\n        f++; if (f > 1) return;\n"
+               "        Box.instances = FindObjectsOfType<Box>();\n"
+               "        for (int i = 0; i < Box.instances.Length; i ++) {\n"
+               "            Box b = Box.instances[i];\n"
+               "            b.spriteRenderer.color = b.spriteRenderer.color.Multiply(0.5f);\n"
+               "            b.trs.position = b.initPos;\n"
+               "            if (b.gameObject.activeInHierarchy) Debug.Log(\"act\");\n"
+               "        }\n"
+               "        Box.instances = new Box[0];\n"
+               "        Debug.Log(\"n \" + Box.instances.Length);\n"
+               "        Box.recs = new Rec[0];\n    }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Color: {{r: 1, g: 0.8, b: 1, a: 1}}\n"
+               "  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"ColorExtensions": ext, "VectorExtensions": vext,
+                              "Rec": rec, "Box": box, "Mgr": mgr}, [
+            ("Mgr",), ("Box", spr, "  spriteRenderer: {fileID: 113}\n"
+                       "  trs: {fileID: 111}\n  initPos: {x: 5, y: 2}\n")])
+        out = run_frames(self, pack(self, root), 1)
+        self.assertEqual([l for l in out if l[:2] in ("x ", "ac", "n ")],
+                         ["act", "n 0", "x 5 g 40"])
+
+    @needs_cc
     def test_enabled(self):
         """`spriteRenderer.enabled = false` (Slime Jump's Player.Death)."""
         mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"

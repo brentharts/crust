@@ -204,6 +204,95 @@ def _collect_mb_bases(analyses):
     return bases
 
 
+def _empty_instance_lists(plan):
+    """{"T.f"}: a `List<U>` / `U[]` field of a MonoBehaviour T where no
+    packed class is a U (and, for a static, none is a T). No such object
+    exists in the packed game, so nothing that runs can fill the list
+    (`_drop_empty_instance_lists`; an instance one through a handle,
+    `_handle_field_access`). ponytail: `Add(null)` would fill one."""
+    import tools.unity_pack_common as _cm
+    # every project script, not only the analyzed ones: a class no scene
+    # places is not analyzed
+    bases = {k: list(v) for k, v in (plan.get("mb_bases") or {}).items()}
+    fields, structs = [], set()
+    for t in _cm.SOURCE_ORIGINAL.values():
+        scan = cs2cpp._blank(t)
+        structs.update(re.findall(r"\bstruct\s+(\w+)", scan))
+        opens = []
+        for m in re.finditer(r"\bclass\s+(\w+)(?:\s*<[^>{]*>)?\s*(?::\s*([^{]+))?\{",
+                             scan):
+            bases.setdefault(m.group(1), [
+                re.sub(r"<.*", "", b).strip().split(".")[-1]
+                for b in (m.group(2) or "").split(",") if b.strip()])
+            opens.append((m.end() - 1, m.group(1)))
+        for m in re.finditer(
+                r"\b(static\s+)?(?:readonly\s+)?(?:List\s*<\s*(\w+)\s*>|(\w+)\s*\[\s*\])"
+                r"\s+(\w+)\s*[=;]", scan):
+            owner = None
+            for at, name in opens:
+                # ponytail: the innermost class opened before the field and
+                # not yet closed, by brace balance
+                if at < m.start() and scan.count("{", at, m.start()) > \
+                        scan.count("}", at, m.start()):
+                    owner = name
+            if owner:
+                fields.append((owner, m.group(4), m.group(2) or m.group(3),
+                               bool(m.group(1))))
+    packed = list(plan.get("classes") or {})
+
+    def absent(t):
+        return (_mb_is_a(t, "MonoBehaviour", bases)
+                and not any(_mb_is_a(c, t, bases) for c in packed))
+    # a packed class's static `U[]` of a project class or struct with no
+    # packed rows (not `_static_ref_array`): no storage, so every method
+    # reading it is a stub, and a reset is unseen
+    plan["storageless_arrays"] = {
+        "%s.%s" % (cn, f["name"])
+        for cn, c in (plan.get("classes") or {}).items()
+        for f in c.get("class_consts") or ()
+        if f.get("static") and _array_elem_name(f.get("ty") or "") in (
+            set(bases) | structs) and not _static_ref_array(f, plan)}
+    # an instance list's owner may be packed: its rows exist, the list's
+    # elements never do
+    return {"%s.%s" % (o, f) for o, f, u, st in fields
+            if absent(u) and (absent(o) or not st)}
+
+
+def _drop_empty_instance_lists(text, plan):
+    """An always-empty list (`_empty_instance_lists`): `.Count` / `.Length`
+    is 0, `.Clear()` does nothing, and a `for` counting up from 0 over it
+    never runs, so its body (about objects that do not exist) goes."""
+    for n in sorted(plan.get("storageless_arrays") or ()):
+        o, f = n.split(".")
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*%s\s*=(?!=)\s*new\s+\w+\s*\[\s*0\s*\]\s*;" % (
+                re.escape(o), re.escape(f)), ";", text)
+    names = plan.get("empty_lists") or ()
+    if not names:
+        return text
+    alt = "|".join(r"%s\s*\.\s*%s" % tuple(map(re.escape, n.split(".")))
+                   for n in sorted(names))
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:%s)\s*\.\s*(?:Count|Length)\b" % alt,
+                           "0", text)
+    text = cs2cpp.code_sub(r"(?<![\w.])(?:%s)\s*\.\s*Clear\s*\(\s*\)" % alt,
+                           "(void)0", text)
+    rx = re.compile(r"(?<![\w.])for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*0"
+                    r"\s*;[^;{}]*\)\s*\{")
+    while True:
+        scan = cs2cpp._blank(text)
+        m = rx.search(scan)
+        if not m:
+            return text
+        depth, j = 0, m.end() - 1
+        for j in range(m.end() - 1, len(scan)):
+            depth += {"{": 1, "}": -1}.get(scan[j], 0)
+            if depth == 0:
+                break
+        # (the body's lines stay the C# lines: NRE sites name them)
+        text = (text[:m.start()] + ";" + "\n" * text.count("\n", m.start(), j)
+                + text[j + 1:])
+
+
 def _lower_handle_enabled(text, plan):
     """`Other_AT(e).enabled`, a packed script through a handle: read with
     `Other_get_enabled`, written with `Other_set_enabled` (OnEnable /
@@ -6409,7 +6498,11 @@ def _rewrite_static_ref_arrays(text, cl, plan):
                 else:
                     call = "_engine_ref_erase(%s, %s);" % (mangled, expr)
                 text = text[:m.start()] + call + text[end:]
-    for pat, mangled, _elem, _iface in targets:
+    for pat, mangled, elem, _iface in targets:
+        # `= new T[0]`: a new empty array; the vector is the only copy
+        text = cs2cpp.code_sub(
+            pat + r"\s*=(?!=)\s*new\s+%s\s*\[\s*0\s*\]\s*;" % re.escape(elem),
+            "%s.clear();" % mangled, text)
         text = cs2cpp.code_sub(pat + r"\s*\.\s*Length\b",
                                "%s.size()" % mangled, text)
         text = cs2cpp.code_sub(pat, mangled, text)
@@ -8076,7 +8169,9 @@ def _static_helper_methods():
 
 
 _SIMPLE_ARG_RE = re.compile(
-    r'[A-Za-z_][\w.]*|"(?:[^"\\]|\\.)*"|-?(?:\d+\.?\d*|\.\d+)[fF]?')
+    r'[A-Za-z_][\w.]*|"(?:[^"\\]|\\.)*"|-?(?:\d+\.?\d*|\.\d+)[fF]?'
+    # a packed accessor of a name (no side effect, so read twice is the same)
+    r'|[A-Za-z_]\w*_get_\w+\(\s*\w*\s*\)(?:\s*\.\s*\w+)*')
 
 
 def _bind_params(text, params_str, args):
@@ -17433,6 +17528,14 @@ def _lower_rb2d_api(text, cl, plan, site):
     recvs[r"(?<![\w.])(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\s*\.\s*)?"
           r"Rigidbody2D\s*>\s*\(\s*\)"] = \
         "GameObject_GetComponent_Rigidbody2D(_engine_go_of_%s(i))" % idn
+    # another object's field, `Other_get_rb(x)` (`_handle_field_access`)
+    getters = {"%s_get_%s" % (_c_ident(cn), f["name"])
+               for cn, c in (plan.get("classes") or {}).items()
+               for f in c.get("fields") or ()
+               if f.get("ty") == "Rigidbody2D" and not f.get("static")}
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\(\s*\w+\s*\)", cs2cpp._blank(text)):
+        if m.group(1) in getters:
+            recvs[r"(?<![\w.])%s" % re.escape(m.group(0))] = "(int)" + m.group(0)
     text = cs2cpp.code_sub(r"(?<![\w.])(?:UnityEngine\s*\.\s*)?RigidbodyType2D\s*\.\s*"
                            r"(Dynamic|Kinematic|Static)\b",
                            lambda m: {"Dynamic": "0", "Kinematic": "1",
@@ -19033,6 +19136,10 @@ def emit_engine(plan, analyses, used_apis):
         want_set_parent = True
         want_transform_parent = True
         want_go_tables = True
+    # as `_emit_engine_transform_handles` is gated below (bodies lower first)
+    plan["_xf_handles"] = bool(
+        ("transform.SetParent" in used_apis or plan.get("newgo_budget"))
+        and want_go_tables and _plan_needs_vector2(plan, used_apis))
     want_ctor_forbidden = any(
         bool(cl.get("ctor_forbidden"))
         for cl in plan["classes"].values())
@@ -24728,6 +24835,17 @@ def _getter_transform_positions(text, plan, site):
         if not got:
             continue
         _args, after = got
+        wm = plan.get("_xf_handles") and re.match(
+            r"\s*\.\s*position\s*=(?!=)\s*([^;]+);", text[after:])
+        if wm:
+            # a Vector2 (C has no Vector3): z is 0, as Vector2 -> Vector3
+            out += [text[pos:m.start()], "Transform_set_position2(%s, %s);" % (
+                text[m.start():after], wm.group(1).strip())]
+            pos = after + wm.end()
+            if site is not None:
+                site.setdefault("protos", set()).add(
+                    _TRANSFORM_HANDLE_PROTOS["Transform_set_position2"])
+            continue
         mm = re.match(r"\s*\.\s*position\b(?:\s*\.\s*([xyz])\b)?"
                       r"(?!\s*(?:\.|[-+*/]?=(?!=)))", text[after:])
         if not mm:
@@ -24789,7 +24907,26 @@ def _lower_reference_game_objects(text, cl, plan, site):
                           "%s.%s" % (oname, f["name"]))[:None] + (
                               (f["name"],) if oname == cl["name"] else ()):
                     holds.setdefault(r, f["ty"])
+    def stop(api):
+        return lambda m: (
+            '{ (void)(%s); fprintf(stderr, "%s is not lowered by crust; '
+            'stopping rather than skipping it\\n"); exit(70); }' % (
+                m.group(m.lastindex), api))
     for recv, other in sorted(holds.items()):
+        # ponytail: Box2D fixes a shape's sensor flag at creation, and a
+        # handle's local rotation has no setter here: the writes stop when
+        # run (Slime Jump's equipped-cosmetic loop); rebuild the shape /
+        # emit Transform_set_rotation for them if a game needs them
+        rq = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*" % re.escape(recv)
+        cols = [f["name"] for f in (classes.get(other) or {}).get("fields") or ()
+                if f.get("ty") in _COLLIDER2D_FIELD_TYPES]
+        if cols:
+            text = cs2cpp.code_sub(
+                rq + r"(?:%s)\s*\.\s*isTrigger\s*=(?!=)\s*([^;]+);" % "|".join(
+                    map(re.escape, cols)), stop("Collider2D.isTrigger = v"), text)
+        text = cs2cpp.code_sub(
+            rq + r"transform\s*\.\s*localEulerAngles\s*=(?!=)\s*([^;]+);",
+            stop("Transform.localEulerAngles = v"), text)
         go = "_engine_go_of_%s(%s)" % (_c_ident(other), recv)
         q = r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*gameObject" % re.escape(recv)
         text = cs2cpp.code_sub(q + r"\s*\.\s*SetActive\s*\(",
@@ -24799,6 +24936,8 @@ def _lower_reference_game_objects(text, cl, plan, site):
                 r"(?<![\w.])"):] + r"\s*\)", "Object_Destroy(%s)" % go, text)
         text = cs2cpp.code_sub(q + r"\s*\.\s*activeSelf\b(?!\s*[.=])",
                                "GameObject_activeSelf(%s)" % go, text)
+        text = cs2cpp.code_sub(q + r"\s*\.\s*activeInHierarchy\b(?!\s*[.=])",
+                               "_engine_go_active_in_hierarchy(%s)" % go, text)
         text = cs2cpp.code_sub(q + r"\b(?!\s*\.)", go, text)
     return text
 
@@ -24856,10 +24995,17 @@ def _handle_field_access(text, plan, holds):
     handle). It was `Other_AT(other).hp`, the raw storage. `other` is left
     for the field / local lowering after."""
     classes = plan.get("classes") or {}
+    empty = plan.get("empty_lists") or ()
     for recv, other in sorted(holds.items()):
         ocl = classes.get(other)
         if not ocl:
             continue
+        for n in sorted(empty):
+            if n.split(".")[0] == other:
+                q = r"(?<![\w.])%s\s*\.\s*%s\s*\.\s*" % (
+                    re.escape(recv), re.escape(n.split(".")[1]))
+                text = cs2cpp.code_sub(q + r"Clear\s*\(\s*\)", "(void)0", text)
+                text = cs2cpp.code_sub(q + r"(?:Count|Length)\b", "0", text)
         # an `idx:` member of no packed class (a collection type the planner
         # did not parse) has no faithful accessor: left, the method stubs
         names = [m[0] for m in ocl.get("members") or ()
@@ -24890,6 +25036,19 @@ def _handle_field_access(text, plan, holds):
         text = cs2cpp.code_sub(
             head + r"(?!\s*\()(?!\s*\.)",
             lambda m, r=recv: "%s_get_%s(%s)" % (o, m.group(1), r), text)
+        # a SpriteRenderer's, Rigidbody2D's or Transform's members
+        # (`other.sr.color`, `other.rb.simulated`, `other.trs.position`):
+        # `_lower_bounds` / `_lower_rb2d_api` / `_getter_transform_positions`
+        # take them on the getter
+        packed = {mm[0] for mm in ocl.get("members") or ()}
+        sprs = [f["name"] for f in ocl.get("fields") or ()
+                if f.get("ty") in ("SpriteRenderer", "Rigidbody2D", "Transform")
+                and not f.get("static") and f["name"] in packed]
+        if sprs:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.\s*(%s)\b(?=\s*\.)" % (
+                    re.escape(recv), "|".join(map(re.escape, sprs))),
+                lambda m, r=recv: "%s_get_%s(%s)" % (o, m.group(1), r), text)
     return text
 
 
@@ -27220,6 +27379,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             if v == "s"))
     if "_cs_str_Equals(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
+    text = _drop_empty_instance_lists(text, plan)
     text = _lower_handle_enabled(text, plan)
     return _late_call_members(text, plan)
 
@@ -27586,6 +27746,16 @@ def _lower_bounds(text, plan, site=None):
                 call, ", ".join(a + ["1.f"] if len(a) == 3 else a))
             if len(a) in (3, 4) else call + mm.group(0) + ", ".join(a) + ")",
             args=True)
+    # ponytail: crust draws no 2D lights, so a ShadowCaster2D's `enabled`
+    # write shows nothing; a read stays C# (stubs). A table if lights land.
+    shadows = {"%s_get_%s" % (_c_ident(cn), f["name"])
+               for cn, c in (plan.get("classes") or {}).items()
+               for f in c.get("fields") or []
+               if f.get("ty") == "ShadowCaster2D" and not f.get("static")}
+    if shadows and ".enabled" in text:
+        text = _call_suffix_sub(
+            text, shadows, r"\s*\.\s*enabled\s*=(?!=)\s*([^;]+);",
+            lambda call, mm: "(void)(%s);" % mm.group(1))
     if sprs and plan.get("_spr_off_cap") and ".enabled" in text:
         text = _call_suffix_sub(
             text, sprs, r"\s*\.\s*enabled\s*=(?!=)\s*([^;]+);",
@@ -30385,6 +30555,7 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
     _validate_getcomponent_types(gcic_types, plan, analyses)
     plan["getcomponentsinchildren_types"] = sorted(gcic_types)
     plan["mb_bases"] = _collect_mb_bases(analyses)
+    plan["empty_lists"] = _empty_instance_lists(plan)
     plan["interfaces"] = _collect_interfaces(analyses)
     plan["scene_manager"] = "SceneManager" in used_apis
     plan["static_getters"] = _collect_static_getters(analyses)
