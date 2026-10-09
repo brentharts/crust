@@ -3496,6 +3496,130 @@ class TestMultipleCameras(unittest.TestCase):
             "all 1"])                                # no pass: the main's view
 
 
+class TestHeartBar(unittest.TestCase):
+    """Slime Jump's Player.Respawn / TakeDamage heart bar: a layout group's
+    children counted, destroyed and cloned through a Transform field, laid
+    out again, and dimmed through their Image."""
+
+    P = """using UnityEngine;
+using UnityEngine.UI;
+public static class ColorExtensions {
+    public static Color SetAlpha (this Color c, float a) { return new Color(c.r, c.g, c.b, a); }
+}
+public class P : MonoBehaviour {
+    public uint maxHp;
+    public Transform hpBarTrs;
+    float hp;
+    void Start() { Respawn(); Respawn(); TakeDamage(1); }
+    void Respawn() {
+        hp = maxHp;
+        if (hpBarTrs.childCount > 1)
+            for (int i = 1; i < maxHp; i ++)
+                DestroyImmediate(hpBarTrs.GetChild(0).gameObject);
+        for (int i = 0; i < hp; i ++)
+        {
+            if (i > hpBarTrs.childCount - 1)
+                Instantiate(hpBarTrs.GetChild(0).gameObject, hpBarTrs);
+            else
+            {
+                Image image = hpBarTrs.GetChild(i).GetComponent<Image>();
+                image.color = image.color.SetAlpha(1);
+            }
+        }
+    }
+    public void TakeDamage (float amount) {
+        float prevHp = hp;
+        hp = Mathf.Clamp(hp - amount, 0, maxHp);
+        if (prevHp > hp && hp > 0)
+            for (int i = 0; i < prevHp - hp; i ++)
+            {
+                Image image = hpBarTrs.GetChild((int) hp - i).GetComponent<Image>();
+                image.color = image.color.SetAlpha(0.25f);
+            }
+    }
+}
+"""
+
+    @staticmethod
+    def _go(fid, name, comps, extra=""):
+        return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n  m_IsActive: 1\n%s"
+                "  m_Component:\n%s" % (fid, name, extra, "".join(
+                    "  - component: {fileID: %d}\n" % c for c in comps)))
+
+    @staticmethod
+    def _rt(fid, go, father, apos, size, pivot, kids=()):
+        return ("--- !u!224 &%d\nRectTransform:\n  m_GameObject: {fileID: %d}\n"
+                "  m_Father: {fileID: %d}\n  m_Children:%s\n"
+                "  m_AnchorMin: {x: 0, y: %d}\n  m_AnchorMax: {x: 0, y: %d}\n"
+                "  m_AnchoredPosition: {x: %s, y: %s}\n"
+                "  m_SizeDelta: {x: %s, y: %s}\n  m_Pivot: {x: %s, y: %s}\n"
+                % (fid, go, father, "".join("\n  - {fileID: %d}" % k for k in kids)
+                   or " []", father != 0, father != 0, apos[0], apos[1],
+                   size[0], size[1], pivot[0], pivot[1]))
+
+    @needs_cc
+    def test_respawn_clones_lays_out_and_dims(self):
+        import struct
+        import zlib
+        root = tempfile.mkdtemp(prefix="upf-hearts-")
+        self.addCleanup(shutil.rmtree, root, True)
+        sd = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(sd)
+        os.makedirs(os.path.join(root, "Assets", "Scenes"))
+        with open(os.path.join(sd, "P.cs"), "w") as f:
+            f.write(self.P)
+        with open(os.path.join(sd, "P.cs.meta"), "w") as f:
+            f.write("guid: %032x\n" % 1)
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        with open(os.path.join(sd, "heart.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 32) * 8))
+                    + chunk(b"IEND", b""))
+        with open(os.path.join(sd, "heart.png.meta"), "w") as f:
+            f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 100\n" % ("c" * 32))
+        mb = ("--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n"
+              "  m_Enabled: 1\n  m_Script: {fileID: 11500000, guid: %s, type: 3}\n")
+        scene = "".join((
+            "%YAML 1.1\n",
+            self._go(1, "Canvas", (2, 3)),
+            self._rt(2, 1, 0, (400, 300), (800, 600), (0.5, 0.5), (11,)),
+            "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n  m_Enabled: 1\n"
+            "  m_RenderMode: 0\n",
+            self._go(10, "Bar", (11, 12)),
+            self._rt(11, 10, 2, (5, -100), (300, 90), (0, 1), (21,)),
+            mb % (12, 10, "30649d3a9faa99c48a7b1166b86bf2a0"),
+            "  m_Padding:\n    m_Left: 0\n    m_Right: 0\n    m_Top: 0\n    m_Bottom: 0\n"
+            "  m_ChildAlignment: 0\n  m_Spacing: 10\n  m_ChildForceExpandWidth: 0\n"
+            "  m_ChildForceExpandHeight: 0\n  m_ChildControlWidth: 0\n"
+            "  m_ChildControlHeight: 0\n",
+            self._go(20, "Heart", (21, 23)),
+            self._rt(21, 20, 11, (45, -45), (90, 90), (0.5, 0.5)),
+            mb % (23, 20, "fe87c0e1cc204ed48ad3b37840f39efc"),
+            "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            "  m_Sprite: {fileID: 21300000, guid: %s, type: 3}\n" % ("c" * 32),
+            self._go(30, "Player", (31, 32)),
+            "--- !u!4 &31\nTransform:\n  m_GameObject: {fileID: 30}\n  m_Father: {fileID: 0}\n",
+            mb % (32, 30, "%032x" % 1), "  maxHp: 3\n  hpBarTrs: {fileID: 11}\n",
+            self._go(40, "Main Camera", (41, 42), "  m_TagString: MainCamera\n"),
+            "--- !u!4 &41\nTransform:\n  m_GameObject: {fileID: 40}\n  m_Father: {fileID: 0}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: -10}\n",
+            "--- !u!20 &42\nCamera:\n  m_GameObject: {fileID: 40}\n  m_Enabled: 1\n"
+            "  orthographic: 1\n  orthographic size: 5\n"))
+        with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "w") as f:
+            f.write(scene)
+        out = pack(self, root)
+        lines = run_frames(self, out, 1, body=(
+            "EngineDraw b[8]; int n = engine_collect_draws(b, 8), j;\n"
+            "  for (j = 0; j < n; j++) printf(\"%.3f %g\\n\", b[j].x, b[j].a);"))
+        # the second Respawn keeps the last clone and clones it twice; one
+        # heart (90 px) + spacing (10 px) apart; TakeDamage dims the third
+        self.assertEqual(lines, ["-6.016 1", "-4.714 1", "-3.411 0.25"])
+
+
 class TestTilemapTiles(unittest.TestCase):
     """Tilemap tiles baked into world-space sprite draws."""
 

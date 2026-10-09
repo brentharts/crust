@@ -3402,6 +3402,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         # SpriteRenderer.color: an undrawn renderer (no sprite) has one too
         spr_color = tuple(float(sprite.get(c, 1.0)) for c in "rgba") \
             if sprite else None
+        if spr_color is None and ui_image:
+            # Image.color: the same per-GameObject tint
+            spr_color = tuple(float(ui_image.get(c, 1.0)) for c in "rgba")
         if not (sprite and sprite.get("enabled", 1)
                 and sprite.get("has_sprite")):
             sprite = None
@@ -4745,10 +4748,42 @@ def _instantiate_budget(analyses, plan):
                 budget[cname] = budget.get(cname, 0) + n
             for t in _prefab_instantiate_fields(c, plan).values():
                 budget[t] = budget.get(t, 0) + n
+            for t in _child_clone_classes(c, plan):
+                budget[t] = budget.get(t, 0) + n
     return budget
 
 
+def _child_clone_classes(c, plan):
+    """Classes `Instantiate(field.GetChild(k)[.gameObject], ..)` in class *c*
+    can clone: whatever sits on a child of the field's authored Transform.
+    Only a child GameObject that is one packed class and has no children of
+    its own (`GameObject_Instantiate` clones that one row, not a subtree)."""
+    classes = plan.get("classes") or {}
+    ftys = {f["name"]: f["ty"] for f in c.get("fields") or ()}
+    bodies = cs2cpp._blank(
+        "\n".join(m.get("body") or "" for m in c.get("methods") or []))
+    names = {m.group(1) for m in re.finditer(
+        r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*\(\s*"
+        r"(?:this\s*\.\s*)?(\w+)\s*\.\s*GetChild\s*\(", bodies)
+        if ftys.get(m.group(1)) in ("Transform", "RectTransform")}
+    fids = {str((o.get("object_refs") or {}).get(f))
+            for f in names for o in (classes.get(c["name"]) or {}).get(
+                "instances") or ()} - {"None", "0"}
+    if not fids:
+        return set()
+    rows = [(cn, o) for cn, cl in classes.items() for o in cl.get("instances") or ()]
+    per_go, fathers = {}, set()
+    for cn, o in rows:
+        per_go.setdefault(str(o.get("xf_id")), set()).add(cn)
+        fathers.add(str(o.get("father_id")))
+    return {cn for cn, o in rows
+            if str(o.get("father_id")) in fids and o.get("xf_id")
+            and len(per_go[str(o["xf_id"])]) == 1
+            and str(o["xf_id"]) not in fathers}
+
+
 _PREFAB_SPAWN_POOL = 64
+_GO_CLONE_POOL = 16
 
 
 def _prefab_instantiate_fields(c, plan):
@@ -5185,6 +5220,10 @@ def _rewrite_instantiate(text, plan, this_class):
             continue
         else:
             out.append(text[i:after])
+            i = after
+            continue
+        if src.startswith("Transform_GetChild(") and plan.get("go_clone_classes"):
+            out.append(before + "GameObject_Instantiate(%s, %s)" % (src, parent))
             i = after
             continue
         ty = None
@@ -6760,6 +6799,12 @@ def analyze_script(path, text=None, shallow=False):
                 apis.add("transform.parent")
         elif ch.get("on_this"):
             apis.add("GetComponent")
+    # `h.GetChild(k).GetComponent<Image>()` (`_rewrite_get_child`)
+    for m in re.finditer(r"\.\s*GetChild\s*\([^;]*?\)\s*\.\s*GetComponent\s*<\s*"
+                         r"(?:UnityEngine\.UI\.)?(\w+)\s*>", scan):
+        if m.group(1) in _UI_GETCOMPONENT_TYPES:
+            apis.add("GetComponent")
+            getcomponent_types.add(m.group(1))
     for m in re.finditer(
             r"GetComponentsInChildren\s*<\s*(?:UnityEngine\.)?(\w+)\s*>",
             scan):
@@ -6788,10 +6833,9 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
                  scan):
         apis.add("transform.LookAt")
-    # (any `x.color =` in a script naming SpriteRenderer: the live table
-    # costs only memory when x is something else)
-    if "SpriteRenderer" in scan and re.search(
-            r"(?<![\w.])\w+\s*\.\s*color\s*=(?!=)", scan):
+    # (any `x.color =`, the renderer maybe another script's field: the live
+    # table costs only memory when x is something else)
+    if re.search(r"\.\s*color\s*=(?!=)", scan):
         apis.add("SpriteRenderer.color")
     if re.search(r"(?<![\w.])Sprite\b", scan) and re.search(
             r"\.\s*sprite\b", scan):
@@ -6942,6 +6986,9 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("transform.GetSiblingIndex")
     if re.search(r"(?<![.\w])\w+\s*\.\s*GetSiblingIndex\s*\(", scan):
         apis.add("transform.GetSiblingIndex")
+    if re.search(r"\.\s*(?:childCount\b|GetChild\s*\()", scan):
+        apis.update(("transform.GetChild", "transform.GetSiblingIndex",
+                     "transform.parent"))
     if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
             r"worldToLocalMatrix\b",
@@ -7073,7 +7120,7 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Application.Quit")
     if re.search(
             r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*"
-            r"\(\s*this\s*,",
+            r"\(\s*(?:this\s*,|[\w.]+\s*\.\s*GetChild\s*\()",
             scan):
         apis.add("Instantiate.parent")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
@@ -10623,6 +10670,7 @@ def _emit_engine_gameobject_tables(
             p("/* GetComponent<%s> — live GO map */" % ty)
             p("static int _engine_go_%s[%d] = { %s };" % (
                 idn, len(vals), ", ".join(vals)))
+            plan.setdefault("_ui_gc_maps", []).append((idn, len(vals)))
             p("static int GameObject_GetComponent_%s(int go) {" % idn)
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    return _engine_go_%s[go];" % idn)
@@ -10914,12 +10962,13 @@ def _emit_engine_live_rect_transforms(
                          or plan.get("screen_height") or 768))
         p("static const float _engine_ui_layout_w = %sf;" % repr(float(ulw)))
         p("static const float _engine_ui_layout_h = %sf;" % repr(float(ulh)))
-        p("static const int _engine_rt_has[%d] = { %s };" % (
-            go_rt_n, ", ".join(str(int(x)) for x in _rt_i("has"))))
-        p("static const int _engine_rt_canvas[%d] = { %s };" % (
-            go_rt_n, ", ".join(str(int(x)) for x in _rt_i("canvas"))))
-        p("static const int _engine_rt_canvas_root[%d] = { %s };" % (
-            go_rt_n,
+        ro = "" if go_spawn_budget else "const "
+        p("static %sint _engine_rt_has[%d] = { %s };" % (
+            ro, go_rt_n, ", ".join(str(int(x)) for x in _rt_i("has"))))
+        p("static %sint _engine_rt_canvas[%d] = { %s };" % (
+            ro, go_rt_n, ", ".join(str(int(x)) for x in _rt_i("canvas"))))
+        p("static %sint _engine_rt_canvas_root[%d] = { %s };" % (
+            ro, go_rt_n,
             ", ".join(str(int(x)) for x in _rt_i("canvas_root"))))
         p("static float _engine_rt_amin_x[%d] = { %s };" % (
             go_rt_n, ", ".join("%sf" % repr(float(x))
@@ -10957,6 +11006,17 @@ def _emit_engine_live_rect_transforms(
         p("static float _engine_rt_sy[%d] = { %s };" % (
             go_rt_n, ", ".join("%sf" % repr(float(x))
                                for x in _rt_f("sy", 1.0))))
+        if go_spawn_budget:
+            # an Instantiate'd clone's RectTransform is its source's
+            plan["_rt_clone"] = True
+            p("static void _engine_rt_clone(int go, int src) {")
+            p("    if (go < 0 || go >= %d || src < 0 || src >= %d) return;"
+              % (go_rt_n, go_rt_n))
+            for t in ("has", "canvas", "canvas_root", "amin_x", "amin_y",
+                      "amax_x", "amax_y", "apos_x", "apos_y", "sd_x", "sd_y",
+                      "pivot_x", "pivot_y", "sx", "sy"):
+                p("    _engine_rt_%s[go] = _engine_rt_%s[src];" % (t, t))
+            p("}")
         p("static void _engine_rt_pivot_center(")
         p("    float parent_w, float parent_h,")
         p("    float amin_x, float amin_y, float amax_x, float amax_y,")
@@ -13715,6 +13775,33 @@ def _emit_engine_ui_transform_tables(
         p("    return _engine_go_sib[go];")
         p("}")
         p("")
+    if want_get_sibling and plan.get("_want_get_child"):
+        dead = " || _engine_go_destroyed[c]" if plan.get("_want_destroy") else ""
+        # ponytail: O(GameObjects) per childCount, O(GameObjects^2) per
+        # GetChild; a per-parent child list is the upgrade
+        p("static int Transform_childCount(int go) {")
+        p("    int c, n = 0;")
+        p("    for (c = 0; c < _engine_go_count; c = c + 1)")
+        p("        if (!(_engine_go_parent[c] != go%s)) n = n + 1;" % dead)
+        p("    return n;")
+        p("}")
+        p("static int Transform_GetChild(int go, int k) {")
+        p("    int c, d, r;")
+        p("    for (c = 0; c < _engine_go_count; c = c + 1) {")
+        p("        if (_engine_go_parent[c] != go%s) continue;" % dead)
+        p("        r = 0;")
+        p("        for (d = 0; d < _engine_go_count; d = d + 1)")
+        p("            if (!(_engine_go_parent[d] != go%s)"
+          " && _engine_go_sib[d] < _engine_go_sib[c]) r = r + 1;"
+          % dead.replace("[c]", "[d]"))
+        p("        if (r == k) return c;")
+        p("    }")
+        p('    fprintf(stderr, "UnityException: Transform child out of bounds\\n");')
+        p("    _engine_trace(0, 0, 0, 0);")
+        p("    if (_engine_in_script) longjmp(_engine_script_jmp, 1);")
+        p("    exit(70);")
+        p("}")
+        p("")
     if want_transform_parent:
         p("static int Transform_get_parent(int go) {")
         p("    if (go < 0 || go >= %d) return -1;" % go_n)
@@ -13909,6 +13996,13 @@ def _emit_engine_instantiate(
                 p("    _engine_spr_clone(go, _engine_%s_go_of[src]);" % idn)
             if plan.get("_spr_tex_cap"):
                 p("    _engine_spr_tex_clone(go, _engine_%s_go_of[src]);" % idn)
+            if plan.get("_rt_clone"):
+                p("    _engine_rt_clone(go, _engine_%s_go_of[src]);" % idn)
+            for ui_idn, ui_n in plan.get("_ui_gc_maps") or ():
+                # the clone has its source's uGUI components
+                p("    if (go < %d) _engine_go_%s[go] = "
+                  "_engine_go_%s[_engine_%s_go_of[src]] >= 0 ? go : -1;"
+                  % (ui_n, ui_idn, ui_idn, idn))
             if _multi_scene(plan):
                 p("    _engine_go_scene[go] = _engine_scene_active;")
             if want_ui:
@@ -14036,6 +14130,30 @@ def _emit_engine_instantiate(
                 p("    return _%s_tostring_buf;" % idn)
                 p("}")
                 p("")
+        clone = sorted(plan.get("go_clone_classes") or ())
+        if clone:
+            p("/* Instantiate(GameObject, parent): the class that is the GO */")
+            p("static int GameObject_Instantiate(int go, int parent_go) {")
+            p("    int c = -1;")
+            p("    if (go < 0 || go >= _engine_go_count) {")
+            p('        fprintf(stderr, "ArgumentException: The Object you want'
+              ' to instantiate is null.\\n");')
+            p("        _engine_trace(0, 0, 0, 0);")
+            p("        exit(70);")
+            p("    }")
+            for cname in clone:
+                idn = _c_ident(cname)
+                p("    if (_engine_go_%s[go] >= 0) {" % idn)
+                p("        c = Object_Instantiate_%s(_engine_go_%s[go], parent_go);"
+                  % (idn, idn))
+                p("        if (c >= 0) return _engine_%s_go_of[c];" % idn)
+                p("    }")
+            p('    fprintf(stderr, "Instantiate: more than %d live clones of'
+              ' %%s; raise [MaxInstances(N)]\\n", _engine_go_name[go]);'
+              % _GO_CLONE_POOL)
+            p("    exit(70);")
+            p("}")
+            p("")
 
 
 def _emit_engine_get_components_in_children(
@@ -18462,9 +18580,13 @@ def _emit_engine_class_draws(
         if want_destroy and plan.get("_go_of_fn"):
             p("            if (_engine_go_destroyed[_engine_go_of_%s(i)])" % idn)
             p("                continue;")
+        # a clone draws as its own GameObject (its rect, its activeness)
+        spr_go = ("_engine_go_of_%s(i)" % idn
+                  if _spawnable(plan, cname) and plan.get("_go_of_fn")
+                  else "_spr_go[k]")
         if want_ui:
-            p("            if (_spr_go[k] >= 0) {")
-            p("                if (!_engine_go_active_in_hierarchy(_spr_go[k]))")
+            p("            if (%s >= 0) {" % spr_go)
+            p("                if (!_engine_go_active_in_hierarchy(%s))" % spr_go)
             p("                    continue;")
             p("            }")
         cid = class_ids[cname]
@@ -18544,7 +18666,7 @@ def _emit_engine_class_draws(
                 p("                    float sh = _engine_ui_layout_h;")
                 p("                    float rcx, rcy, rw, rh, dw, dh, dcx, dcy;")
                 p("                    float pivx, pivy, sa;")
-                p("                    int go = _spr_go[k];")
+                p("                    int go = %s;" % spr_go)
                 p("                    if (sw < 1.f) sw = 1.f;")
                 p("                    if (sh < 1.f) sh = 1.f;")
                 p("                    _engine_ui_screen_rect("
@@ -18753,6 +18875,9 @@ def emit_engine(plan, analyses, used_apis):
     want_transform_go = "transform.gameObject" in used_apis
     want_set_parent = "transform.SetParent" in used_apis
     want_get_sibling = "transform.GetSiblingIndex" in used_apis
+    plan["_want_get_child"] = "transform.GetChild" in used_apis
+    plan["_rt_clone"] = False
+    plan["_ui_gc_maps"] = []
     want_getcomponent = "GetComponent" in used_apis
     want_data_path = "Application.dataPath" in used_apis
     want_persistent_data_path = "Application.persistentDataPath" in used_apis
@@ -20572,12 +20697,15 @@ def emit_engine(plan, analyses, used_apis):
     _parts.emit_collect(p, plan)
     _lines.emit_collect(p, plan)
     _tm.emit_collect(p, plan, _multi_scene(plan))
+    relayout = _emit_runtime_layout(p, plan, want_ui, want_destroy)
     p("int _engine_draw_nosort = 0; /* the GPU sorts (gles3_batch.h GPU_SORT) */")
     p("%s(EngineDraw *out, int max) {" % (
         "static int _engine_collect_draws_all" if plan.get("camera")
         else "int engine_collect_draws"))
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
+    if relayout:
+        p("    _engine_layout_all();")
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
     if plan.get("camera"):
@@ -20814,6 +20942,90 @@ _ENGINE_CAMERA_TYPEDEF = """typedef struct EngineCamera {
     int clear;                          /* 1: clear to bg first (Solid Color / Skybox) */
 } EngineCamera;
 """
+
+
+def _emit_runtime_layout(p, plan, want_ui, want_destroy):
+    """Horizontal/VerticalLayoutGroup over the live children (Instantiate'd
+    ones too), before each draw: Unity's SetChildrenAlongAxis with child
+    control and child scale off (a child's size is its sizeDelta). True
+    when emitted.
+
+    ponytail: a group that controls or scales its children keeps the
+    pack-time bake (_apply_layout_groups); O(children^2) per group."""
+    if not (plan.get("_rt_clone") and plan.get("_want_get_child")):
+        return False
+    groups = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            lg, gi = o.get("layout_group"), o.get("go_index")
+            if (lg and gi is not None and int(lg.get("enabled", 1))
+                    and not any(lg.get(k) for k in (
+                        "child_control_width", "child_control_height",
+                        "child_scale_width", "child_scale_height"))):
+                groups.append((int(gi), lg))
+    if not groups:
+        return False
+    live = ["_engine_go_parent[d] == go", "_engine_rt_has[d]"]
+    if want_destroy:
+        live.append("!_engine_go_destroyed[d]")
+    if want_ui:
+        live.append("_engine_go_active_in_hierarchy(d)")
+    p("static int _engine_layout_kid(int go, int d) {")
+    p("    return %s;" % " && ".join(live))
+    p("}")
+    p("static void _engine_layout_go(int go, int vert, float sp, float pl,")
+    p("    float pr, float pt, float pb, float al_x, float al_y, int rev) {")
+    p("    float size[2], pad0[2], pads[2], al[2], total, pos, cur;")
+    p("    int ax, c, d, prim;")
+    p("    _engine_ui_local_wh(go, _engine_ui_layout_w, _engine_ui_layout_h,")
+    p("                        &size[0], &size[1]);")
+    p("    if (size[0] < 0.f) size[0] = -size[0];")
+    p("    if (size[1] < 0.f) size[1] = -size[1];")
+    p("    pad0[0] = pl; pad0[1] = pt; pads[0] = pl + pr; pads[1] = pt + pb;")
+    p("    al[0] = al_x; al[1] = al_y;")
+    p("    for (ax = 0; ax < 2; ax = ax + 1) {")
+    p("        float *sd = ax == 0 ? _engine_rt_sd_x : _engine_rt_sd_y;")
+    p("        prim = (ax == 0) != vert;")
+    p("        total = pads[ax];")
+    p("        for (d = 0; d < _engine_go_count; d = d + 1)")
+    p("            if (_engine_layout_kid(go, d))")
+    p("                total = total + (sd[d] < 0.f ? -sd[d] : sd[d]) + sp;")
+    p("        if (total > pads[ax]) total = total - sp;")
+    p("        for (c = 0; c < _engine_go_count; c = c + 1) {")
+    p("            if (!_engine_layout_kid(go, c)) continue;")
+    p("            cur = (sd[c] < 0.f ? -sd[c] : sd[c]);")
+    p("            if (prim) {")
+    p("                pos = pad0[ax];")
+    p("                if (size[ax] > total)")
+    p("                    pos = pos + (size[ax] - total) * al[ax];")
+    p("                for (d = 0; d < _engine_go_count; d = d + 1)")
+    p("                    if (_engine_layout_kid(go, d) && (rev")
+    p("                            ? _engine_go_sib[d] > _engine_go_sib[c]")
+    p("                            : _engine_go_sib[d] < _engine_go_sib[c]))")
+    p("                        pos = pos + (sd[d] < 0.f ? -sd[d] : sd[d]) + sp;")
+    p("            } else")
+    p("                pos = pad0[ax] + (size[ax] - pads[ax] - cur) * al[ax];")
+    p("            if (ax == 0) {")
+    p("                _engine_rt_amin_x[c] = 0.f; _engine_rt_amax_x[c] = 0.f;")
+    p("                _engine_rt_apos_x[c] = pos + cur * _engine_rt_pivot_x[c];")
+    p("            } else {")
+    p("                _engine_rt_amin_y[c] = 1.f; _engine_rt_amax_y[c] = 1.f;")
+    p("                _engine_rt_apos_y[c] = -pos - cur * (1.f - _engine_rt_pivot_y[c]);")
+    p("            }")
+    p("        }")
+    p("    }")
+    p("}")
+    p("static void _engine_layout_all(void) {")
+    for gi, lg in groups:
+        a = int(lg.get("child_alignment") or 0)
+        p("    _engine_layout_go(%d, %d, %sf, %sf, %sf, %sf, %sf, %sf, %sf, %d);" % (
+            gi, 1 if lg.get("vertical") else 0,
+            *(repr(float(lg.get(k) or 0.0)) for k in (
+                "spacing", "pad_left", "pad_right", "pad_top", "pad_bottom")),
+            repr((a % 3) * 0.5), repr((a // 3) * 0.5), 1 if lg.get("reverse") else 0))
+    p("}")
+    p("")
+    return True
 
 
 def emit_engine_draw_h():
@@ -21214,15 +21426,25 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
             text = cs2cpp.code_sub(
                 pat + r"\s*\.\s*value\b",
                 lambda m, t=ty, e=expr: "%s_get_value(%s)" % (t, e), text)
+        if ty in ("Transform", "RectTransform"):
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*childCount\b",
+                lambda m, e=expr: "Transform_childCount(%s)" % e, text)
+            text = _rewrite_get_child(text, pat, expr)
+        if ty in ("Image", "RawImage") and plan.get("_spr_color_cap"):
+            text = _lower_handle_color(text, pat, expr)
+        def up(e, ups):
+            for _ in range(len(re.findall(r"parent", ups or ""))):
+                e = "Transform_get_parent(%s)" % e
+            return e
         text = cs2cpp.code_sub(
-            pat + r"(\s*\.\s*parent)?\s*\.\s*gameObject\s*\.\s*SetActive\s*"
+            pat + r"((?:\s*\.\s*parent\b)*)\s*\.\s*gameObject\s*\.\s*SetActive\s*"
             r"\(\s*([^)]+)\s*\)",
             lambda m, e=expr: "GameObject_SetActive(%s, (%s))" % (
-                "Transform_get_parent(%s)" % e if m.group(1) else e,
-                m.group(2)), text)
+                up(e, m.group(m.lastindex - 1)), m.group(m.lastindex)), text)
         text = cs2cpp.code_sub(
-            pat + r"\s*\.\s*parent(?:\s*\.\s*(?:gameObject|transform)\b)?",
-            lambda m, e=expr: "Transform_get_parent(%s)" % e, text)
+            pat + r"((?:\s*\.\s*parent\b)+)(?:\s*\.\s*(?:gameObject|transform)\b)?",
+            lambda m, e=expr: up(e, m.group(m.lastindex)), text)
         text = cs2cpp.code_sub(
             pat + r"\s*\.\s*(?:gameObject|transform)\b",
             lambda m, e=expr: e, text)
@@ -21231,6 +21453,32 @@ def _rewrite_go_handle_members(text, cl, plan, site=None):
     if trs:
         text = _rewrite_transform_handle_trs(text, trs, site)
     return text
+
+
+def _rewrite_get_child(text, pat, expr):
+    """`h.GetChild(k)[.gameObject|.transform][.GetComponent<UiType>()]` on a
+    Transform handle: the child's GO index (a uGUI component is its GO)."""
+    out, i = [], 0
+    rx = re.compile(pat + r"\s*\.\s*GetChild\s*\(")
+    tail = re.compile(
+        r"\s*\.\s*(?:gameObject|transform)\b"
+        r"|\s*\.\s*GetComponent\s*<\s*(?:UnityEngine\.UI\.)?(\w+)\s*>\s*\(\s*\)")
+    while True:
+        m = rx.search(text, i)
+        parsed = m and _match_call_args(text, m.end() - 1)
+        if not parsed:
+            out.append(text[i:])
+            return "".join(out)
+        args, after = parsed
+        call = "Transform_GetChild(%s, (int)(%s))" % (expr, args.strip())
+        t = tail.match(text, after)
+        while t and (t.group(1) is None or t.group(1) in _UI_GETCOMPONENT_TYPES):
+            if t.group(1):
+                call = "GameObject_GetComponent_%s(%s)" % (_c_ident(t.group(1)), call)
+            after = t.end()
+            t = tail.match(text, after)
+        out.append(text[i:m.start()] + call)
+        i = after
 
 
 _TRANSFORM_HANDLE_PROTOS = {
@@ -27139,6 +27387,48 @@ _COLLIDER2D_FIELD_TYPES = frozenset((
     "PolygonCollider2D"))
 
 
+def _unwrap_color_assign(text):
+    """`x.color = (new Color(..));` -> `x.color = new Color(..);`."""
+    for m in reversed(list(re.finditer(
+            r"\.\s*color\s*=(?!=)\s*(\()\s*new\s+(?:UnityEngine\s*\.\s*)?"
+            r"Color\s*\(", text))):
+        got = _match_call_args(text, m.start(1))
+        if got and _match_call_args(text, m.end() - 1)[1] == got[1] - 1:
+            text = (text[:m.start(1)] + text[m.start(1) + 1:got[1] - 1]
+                    + text[got[1]:])
+    return text
+
+
+def _lower_handle_color(text, pat, expr):
+    """`h.color.r|g|b|a` and `h.color = new Color(r, g, b[, a]);` on an
+    Image handle (its GO): the per-GameObject tint `SpriteRenderer.color`
+    keeps, which the draw list applies."""
+    text = cs2cpp.code_sub(r"\(\s*%s\s*\.\s*color\s*\)" % pat,
+                           lambda m: m.group(0)[1:-1].strip(), text)
+    text = _unwrap_color_assign(text)
+    text = cs2cpp.code_sub(
+        pat + r"\s*\.\s*color\s*\.\s*(?P<ch>[rgba])\b"
+        r"(?!\s*(?:\.|\(|[-+*/]?=(?!=)))",
+        lambda m: "SpriteRenderer_color(%s, %d)" % (
+            expr, "rgba".index(m.group("ch"))), text)
+    out, i = [], 0
+    rx = re.compile(pat + r"\s*\.\s*color\s*=(?!=)\s*new\s+"
+                    r"(?:UnityEngine\s*\.\s*)?Color\s*\(")
+    while True:
+        m = rx.search(text, i)
+        got = m and _match_call_args(text, m.end() - 1)
+        if not got:
+            out.append(text[i:])
+            return "".join(out)
+        a = [x.strip() for x in _split_call_args(got[0])]
+        if len(a) not in (3, 4):
+            out.append(text[i:got[1]])
+        else:
+            out.append(text[i:m.start()] + "SpriteRenderer_set_color(%s, %s)" % (
+                expr, ", ".join(a + ["1.f"] if len(a) == 3 else a)))
+        i = got[1]
+
+
 def _lower_bounds(text, plan, site=None):
     """`c.bounds.center|extents|size|min|max[.x|.y]` of a Collider2D field
     (a collider row) or a SpriteRenderer field (a GO): the world AABB, by
@@ -27161,13 +27451,7 @@ def _lower_bounds(text, plan, site=None):
         # (the inlined extension wraps both in parentheses)
         text = re.sub(r"\(\s*((?:%s)\s*\([^()]*\)\s*\.\s*color)\s*\)" % "|".join(
             map(re.escape, sorted(sprs))), r"\1", text)
-        for m in reversed(list(re.finditer(
-                r"\.\s*color\s*=(?!=)\s*(\()\s*new\s+(?:UnityEngine\s*\.\s*)?"
-                r"Color\s*\(", text))):
-            got = _match_call_args(text, m.start(1))
-            if got and _match_call_args(text, m.end() - 1)[1] == got[1] - 1:
-                text = (text[:m.start(1)] + text[m.start(1) + 1:got[1] - 1]
-                        + text[got[1]:])
+        text = _unwrap_color_assign(text)
         text = _call_suffix_sub(
             text, sprs, r"\s*\.\s*color\s*\.\s*([rgba])\b"
             r"(?!\s*(?:\.|\(|[-+*/]?=(?!=)))",
@@ -29367,7 +29651,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 12
+_SCENE_CACHE_VERSION = 13
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -30001,6 +30285,13 @@ def _pack_impl(root, outdir, soa=True, soa_vec4=False, force=False, strict=None,
                 _tc = plan["classes"][_t]
                 if _tc.get("max_instances") is None:
                     _tc["max_instances"] = int(_tc["n"]) + _PREFAB_SPAWN_POOL
+            # ponytail: at most _GO_CLONE_POOL live clones of a child; the
+            # next Instantiate stops the program -- raise it, or [MaxInstances]
+            for _t in _child_clone_classes(c, plan):
+                plan.setdefault("go_clone_classes", set()).add(_t)
+                _tc = plan["classes"][_t]
+                if _tc.get("max_instances") is None:
+                    _tc["max_instances"] = int(_tc["n"]) + _GO_CLONE_POOL
     if plan.get("godot"):
         # Godot's PackedScene.Instantiate: a template root's class spawns,
         # [MaxInstances(N)] or a default number of spare rows
