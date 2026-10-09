@@ -6936,6 +6936,8 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![\w.])Camera\s*\.\s*main\s*\.\s*"
                  r"ScreenToWorldPoint\s*\(", scan):
         apis.add("Camera.main.ScreenToWorldPoint")
+    if re.search(r"(?<![\w.])Rect\b|\.\s*rect\b", scan):
+        apis.add("Rect")
     if re.search(r"(?<![\w.])Mouse\s*\.\s*current\s*\.\s*position\b", scan):
         apis.add("Mouse.current.position")
     if re.search(r"\bInputAction\b", scan):
@@ -9166,6 +9168,11 @@ def plan_layouts(objects, analyses, two_d=None):
             if ty == "Vector2":
                 members.append((fname + "_x", "float", 32, "f32"))
                 members.append((fname + "_y", "float", 32, "f32"))
+                continue
+            if ty == "Rect":
+                # its four floats; `Cls_get_f(i)` is the whole Rect
+                for ax in _RECT_AXES:
+                    members.append((fname + "_" + ax, "float", 32, "f32"))
                 continue
             if ty == "Vector2Int":
                 members.append((fname + "_x", "int", 32, "i32"))
@@ -14476,6 +14483,17 @@ def _emit_engine_class_groups(
                   % (idn, name, idn, name))
                 p("static void %s_set_%s(unsigned i, unsigned v) { %s_AT(i).%s = v; }"
                   % (idn, name, idn, name))
+        names = {m[0] for m in cl["members"]}
+        for f in cl.get("fields") or []:
+            fn = f["name"]
+            if f.get("ty") != "Rect" or fn + "_x" not in names:
+                continue
+            p("static Rect %s_get_%s(unsigned i) { return Rect_make(%s); }" % (
+                idn, fn, ", ".join("%s_get_%s_%s(i)" % (idn, fn, ax)
+                                   for ax in _RECT_AXES)))
+            p("static void %s_set_%s(unsigned i, Rect r) { %s }" % (
+                idn, fn, " ".join("%s_set_%s_%s(i, r.%s);" % (idn, fn, ax, ax)
+                                  for ax in _RECT_AXES)))
         p("")
         emit_names = _reachable_emit_methods(
             [m for _c, m in methods_by.get(cname, [])],
@@ -18369,8 +18387,8 @@ def emit_engine(plan, analyses, used_apis):
     want_quat_angle = "Quaternion.Angle" in used_apis
     # UnityEngine.Rect as a value type: any script that builds or reads one.
     want_rect = bool(used_apis & {
-        "Rect.PointToNormalized", "RectTransform.rect",
-        "Extensions.GetWorldRect"})
+        "Rect", "Rect.PointToNormalized", "RectTransform.rect",
+        "Extensions.GetWorldRect"}) or _plan_has_rect_field(plan)
     want_screen_to_world = bool(plan.get("camera")) and bool(used_apis & {
         "Camera.main.ScreenToWorldPoint", "Extensions.GetWorldRect"})
     want_mouse_position = "Mouse.current.position" in used_apis
@@ -18803,6 +18821,22 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float Camera_main_rect_y;")
         p("extern float Camera_main_rect_w;")
         p("extern float Camera_main_rect_h;")
+        if want_rect:
+            p("static Rect Camera_main_rect(void) {")
+            p("    return Rect_make(Camera_main_rect_x, Camera_main_rect_y,")
+            p("                     Camera_main_rect_w, Camera_main_rect_h);")
+            p("}")
+            p("/* ponytail: clipped to the screen when set (Unity clips it")
+            p("   only when drawing, so a read back of an off-screen rect")
+            p("   differs; the viewport the host draws is the same). */")
+            p("static void Camera_main_set_rect(Rect r) {")
+            p("    float x0 = r.x < 0.f ? 0.f : r.x, y0 = r.y < 0.f ? 0.f : r.y;")
+            p("    float x1 = r.x + r.width > 1.f ? 1.f : r.x + r.width;")
+            p("    float y1 = r.y + r.height > 1.f ? 1.f : r.y + r.height;")
+            p("    Camera_main_rect_x = x0; Camera_main_rect_y = y0;")
+            p("    Camera_main_rect_w = x1 > x0 ? x1 - x0 : 0.f;")
+            p("    Camera_main_rect_h = y1 > y0 ? y1 - y0 : 0.f;")
+            p("}")
         p("extern float Camera_main_nearClipPlane;")
         p("extern float Camera_main_farClipPlane;")
         p("extern float Camera_main_background_r;")
@@ -21162,9 +21196,9 @@ def _rewrite_rect_members(text):
     # `rect.center = v` — a property write on a Rect local.
     for n in sorted(names):
         text = cs2cpp.code_sub(
-            r"(?<![\w.])%s\s*\.\s*center\s*=\s*([^;]+);" % re.escape(n),
-            lambda m, nm=n: "Rect_set_center(&%s, %s);" % (
-                nm, m.group(1).strip()),
+            r"(?<![\w.])%s\s*\.\s*(center|size)\s*=\s*([^;]+);" % re.escape(n),
+            lambda m, nm=n: "Rect_set_%s(&%s, %s);" % (
+                m.group(1), nm, m.group(2).strip()),
             text)
     i = 0
     while True:
@@ -22442,7 +22476,14 @@ def _plan_needs_vector2(plan, used_apis=None):
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2_fields"):
             return True
-    return False
+    return _plan_has_rect_field(plan)
+
+
+def _plan_has_rect_field(plan):
+    """A script's `Rect` field: the Rect struct (and its Vector2) is its type."""
+    return any(f.get("ty") == "Rect" and not f.get("static")
+               for cl in (plan or {}).get("classes", {}).values()
+               for f in cl.get("fields") or [])
 
 
 def _plan_needs_vector2int(plan, used_apis=None):
@@ -22902,6 +22943,7 @@ _UNITY_API_SCENE = [
     _B("RenderSettings.ambientLight.g", "RenderSettings_ambient_g", "value"),
     _B("RenderSettings.ambientLight.b", "RenderSettings_ambient_b", "value"),
     _B("Camera.main.orthographicSize", "Camera_main_orthographicSize", "value"),
+    _B("Camera.main.rect", "Camera_main_rect", "getter"),
     _B("Camera.main.transform.position.x", "Camera_main_pos_x", "value"),
     _B("Camera.main.transform.position.y", "Camera_main_pos_y", "value"),
     _B("Camera.main.transform.position.z", "Camera_main_pos_z", "value"),
@@ -26052,7 +26094,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 plan["_destroy_after"] = True
                 text = text[:m.start()] + "Object_DestroyAfter" + \
                     text[m.start() + len("Object_Destroy"):]
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Camera\s*\.\s*main\s*\.\s*rect\s*=(?!=)\s*([^;]+);",
+        r"Camera_main_set_rect(\1);", text)
     text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])Camera_main_rect\(\)\s*\.\s*(x|y|width|height)\b",
+        lambda m: "Camera_main_rect_" + m.group(1)[0], text)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\."
@@ -26176,7 +26224,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                   idn + "_get_pos_z(i)" if not cl["two_d"] else "0.f", text)
     text = _rewrite_new_vector_assigns(text, idn, two_d=bool(cl.get("two_d")))
 
-    members = {n for n, _t, _b, _k in cl["members"]}
+    members = {n for n, _t, _b, _k in cl["members"]} | {
+        f["name"] for f in cl.get("fields") or []
+        if f.get("ty") == "Rect" and not f.get("static")}
     # Class const / static names (FRAME_CNT, LOG_FILE_PATH).
     class_const_names = {
         f["name"]: f for f in (cl.get("class_consts") or [])
@@ -26249,6 +26299,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                     % (o, f, m.group(1), o, f, m.group(1))),
                 text)
     # new Rect(x, y, w, h) → the engine's value-type constructor.
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])new\s+Rect\s*\(\s*\)", "Rect_make(0, 0, 0, 0)", text)
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Rect\s*\(",
         "Rect_make(", text)
@@ -26684,6 +26736,37 @@ def _late_call_members(text, plan):
             text = _fill_defaults_after(text, _method_c_symbol(
                 _c_ident(cn), m["name"], m.get("args") or "", False), prms,
                 receiver=True)
+    rects = {"%s_get_%s" % (_c_ident(cn), f["name"])
+             for cn, c in (plan.get("classes") or {}).items()
+             for f in c.get("fields") or []
+             if f.get("ty") == "Rect" and not f.get("static")}
+    if rects:
+        # a Rect field: `r.center|size = v` writes it back whole; `r.x =`
+        # and `r.x` are its float's; `r.center` (a Vector2) a Rect helper's
+        def parts(call):
+            k = call.index("(")
+            return call[:k], call[k + 1:call.rindex(")")]
+        text = _call_suffix_sub(
+            text, rects, r"\s*\.\s*(center|size)\s*=(?!=)",
+            lambda call, mm: "{ Rect _rf = %s; Rect_set_%s(&_rf, \x01%s(%s, _rf); }\x02" % (
+                call, mm.group(1), parts(call)[0].replace("_get_", "_set_", 1),
+                parts(call)[1]))
+        text = re.sub(r"\x01([^\x02]*)\x02([^;]*);",
+                      lambda m: "%s); %s" % (m.group(2), m.group(1)), text)
+        text = _call_suffix_sub(
+            text, rects, r"\s*\.\s*(x|y|width|height)\s*=(?!=)",
+            lambda call, mm: "%s_%s(%s, \x01" % (
+                parts(call)[0].replace("_get_", "_set_", 1), mm.group(1),
+                parts(call)[1]))
+        text = re.sub(r"\x01([^;]*);", r"\1);", text)
+        text = _call_suffix_sub(
+            text, rects, r"\s*\.\s*(x|y|width|height)\b(?!\s*[-+*/]?=(?!=))",
+            lambda call, mm: "%s_%s(%s)" % (parts(call)[0], mm.group(1),
+                                            parts(call)[1]))
+        text = _call_suffix_sub(
+            text, rects, r"\s*\.\s*(center|size|min|max)\b(?!\s*=(?!=))",
+            lambda call, mm: "Rect_%s(%s)" % (mm.group(1), call))
+        text = _rewrite_vector2_value_axis(text)
     if plan.get("_spr_tex_cap") and ".sprite" in text:
         # `r.sprite = s;` / `r.sprite` of an Image / SpriteRenderer field
         text = _call_suffix_sub(
@@ -26724,6 +26807,9 @@ def _late_call_members(text, plan):
             "GameObject_activeSelf(%s)" % call if g == "activeSelf"
             else "GameObject_SetActive(%s, " % call if g
             else call))(mm.group(1) or mm.group(2)))
+
+
+_RECT_AXES = ("x", "y", "width", "height")
 
 
 _COLLIDER2D_FIELD_TYPES = frozenset((
@@ -27651,6 +27737,8 @@ def emit_data(plan, used_apis=None):
         p("%s _%s_inst_array[%d] = {" % (idn, idn, cap))
         mb_index = _mb_index(plan)
         go_refs = plan.get("go_field_refs") or {}
+        rects = {f["name"] for f in cl.get("fields") or []
+                 if f.get("ty") == "Rect" and not f.get("static")}
         for inst_i, o in enumerate(cl["instances"]):
             parts = []
             sx, sy, sz = _instance_storage_pos(o)
@@ -27660,6 +27748,12 @@ def emit_data(plan, used_apis=None):
                     go = row[inst_i] if inst_i < len(row) else -1
                     parts.append(str(int(go)) if int(go) >= 0
                                  else "%du" % _idx_null(bits))
+                    continue
+                base, _, ax = name.rpartition("_")
+                if base in rects and ax in _RECT_AXES:
+                    parts.append(_init_num(float(
+                        ((o.get("struct_values") or {}).get(base) or {})
+                        .get("fields", {}).get(ax) or 0.0), kind))
                     continue
                 if name == "pos_x":
                     parts.append(_init_num(sx, kind))

@@ -2617,7 +2617,7 @@ def _rewrite_toggle_is_on(text):
 
 #: Emitted helpers that hand back a `Rect` — a receiver its properties read.
 _RECT_VALUE_CALLS = ("RectTransform_GetWorldRect", "RectTransform_get_rect",
-                     "Rect_MinMaxRect", "Rect_make")
+                     "Rect_MinMaxRect", "Rect_make", "Camera_main_rect")
 
 
 def _rect_receiver(text, scan, end):
@@ -2806,6 +2806,10 @@ def _emit_rect_struct(p, want_point_to_normalized=True):
     p("static void Rect_set_center(Rect *r, Vector2 v) {")
     p("    r->x = Vector2_x(v) - r->width * 0.5f;")
     p("    r->y = Vector2_y(v) - r->height * 0.5f;")
+    p("}")
+    p("/* `rect.size = v` keeps the min corner. */")
+    p("static void Rect_set_size(Rect *r, Vector2 v) {")
+    p("    r->width = Vector2_x(v); r->height = Vector2_y(v);")
     p("}")
     if want_point_to_normalized:
         p("/* Mathf.InverseLerp — 0 on a degenerate range, clamped [0,1]. */")

@@ -3327,6 +3327,28 @@ class TestPrefabVariants(unittest.TestCase):
         self.assertIn("m_Name: Base", out)
 
 
+class TestRectField(unittest.TestCase):
+    """A `Rect` field (CameraScript.viewRect): its authored value, and
+    `.size =` / `.center =` writes moving it (CameraScript.HandlePosition
+    and HandleViewSize) -- not a handle an int stands for."""
+
+    @needs_cc
+    def test_size_then_center(self):
+        root = project(self, {"Cam": script(
+            "Cam", "Debug.Log(\"a \" + viewRect.x + \" \" + viewRect.width);\n"
+            "        viewRect.size = viewSize;\n"
+            "        viewRect.center = transform.position;\n"
+            "        Debug.Log(\"r \" + viewRect.x + \" \" + viewRect.y + \" \""
+            " + viewRect.width + \" \" + viewRect.height + \" \" + viewRect.center.x);",
+            "    public Rect viewRect;\n    public Vector2 viewSize;")},
+            [("Cam", None, "  viewRect:\n    serializedVersion: 2\n    x: 1\n"
+              "    y: 2\n    width: 3\n    height: 4\n"
+              "  viewSize: {x: 4, y: 2}\n")])
+        out = pack(self, root)
+        # the object sits at x 0 (project's first), so centred on (0, 0)
+        self.assertEqual(run_frames(self, out, 1), ["a 1 3", "r -2 -1 4 2 0"])
+
+
 class TestTilemapTiles(unittest.TestCase):
     """Tilemap tiles baked into world-space sprite draws."""
 
