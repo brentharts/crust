@@ -50,6 +50,16 @@ int Camera_main_y_down __attribute__((weak)) = 0;
 float engine_input_axis_Horizontal __attribute__((weak)) = 0.f;
 float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
 int engine_keyboard_connected __attribute__((weak)) = 0;
+/* A pack with no Camera: no passes, the Camera_main_* view alone. */
+int engine_collect_cameras(EngineCamera *out, int max) __attribute__((weak));
+int engine_collect_cameras(EngineCamera *out, int max)
+{
+    (void)out;
+    (void)max;
+    return 0;
+}
+void engine_draw_camera(int k) __attribute__((weak));
+void engine_draw_camera(int k) { (void)k; }
 /* Input System Keyboard.current.<name>Key -> GLFW key; weak so data.c's
  * engine_keyboard_<name> (only the keys scripts read) wins. */
 #define UNITY_KEYS(X) \
@@ -328,6 +338,8 @@ static GLuint build_program(void)
     return p;
 }
 
+static GLuint white_tex;
+
 static int upload_textures(void)
 {
     int i;
@@ -421,8 +433,6 @@ static void poll_input_axes(GLFWwindow *win)
     }
 }
 
-static GLuint white_tex;
-
 static void draw_one(const EngineDraw *d)
 {
     int nfloats = 0;
@@ -453,13 +463,53 @@ static void draw_one(const EngineDraw *d)
     glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);
 }
 
-static void frame(GLFWwindow *win)
+/* Camera.rect's pixels for the camera the Camera_main_* globals are,
+ * cleared to its background when it clears (Solid Color / Skybox); the
+ * scissor keeps the clear inside the rect (the letterbox stays black). */
+static void camera_viewport(int width, int height, int clear)
+{
+    int vx = (int)(Camera_main_rect_x * (float)width + 0.5f);
+    int vy = (int)(Camera_main_rect_y * (float)height + 0.5f);
+    int vw = (int)(Camera_main_rect_w * (float)width + 0.5f);
+    int vh = (int)(Camera_main_rect_h * (float)height + 0.5f);
+    float aspect = Camera_main_aspect;
+    if (vw < 1)
+        vw = 1;
+    if (vh < 1)
+        vh = 1;
+    if (aspect < 1e-6f)
+        aspect = (float)vw / (float)vh;
+    refresh_camera_bounds(aspect);
+    glViewport(vx, vy, vw, vh);
+    if (!clear)
+        return;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(vx, vy, vw, vh);
+    glClearColor(Camera_main_background_r, Camera_main_background_g,
+                 Camera_main_background_b, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+/* One camera's pass: its view, its clear, the draws it sees. */
+static void draw_pass(int fbw, int fbh, int clear)
 {
     static EngineDraw draws[MAX_DRAWS];
-    int ndraw, i;
-    int fbw, fbh, ww, wh;
-    int vx, vy, vw, vh;
-    float aspect;
+    int ndraw = engine_collect_draws(draws, MAX_DRAWS), i;
+    camera_viewport(fbw, fbh, clear);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(prog);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(u_tex_loc, 0);
+    for (i = 0; i < ndraw; i++)
+        draw_one(&draws[i]);
+}
+
+static void frame(GLFWwindow *win)
+{
+    static EngineCamera cams[32];
+    int fbw, fbh, ww, wh, ncam, k;
 
     glfwGetWindowSize(win, &ww, &wh);
     glfwGetFramebufferSize(win, &fbw, &fbh);
@@ -474,36 +524,19 @@ static void frame(GLFWwindow *win)
         handle_view_size(ww, wh);
     poll_input_axes(win);
     engine_tick();
-    aspect = Camera_main_aspect;
-    if (aspect < 1e-6f)
-        aspect = fbh > 0 ? (float)fbw / (float)fbh : 1.0f;
-    refresh_camera_bounds(aspect);
-    ndraw = engine_collect_draws(draws, MAX_DRAWS);
 
-    /* Camera.rect letterbox: black bars outside the authored pixel rect. */
-    vx = (int)(Camera_main_rect_x * (float)fbw + 0.5f);
-    vy = (int)(Camera_main_rect_y * (float)fbh + 0.5f);
-    vw = (int)(Camera_main_rect_w * (float)fbw + 0.5f);
-    vh = (int)(Camera_main_rect_h * (float)fbh + 0.5f);
-    if (vw < 1)
-        vw = 1;
-    if (vh < 1)
-        vh = 1;
     glViewport(0, 0, fbw, fbh);
     glClearColor(0.f, 0.f, 0.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(vx, vy, vw, vh);
-    glClearColor(Camera_main_background_r, Camera_main_background_g,
-                 Camera_main_background_b, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    glUseProgram(prog);
-    glActiveTexture(GL_TEXTURE0);
-    glUniform1i(u_tex_loc, 0);
-    for (i = 0; i < ndraw; i++)
-        draw_one(&draws[i]);
+    /* every camera that renders, lowest depth first */
+    ncam = engine_collect_cameras(cams, 32);
+    if (ncam < 1)
+        draw_pass(fbw, fbh, 1);
+    for (k = 0; k < ncam; k++) {
+        engine_draw_camera(k);
+        draw_pass(fbw, fbh, cams[k].clear);
+    }
+    engine_draw_camera(-1);
 
     glfwSwapBuffers(win);
     glfwPollEvents();

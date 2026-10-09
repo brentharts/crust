@@ -26,6 +26,7 @@ takes a spare row (null when the GameObject already has one).
 """
 import re
 
+import tools.unity_pack_common as _cmn
 import tools.unity_pack_curves as _curves
 
 #: At most this many points a line (Unity has no limit; this is the table).
@@ -369,6 +370,7 @@ def emit_collect(p, plan):
         return
     cap = PER_LINE_CAP
     p("static void _lr_collect(EngineDraw *out, int *n, int max) {")
+    p("    static const int _lr_layer[] = { %s };" % _cmn.draw_layers(plan, plan["lines"]))
     p("    int s, k, segs;")
     p("    for (s = 0; s < %d; s = s + 1) {" % len(lines))
     p("        float ox = 0.f, oy = 0.f, total = 0.f, run = 0.f;")
@@ -406,6 +408,7 @@ def emit_collect(p, plan):
     p("            d->sorting_order = _lr_order[s];")
     p("            d->flags = 0;")
     p("            d->go = _lr_go[s];")
+    p("            d->layer = _lr_layer[s];")
     p("            d->z = 0.f;")
     p("            *n = *n + 1;")
     p("        }")

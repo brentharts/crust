@@ -22,6 +22,7 @@ import math
 import re
 
 import tools.cs2cpp as cs2cpp
+import tools.unity_pack_common as _cmn
 
 #: At most this many live particles a system (and maxNumParticles).
 PER_SYSTEM_CAP = 512
@@ -330,6 +331,7 @@ def emit_collect(p, plan):
     if not plan.get("particles"):
         return
     p("static void _ps_collect(EngineDraw *out, int *n, int max) {")
+    p("    static const int _ps_layer[] = { %s };" % _cmn.draw_layers(plan, plan["particles"]))
     p("    int s, k;")
     p("    for (s = 0; s < %d; s = s + 1) {" % len(plan["particles"]))
     p("        float ex = 0.f, ey = 0.f;")
@@ -347,7 +349,7 @@ def emit_collect(p, plan):
     p("            d->tex = -2; /* no texture: its color */")
     p("            d->sorting_layer = 0;")
     p("            d->sorting_order = 0;")
-    p("            d->flags = 0; d->go = -1; d->z = 0.f;")
+    p("            d->flags = 0; d->go = -1; d->z = 0.f; d->layer = _ps_layer[s];")
     p("            *n = *n + 1;")
     p("        }")
     p("    }")

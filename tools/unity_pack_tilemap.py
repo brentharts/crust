@@ -151,6 +151,7 @@ def bake_tiles(by_id, world_trs, quat_xy_basis):
                 rd, enabled=1, has_sprite=True, tile=True,
                 sprite_file_id=spr[0], sprite_guid=spr[1],
                 x=px + r00 * lx + r01 * ly, y=py + r10 * lx + r11 * ly, z=pz,
+                layer=int((by_id.get(go) or {}).get("layer") or 0),
                 m00=a00 / n0, m01=a01 / n1, m10=a10 / n0, m11=a11 / n1,
                 scale_x=n0, scale_y=n1,
                 r=col[0] * tm["color"][0], g=col[1] * tm["color"][1],
@@ -181,7 +182,7 @@ def emit_collect(p, plan, multi_scene):
                                for t in tiles])
     table("float", "_tm_pvy", [_f(1.0 - 2.0 * float((t.get("pivot") or (0.5, 0.5))[1]))
                                for t in tiles])
-    for k in ("tex_id", "sorting_layer", "sorting_order", "lit"):
+    for k in ("tex_id", "sorting_layer", "sorting_order", "lit", "layer"):
         table("int", "_tm_" + k, [str(int(t.get(k) or 0)) for t in tiles])
     if multi_scene:
         table("int", "_tm_scene", [str(int(t.get("scene") or 0)) for t in tiles])
@@ -217,6 +218,7 @@ def emit_collect(p, plan, multi_scene):
     p("        d->z = _tm_z[k];")
     p("        d->flags = _tm_lit[k];")
     p("        d->go = -1;")
+    p("        d->layer = _tm_layer[k];")
     p("        *n = *n + 1;")
     p("    }")
     p("}")

@@ -2185,16 +2185,16 @@ class TestHybrid(_PackHarness):
         body = """
     public float a;
     void Update() {
-        a = Camera.main.aspect;
+        a = Camera.main.fieldOfView;
         transform.position = new Vector3(a, 0f, 0f);
     }"""
         root = self._project(self._script(body))
         with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
             f.write(self.CAMERA_SCENE)
         out, err = self._pack(root, managed="*")
-        # (the packer cannot lower Camera.main.aspect either: the method stays the stub it was, with the managed reason)
+        # (the packer cannot lower Camera.main.fieldOfView either: the method stays the stub it was, with the managed reason)
         self.assertIn("warning CS8000", err)
-        self.assertIn("'Camera' does not contain a definition for 'aspect'", err)
+        self.assertIn("'Camera' does not contain a definition for 'fieldOfView'", err)
 
     KEYS = """
     public float k; public float dn; public float up; public float db;
@@ -3325,6 +3325,138 @@ class TestPrefabVariants(unittest.TestCase):
         self.assertRegex(out, r"--- !u!212 &%d\n[^-]*m_Sprite: \{fileID: -7, "
                               r"guid: ef, type: 3\}" % sid)
         self.assertIn("m_Name: Base", out)
+
+
+class TestRectField(unittest.TestCase):
+    """A `Rect` field (CameraScript.viewRect): its authored value, and
+    `.size =` / `.center =` writes moving it (CameraScript.HandlePosition
+    and HandleViewSize) -- not a handle an int stands for."""
+
+    @needs_cc
+    def test_size_then_center(self):
+        root = project(self, {"Cam": script(
+            "Cam", "Debug.Log(\"a \" + viewRect.x + \" \" + viewRect.width);\n"
+            "        viewRect.size = viewSize;\n"
+            "        viewRect.center = transform.position;\n"
+            "        Debug.Log(\"r \" + viewRect.x + \" \" + viewRect.y + \" \""
+            " + viewRect.width + \" \" + viewRect.height + \" \" + viewRect.center.x);",
+            "    public Rect viewRect;\n    public Vector2 viewSize;")},
+            [("Cam", None, "  viewRect:\n    serializedVersion: 2\n    x: 1\n"
+              "    y: 2\n    width: 3\n    height: 4\n"
+              "  viewSize: {x: 4, y: 2}\n")])
+        out = pack(self, root)
+        # the object sits at x 0 (project's first), so centred on (0, 0)
+        self.assertEqual(run_frames(self, out, 1), ["a 1 3", "r -2 -1 4 2 0"])
+
+
+class TestCameraField(unittest.TestCase):
+    """A `Camera` field on the camera the engine drives (the scene's
+    MainCamera, else its first: CameraScript.HandleViewSize): `aspect`,
+    `orthographicSize` and `rect` reach the engine's globals."""
+
+    CAMERA = ("--- !u!20 &{fid}\nCamera:\n  m_GameObject: {{fileID: {go}}}\n"
+              "  m_Orthographic: 1\n  m_OrthographicSize: 5\n")
+
+    def _project(self, n, main_tag=None):
+        root = project(self, {"Cam": script(
+            "Cam", "float sa = (float) Screen.width / Screen.height;\n"
+            "        camera.aspect = viewSize.x / viewSize.y;\n"
+            "        camera.orthographicSize = Mathf.Max(viewSize.x / 2 / camera.aspect, viewSize.y / 2);\n"
+            "        Rect r = new Rect();\n"
+            "        r.size = new Vector2(camera.aspect / sa, Mathf.Min(1, sa / camera.aspect));\n"
+            "        r.center = Vector2.one / 2;\n"
+            "        camera.rect = r;\n"
+            "        Debug.Log(\"c \" + camera.aspect + \" \" + camera.orthographicSize"
+            " + \" \" + camera.rect.width + \" \" + camera.rect.height * 3);",
+            "    public new Camera camera;\n    public Vector2 viewSize;")},
+            [("Cam", self.CAMERA, "  camera: {fileID: %d}\n  viewSize: {x: 4, y: 2}\n"
+              % (103 + 10 * k)) for k in range(n)])
+        if main_tag is not None:
+            scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+            with open(scene) as f:
+                text = f.read()
+            with open(scene, "w") as f:
+                f.write(text.replace("m_Name: Cam%d\n" % main_tag,
+                                     "m_Name: Cam%d\n  m_TagString: MainCamera\n" % main_tag))
+        return root
+
+    @needs_cc
+    def test_handle_view_size(self):
+        out = pack(self, self._project(1))
+        # 1024x768 (4:3) screen, 2:1 view: a 1.5-wide rect clipped to the
+        # screen's width, 2/3 of its height (letterboxed)
+        self.assertEqual(run_frames(self, out, 1), ["c 2 1 1 2"])
+
+    def test_a_camera_the_engine_does_not_drive_stays_a_stub(self):
+        # Cam0's camera is not the scene's: Cam1 holds the MainCamera tag
+        with self.assertRaisesRegex(unity_pack.PackError, "CS8000: `Cam.Update` is not lowered"):
+            pack(self, self._project(2, main_tag=1))
+
+
+class TestMultipleCameras(unittest.TestCase):
+    """Every enabled camera renders, lowest depth first: its own view,
+    viewport and clear, and only the layers in its culling mask; the main
+    camera's view follows its GameObject (GameCamera.HandlePosition)."""
+
+    @needs_cc
+    def test_passes_by_depth_and_mask(self):
+        import struct
+        import zlib
+        noop = "using UnityEngine;\npublic class N : MonoBehaviour { void Update() {} }\n"
+        sprite = ("using UnityEngine;\npublic class S : MonoBehaviour {\n"
+                  "    float x;\n    void Update() { x = transform.position.x; }\n}\n")
+        mover = ("using UnityEngine;\npublic class M : MonoBehaviour {\n"
+                 "    void Update() { transform.position = new Vector3(5f, 0f, -10f); }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Sprite: {{fileID: 21300000, guid: %s, type: 3}}\n"
+               "  m_Color: {{r: 1, g: 1, b: 1, a: 1}}\n" % ("c" * 32))
+
+        def cam(depth, bits, clear, x0, size):
+            return ("--- !u!20 &{fid}\nCamera:\n  m_GameObject: {{fileID: {go}}}\n"
+                    "  m_Enabled: 1\n  m_ClearFlags: %d\n"
+                    "  m_NormalizedViewPortRect:\n    serializedVersion: 2\n"
+                    "    x: %s\n    y: 0\n    width: %s\n    height: 1\n"
+                    "  orthographic: 1\n  orthographic size: %s\n  m_Depth: %s\n"
+                    "  m_CullingMask:\n    serializedVersion: 2\n    m_Bits: %d\n"
+                    % (clear, x0, 1 - x0, size, depth, bits))
+        root = project(self, {"N": noop, "S": sprite, "M": mover}, [
+            ("S", spr), ("S", spr), ("M", cam(0, 1, 2, 0, 5)),
+            ("N", cam(-1, 256, 3, 0.5, 2))])
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(scene) as f:
+            text = f.read()
+        with open(scene, "w") as f:
+            f.write(text.replace("m_Name: S1\n", "m_Name: S1\n  m_Layer: 8\n")
+                    .replace("m_Name: M2\n", "m_Name: M2\n  m_TagString: MainCamera\n")
+                    .replace("{x: 2, y: 0, z: 0}", "{x: 2, y: 0, z: -10}")
+                    .replace("{x: 3, y: 0, z: 0}", "{x: 3, y: 0, z: -10}"))
+        sd = os.path.join(root, "Assets", "Scripts")
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+        with open(os.path.join(sd, "q.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress((b"\x00" + b"\xff" * 32) * 8))
+                    + chunk(b"IEND", b""))
+        with open(os.path.join(sd, "q.png.meta"), "w") as f:
+            f.write("guid: %s\nTextureImporter:\n  spritePixelsToUnits: 8\n" % ("c" * 32))
+        out = pack(self, root)
+        passes = (
+            "EngineCamera cm[4]; EngineDraw b[8];\n"
+            "  int nc = engine_collect_cameras(cm, 4), k, j, n;\n"
+            "  for (k = 0; k < nc; k++) {\n"
+            "    engine_draw_camera(k); n = engine_collect_draws(b, 8);\n"
+            "    printf(\"cam %g size %g clear %d rect %g:\", cm[k].x, cm[k].half_h,"
+            " cm[k].clear, cm[k].rect_x);\n"
+            "    for (j = 0; j < n; j++) printf(\" %g\", b[j].x);\n"
+            "    printf(\"\\n\");\n  }\n"
+            "  engine_draw_camera(-1); printf(\"all %d\\n\", engine_collect_draws(b, 8));")
+        self.assertEqual(run_frames(self, out, 1, body=passes), [
+            "cam 3 size 2 clear 0 rect 0.5: 1",     # depth -1: layer 8 only
+            "cam 5 size 5 clear 1 rect 0: 0",       # the main camera, moved
+            "all 1"])                                # no pass: the main's view
 
 
 class TestTilemapTiles(unittest.TestCase):

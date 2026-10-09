@@ -620,3 +620,11 @@ def _mb_index(plan):
             for mb in o.get("mb_ids") or []:
                 out[str(mb)] = (cname, i)
     return out
+
+
+def draw_layers(plan, rows):
+    """C initializer of each row's GameObject layer (`EngineDraw.layer`,
+    the cameras' culling masks test it; 0 when the row has none)."""
+    gl = plan.get("go_layers") or []
+    return ", ".join(str(int(gl[r["go_index"]]) if r.get("go_index") is not None
+                         and 0 <= int(r["go_index"]) < len(gl) else 0) for r in rows)
