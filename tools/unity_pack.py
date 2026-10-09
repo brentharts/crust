@@ -803,7 +803,8 @@ def player_identity(root):
 def unity_physics_settings(root):
     """Authored Physics2D.gravity, Physics.gravity, Time.fixedDeltaTime.
 
-    Unity defaults (0,-9.81), (0,-9.81,0), 0.02 when a setting is absent.
+    And the Time.timeScale a player starts with (TimeManager m_TimeScale).
+    Unity defaults (0,-9.81), (0,-9.81,0), 0.02, 1 when a setting is absent.
     Fixed Timestep is a float in older assets, a rational (m_Count ticks at
     m_Numerator / m_Denominator Hz) in newer ones.
     """
@@ -834,6 +835,9 @@ def unity_physics_settings(root):
     elif r and float(r.group(3)) > 0:
         out["fixed_dt"] = (float(r.group(1)) * float(r.group(2))
                            / float(r.group(3)))
+    m = re.search(r"(?m)^\s*m_TimeScale:%s\s*$" % num, tm)
+    if m:
+        out["time_scale"] = float(m.group(1))
     return out
 
 
@@ -27417,7 +27421,8 @@ def emit_data(plan, used_apis=None):
 
     p("float Time_deltaTime = 0.0166667f;")
     p("float Time_unscaledDeltaTime = 0.0166667f;")
-    p("float Time_timeScale = 1.f;")
+    p("float Time_timeScale = %sf;" % repr(float(
+        (plan.get("unity_physics") or {}).get("time_scale", 1.0))))
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
     if "Cursor.visible" in used_apis:
