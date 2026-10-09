@@ -1059,6 +1059,18 @@ AnimationClip:
         self.assertIn("f5 1 75", out)
         self.assertTrue(any(l.startswith("f20 0 ") for l in out), out)
 
+    @needs_cc
+    def test_speed_zero_freezes(self):
+        """`animator.speed = 0` (Slime Jump's Player.Death) stops the clock."""
+        self.MGR = self.MGR.replace(
+            'if (f == 2) anim.Play("Squash");',
+            'if (f == 2) anim.Play("Squash");\n        if (f == 3) anim.speed = 0;'
+            '\n        if (f == 5) Debug.Log("speed " + anim.speed);')
+        out = run_frames(self, pack(self, self._project()), 5)
+        self.assertIn("f3 1 92", out)
+        self.assertIn("f5 1 92", out)
+        self.assertIn("speed 0", out)
+
     def test_parameters_are_refused(self):
         ctrl = self.CTRL.replace(
             "  m_AnimatorParameters: []\n",

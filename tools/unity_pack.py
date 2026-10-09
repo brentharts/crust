@@ -27477,6 +27477,13 @@ def _late_call_members(text, plan):
             lambda call, mm, a: "Animator_Play(%s)" % ", ".join(
                 [call] + a + ["-1", "-INFINITY"][len(a) - 1:]), True)
         text = _call_suffix_sub(
+            text, anims, r"\s*\.\s*speed\s*=(?!=)\s*([^;]+);",
+            lambda call, mm: "Animator_set_speed(%s, (float)(%s));" % (
+                call, mm.group(1)))
+        text = _call_suffix_sub(
+            text, anims, r"\s*\.\s*speed\b(?!\s*[-+*/]?=(?!=))",
+            lambda call, mm: "Animator_speed(%s)" % call)
+        text = _call_suffix_sub(
             text, anims, r"\s*\.\s*GetCurrentAnimatorStateInfo\s*\(",
             lambda call, mm, a: "_Animator_StateInfo(%s)" % ", ".join(
                 [call] + a), True)

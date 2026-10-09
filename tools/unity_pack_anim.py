@@ -895,6 +895,8 @@ def _emit_animator_protos(p, plan):
         p("static void Animator_Play(int go, const char *name, int layer,"
           " float nt);")
         p("static int Animator_IsName(int go, int layer, const char *name);")
+        p("static float Animator_speed(int go);")
+        p("static void Animator_set_speed(int go, float v);")
 
 
 def _emit_animator_runtime(p, plan):
@@ -947,6 +949,10 @@ def _emit_animator_runtime(p, plan):
     arr("float", "_AnimrSK_hh", [f(k["hh"]) for k in sk])
     arr("int", "_AnimrSB_kb", [b["kb"] for b in SB])
     arr("int", "_AnimrSB_kc", [b["kc"] for b in SB])
+    arr("int", "_AnimrL_anim", [a for a, x in enumerate(A)
+                                for _ in range(x["layer_count"])])
+    p("static float _Animr_speed[%d] = { %s };" % (
+        max(1, len(A)), ", ".join("1.f" for _ in A) or "1.f"))
     nl = max(1, len(L))
     p("static int _AnimrL_state[%d] = { %s };" % (nl, ", ".join(
         str(x["default"]) for x in L) or "0"))
@@ -1043,6 +1049,13 @@ static void _animr_enter(int k, int s, float t) {
     }
     _AnimrL_state[k] = s;
     _AnimrL_time[k] = t;
+}
+/* Animator.speed: scales every layer's clock */
+static float Animator_speed(int go) {
+    return _Animr_speed[_animr_of(go, "Animator.speed")];
+}
+static void Animator_set_speed(int go, float v) {
+    _Animr_speed[_animr_of(go, "Animator.speed")] = v;
 }""".replace("%(na)d", str(len(A))).replace("%%", "%"))
     p("static void _animr_write_float(int b, float v) {")
     p("    switch (b) {")
@@ -1077,7 +1090,8 @@ static void engine_animator_tick(void) {
             _AnimrL_pend[k] = -1;
         }
         s = _AnimrL_state[k];
-        _AnimrL_time[k] = _AnimrL_time[k] + Time_deltaTime * _AnimrS_speed[s];
+        _AnimrL_time[k] = _AnimrL_time[k] + Time_deltaTime * _AnimrS_speed[s]
+            * _Animr_speed[_AnimrL_anim[k]];
         while (_AnimrS_exit[s] >= 0 && guard < 8
                && _AnimrL_time[k] >= _AnimrS_exit_t[s] * _AnimrS_len[s]) {
             float carry = (_AnimrL_time[k] - _AnimrS_exit_t[s] * _AnimrS_len[s])
