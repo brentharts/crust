@@ -204,6 +204,30 @@ def _collect_mb_bases(analyses):
     return bases
 
 
+def _lower_handle_enabled(text, plan):
+    """`Other_AT(e).enabled`, a packed script through a handle: read with
+    `Other_get_enabled`, written with `Other_set_enabled` (OnEnable /
+    OnDisable as Unity runs them). A null handle throws, as `_AT` does."""
+    idns = {_c_ident(c) for c in plan.get("classes") or {}}
+    scan = cs2cpp._blank(text)
+    out, k = [], 0
+    for m in re.finditer(r"(?<![\w.])(\w+)_AT\(", scan):
+        if m.start() < k or m.group(1) not in idns:
+            continue
+        close = _match_close(scan, m.end() - 1, "(", ")")
+        tail = close is not None and re.match(
+            r"\s*\.\s*enabled\b(?:\s*=(?!=)\s*([^;]+);)?", scan[close + 1:])
+        if not tail:
+            continue
+        e = "_engine_nre_ix(%s)" % text[m.end():close]
+        rep = ("%s_set_enabled(%s, (int)(%s));" % (
+            m.group(1), e, text[close + 1 + tail.start(1):close + 1 + tail.end(1)])
+            if tail.group(1) else "%s_get_enabled(%s)" % (m.group(1), e))
+        out.append(text[k:m.start()] + rep)
+        k = close + 1 + tail.end()
+    return "".join(out) + text[k:]
+
+
 def _mb_is_a(cname, ancestor, bases_map, stack=None):
     """True if *cname* is *ancestor* or inherits it (authored bases)."""
     if cname == ancestor:
@@ -6837,6 +6861,9 @@ def analyze_script(path, text=None, shallow=False):
     # table costs only memory when x is something else)
     if re.search(r"\.\s*color\s*=(?!=)", scan):
         apis.add("SpriteRenderer.color")
+    if re.search(r"\bSpriteRenderer\b", scan) and re.search(
+            r"(?<![\w.])\w+\s*\.\s*enabled\s*=(?!=)", scan):
+        apis.add("SpriteRenderer.enabled")
     if re.search(r"(?<![\w.])Sprite\b", scan) and re.search(
             r"\.\s*sprite\b", scan):
         apis.add("Renderer.sprite")
@@ -8542,6 +8569,11 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
         if use_inst or ocname in (plan.get("classes") or {}):
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*enabled\s*"
+                r"=(?!=)\s*([^;]+);" % re.escape(ocname),
+                lambda m, o=oidn, n=inst: "%s_set_enabled(%s, (int)(%s));" % (
+                    o, n, m.group(1)), text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*enabled\b"
                 r"(?!\s*=(?!=))" % re.escape(ocname),
@@ -13996,6 +14028,9 @@ def _emit_engine_instantiate(
                 p("    _engine_spr_clone(go, _engine_%s_go_of[src]);" % idn)
             if plan.get("_spr_tex_cap"):
                 p("    _engine_spr_tex_clone(go, _engine_%s_go_of[src]);" % idn)
+            if plan.get("_spr_off_cap"):
+                p("    _engine_spr_off[go] = _engine_spr_off[_engine_%s_go_of[src]];"
+                  % idn)
             if plan.get("_rt_clone"):
                 p("    _engine_rt_clone(go, _engine_%s_go_of[src]);" % idn)
             for ui_idn, ui_n in plan.get("_ui_gc_maps") or ():
@@ -15171,19 +15206,20 @@ def _emit_engine_class_groups(
                        for _c, m in methods_by.get(cname, []))
         has_enable, has_disable, has_destroy = (
             _has("OnEnable"), _has("OnDisable"), _has("OnDestroy"))
-        p("/* awoken (1), started (2), enabled (4): per instance */")
+        p("/* awoken (1), started (2), enabled and active (4), disabled (8):"
+          " per instance */")
         # an unplaced prefab's row only answers Instantiate: "awoken" but
-        # never enabled, so no tick wakes or runs it
-        dormant = [k for k, o in enumerate(cl.get("instances") or [])
-                   if o.get("prefab_asset")]
+        # never enabled, so no tick wakes or runs it. An authored
+        # `m_Enabled: 0` row wakes (Awake) but is not enabled.
+        insts = cl.get("instances") or []
+        seed = [(1 if o.get("prefab_asset") else 0)
+                | (0 if int(o.get("mb_enabled", 1)) else 8) for o in insts]
+        while seed and not seed[-1]:
+            seed.pop()
         p("static unsigned char _%s_life[%d]%s;" % (idn, cap, (
-            " = { %s }" % ", ".join("1" if k in dormant else "0"
-                                    for k in range(max(dormant) + 1))
-            if dormant else "")))
-        # ponytail: `enabled` reads "enabled and active" (Unity's stays true
-        # on an inactive GameObject); a per-row enabled bit if that matters
-        p("static int %s_get_enabled(unsigned i) { return (_%s_life[i] & 4)"
-          " != 0; }" % (idn, idn))
+            " = { %s }" % ", ".join(map(str, seed)) if seed else "")))
+        p("static int %s_get_enabled(unsigned i) { return !(_%s_life[i] & 8);"
+          " }" % (idn, idn))
         # Unity's messages as a GameObject becomes active (Awake the first
         # time, then OnEnable), inactive (OnDisable), or is destroyed
         # (OnDisable if enabled, then OnDestroy). Called directly: a
@@ -15201,6 +15237,7 @@ def _emit_engine_class_groups(
                 p("            if (!_engine_go_active_in_hierarchy(_engine_go_of_%s(n)))"
                   " return;" % idn)
         p("        }")
+        p("        if (_%s_life[n] & 8) return; /* disabled: no OnEnable */" % idn)
         p("        _%s_life[n] = (unsigned char)(_%s_life[n] | 4);" % (idn, idn))
         if has_enable:
             p("        %s_OnEnable(n);" % idn)
@@ -15213,6 +15250,21 @@ def _emit_engine_class_groups(
         p("    }")
         if has_destroy:
             p("    if (msg == 2 && (_%s_life[n] & 1)) %s_OnDestroy(n);" % (idn, idn))
+        p("}")
+        # `enabled = v`: OnDisable now, or OnEnable now if the GameObject
+        # is active and the row awoken (else its activation runs it)
+        p("static void %s_set_enabled(unsigned i, int v) {" % idn)
+        p("    if (!v == !!(_%s_life[i] & 8)) return;" % idn)
+        p("    _%s_life[i] = (unsigned char)(_%s_life[i] ^ 8);" % (idn, idn))
+        p("    if (!v) { %s_Lifecycle(i, 1); return; }" % idn)
+        p("    if (!(_%s_life[i] & 1)) return;" % idn)
+        if destroyed:
+            p("    { int go = _engine_go_of_%s(i);" % idn)
+            p("      if (go >= 0 && _engine_go_destroyed[go]) return; }")
+        if plan.get("_go_active_fn") and want_go_tables:
+            p("    if (!_engine_go_active_in_hierarchy(_engine_go_of_%s(i)))"
+              " return;" % idn)
+        p("    %s_Lifecycle(i, 0);" % idn)
         p("}")
         p("static inline void _%s_spawned(unsigned ex) {" % idn)
         p("    _%s_life[ex] = 0;" % idn)
@@ -19943,6 +19995,23 @@ def emit_engine(plan, analyses, used_apis):
     if "Renderer.sprite" in used_apis and plan.get("go_names"):
         _emit_sprite_tex_tables(p, plan, max(
             1, len(plan.get("go_names") or []) + go_spawn_budget))
+    plan["_spr_off_cap"] = 0
+    if "SpriteRenderer.enabled" in used_apis and plan.get("go_names"):
+        cap = plan["_spr_off_cap"] = max(
+            1, len(plan.get("go_names") or []) + go_spawn_budget)
+        p("/* SpriteRenderer.enabled = false by GameObject: not drawn */")
+        p("static unsigned char _engine_spr_off[%d];" % cap)
+        p("static int SpriteRenderer_get_enabled(int go) {")
+        p("    return !(go >= 0 && go < %d && _engine_spr_off[go]);" % cap)
+        p("}")
+        p("static void SpriteRenderer_set_enabled(int go, int v) {")
+        p("    if (go < 0 || go >= %d) {" % cap)
+        p('        fprintf(stderr, "NullReferenceException: Object reference not'
+          ' set to an instance of an object (SpriteRenderer.enabled)\\n");')
+        p("        exit(70);")
+        p("    }")
+        p("    _engine_spr_off[go] = (unsigned char)!v;")
+        p("}")
     _emit_spawn_sprite_rows(p, plan)
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
     _emit_engine_instantiate(
@@ -20735,6 +20804,18 @@ def emit_engine(plan, analyses, used_apis):
         p("                out[r].b = _engine_spr_col[out[r].go][2];")
         p("                out[r].a = _engine_spr_col[out[r].go][3];")
         p("            }")
+        p("    }")
+    if plan.get("_spr_off_cap"):
+        # ponytail: by the draw's GameObject, so a disabled SpriteRenderer
+        # also hides any other draw that GameObject owns (none in practice);
+        # a per-draw renderer kind if one shares it
+        p("    {")
+        p("        int r, w = 0;")
+        p("        for (r = 0; r < n; r = r + 1)")
+        p("            if (!(out[r].go >= 0 && out[r].go < %d"
+          " && _engine_spr_off[out[r].go]))" % plan["_spr_off_cap"])
+        p("                { out[w] = out[r]; w = w + 1; }")
+        p("        n = w;")
         p("    }")
     if plan.get("_spr_tex_cap"):
         # a swapped sprite: its texture, a SpriteRenderer at its size; a
@@ -26292,6 +26373,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             or any(_mb_is_a(cl["name"], w, bases) for w in written)):
         body = cs2cpp.code_sub(
             r"(?<![\w.])(?:this\s*\.\s*)?enabled\b(?!\s*=(?!=))", "1", body)
+    elif not (site or {}).get("static"):
+        own = _c_ident(cl["name"])
+        body = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?enabled\s*=(?!=)\s*([^;]+);",
+            lambda m: "%s_set_enabled(i, (int)(%s));" % (own, m.group(1)), body)
+        body = cs2cpp.code_sub(r"(?<![\w.])(?:this\s*\.\s*)?enabled\b",
+                               "%s_get_enabled(i)" % own, body)
     text = _trap_tmp_writes(body, plan, site)
     text = _own_string_params(text, site)
     text = _drop_iface_tick_loops(text, plan, site)
@@ -27106,6 +27194,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             if v == "s"))
     if "_cs_str_Equals(" in text:
         plan.setdefault("_cs_str_used", set()).add("_cs_str_Equals")
+    text = _lower_handle_enabled(text, plan)
     return _late_call_members(text, plan)
 
 
@@ -27464,6 +27553,14 @@ def _lower_bounds(text, plan, site=None):
                 call, ", ".join(a + ["1.f"] if len(a) == 3 else a))
             if len(a) in (3, 4) else call + mm.group(0) + ", ".join(a) + ")",
             args=True)
+    if sprs and plan.get("_spr_off_cap") and ".enabled" in text:
+        text = _call_suffix_sub(
+            text, sprs, r"\s*\.\s*enabled\s*=(?!=)\s*([^;]+);",
+            lambda call, mm: "SpriteRenderer_set_enabled(%s, (int)(%s));" % (
+                call, mm.group(1)))
+        text = _call_suffix_sub(
+            text, sprs, r"\s*\.\s*enabled\b",
+            lambda call, mm: "SpriteRenderer_get_enabled(%s)" % call)
     if not funcs or ".bounds" not in text:
         return text
     used = set()

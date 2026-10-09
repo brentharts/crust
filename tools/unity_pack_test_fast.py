@@ -1176,6 +1176,21 @@ class TestSpriteRendererColor(unittest.TestCase):
         self.assertIn("a1 50 50", out)
         self.assertIn("a2 25 50", out)
 
+    @needs_cc
+    def test_enabled(self):
+        """`spriteRenderer.enabled = false` (Slime Jump's Player.Death)."""
+        mgr = ("using UnityEngine;\npublic class Mgr : MonoBehaviour {\n"
+               "    public SpriteRenderer sr;\n    int f;\n"
+               "    void Update() {\n        f++;\n"
+               "        Debug.Log(\"e\" + f + \" \" + (sr.enabled ? 1 : 0));\n"
+               "        sr.enabled = f > 1;\n    }\n}\n")
+        spr = ("--- !u!212 &{fid}\nSpriteRenderer:\n  m_GameObject: {{fileID: {go}}}\n"
+               "  m_Enabled: 1\n  m_Sprite: {{fileID: 0}}\n")
+        root = project(self, {"Mgr": mgr}, [("Mgr", spr, "  sr: {fileID: 103}\n")])
+        out = run_frames(self, pack(self, root), 3)
+        for want in ("e1 1", "e2 0", "e3 1"):
+            self.assertIn(want, out)
+
 
 class TestHandleEulerZ(unittest.TestCase):
     """`t.eulerAngles += Vector3.forward * d` and `t.eulerAngles =
@@ -2947,13 +2962,35 @@ class TestLayerMaskAwake(unittest.TestCase):
         out = run_frames(self, pack(self, root), 1)
         self.assertIn("m 224 4", out)
 
-    def test_written_enabled_refused(self):
+    def test_enabled_writes(self):
+        """Slime Jump's Death / Respawn: `Other.instance.enabled`, a handle
+        field's and its own `enabled` written; OnEnable / OnDisable run at
+        the write, a disabled script does not update, and an authored
+        `m_Enabled: 0` script wakes but is not enabled."""
         a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
-             "    void Start() { if (!enabled) return; Debug.Log(\"on\"); }\n"
-             "    void OnDisable() { enabled = true; }\n}\n")
-        root = project(self, {"A": a}, [("A",)])
-        with self.assertRaises(unity_pack.PackError):
-            pack(self, root)
+             "    public static A instance;\n"
+             "    void Awake() { instance = this; }\n"
+             "    void OnEnable() { Debug.Log(\"a on\"); }\n"
+             "    void OnDisable() { Debug.Log(\"a off\"); }\n"
+             "    void Update() { Debug.Log(\"a upd\"); }\n}\n")
+        b = ("using UnityEngine;\npublic class B : MonoBehaviour {\n"
+             "    public A a;\n"
+             "    void Start() {\n"
+             "        A.instance.enabled = false;\n"
+             "        if (!a.enabled) Debug.Log(\"b sees off\");\n"
+             "        a.enabled = true;\n    }\n"
+             "    void Update() { Debug.Log(\"b upd\"); enabled = false; }\n}\n")
+        c = ("using UnityEngine;\npublic class C : MonoBehaviour {\n"
+             "    void Awake() { Debug.Log(\"c awake\"); }\n"
+             "    void OnEnable() { Debug.Log(\"c on\"); }\n"
+             "    void Update() { Debug.Log(\"c upd\"); }\n}\n")
+        root = project(self, {"A": a, "B": b, "C": c}, [
+            ("A",), ("B", None, "  a: {fileID: 102}\n"),
+            ("C", None, "  m_Enabled: 0\n")])
+        out = run_frames(self, pack(self, root), 2)
+        logs = [l for l in out if l.startswith(("a ", "b ", "c "))]
+        self.assertEqual(logs, ["a on", "c awake", "a off", "b sees off",
+                                "a on", "a upd", "b upd", "a upd"])
 
 
 def _run_rc(test, out, frames=1):
