@@ -2185,16 +2185,16 @@ class TestHybrid(_PackHarness):
         body = """
     public float a;
     void Update() {
-        a = Camera.main.aspect;
+        a = Camera.main.fieldOfView;
         transform.position = new Vector3(a, 0f, 0f);
     }"""
         root = self._project(self._script(body))
         with open(os.path.join(root, "Assets", "Scenes", "S.unity"), "a") as f:
             f.write(self.CAMERA_SCENE)
         out, err = self._pack(root, managed="*")
-        # (the packer cannot lower Camera.main.aspect either: the method stays the stub it was, with the managed reason)
+        # (the packer cannot lower Camera.main.fieldOfView either: the method stays the stub it was, with the managed reason)
         self.assertIn("warning CS8000", err)
-        self.assertIn("'Camera' does not contain a definition for 'aspect'", err)
+        self.assertIn("'Camera' does not contain a definition for 'fieldOfView'", err)
 
     KEYS = """
     public float k; public float dn; public float up; public float db;
@@ -3347,6 +3347,50 @@ class TestRectField(unittest.TestCase):
         out = pack(self, root)
         # the object sits at x 0 (project's first), so centred on (0, 0)
         self.assertEqual(run_frames(self, out, 1), ["a 1 3", "r -2 -1 4 2 0"])
+
+
+class TestCameraField(unittest.TestCase):
+    """A `Camera` field on the camera the engine drives (the scene's
+    MainCamera, else its first: CameraScript.HandleViewSize): `aspect`,
+    `orthographicSize` and `rect` reach the engine's globals."""
+
+    CAMERA = ("--- !u!20 &{fid}\nCamera:\n  m_GameObject: {{fileID: {go}}}\n"
+              "  m_Orthographic: 1\n  m_OrthographicSize: 5\n")
+
+    def _project(self, n, main_tag=None):
+        root = project(self, {"Cam": script(
+            "Cam", "float sa = (float) Screen.width / Screen.height;\n"
+            "        camera.aspect = viewSize.x / viewSize.y;\n"
+            "        camera.orthographicSize = Mathf.Max(viewSize.x / 2 / camera.aspect, viewSize.y / 2);\n"
+            "        Rect r = new Rect();\n"
+            "        r.size = new Vector2(camera.aspect / sa, Mathf.Min(1, sa / camera.aspect));\n"
+            "        r.center = Vector2.one / 2;\n"
+            "        camera.rect = r;\n"
+            "        Debug.Log(\"c \" + camera.aspect + \" \" + camera.orthographicSize"
+            " + \" \" + camera.rect.width + \" \" + camera.rect.height * 3);",
+            "    public new Camera camera;\n    public Vector2 viewSize;")},
+            [("Cam", self.CAMERA, "  camera: {fileID: %d}\n  viewSize: {x: 4, y: 2}\n"
+              % (103 + 10 * k)) for k in range(n)])
+        if main_tag is not None:
+            scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+            with open(scene) as f:
+                text = f.read()
+            with open(scene, "w") as f:
+                f.write(text.replace("m_Name: Cam%d\n" % main_tag,
+                                     "m_Name: Cam%d\n  m_TagString: MainCamera\n" % main_tag))
+        return root
+
+    @needs_cc
+    def test_handle_view_size(self):
+        out = pack(self, self._project(1))
+        # 1024x768 (4:3) screen, 2:1 view: a 1.5-wide rect clipped to the
+        # screen's width, 2/3 of its height (letterboxed)
+        self.assertEqual(run_frames(self, out, 1), ["c 2 1 1 2"])
+
+    def test_a_camera_the_engine_does_not_drive_stays_a_stub(self):
+        # Cam0's camera is not the scene's: Cam1 holds the MainCamera tag
+        with self.assertRaisesRegex(unity_pack.PackError, "CS8000: `Cam.Update` is not lowered"):
+            pack(self, self._project(2, main_tag=1))
 
 
 class TestTilemapTiles(unittest.TestCase):

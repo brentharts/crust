@@ -7401,6 +7401,7 @@ def _fields_in(body, bscan, body_abs=0):
             # A line's first member, or one after another's `;` on the same
             # line (method bodies are blanked, so no `for (..; ..)`).
             r"(?m)(?:^|(?<=;))[ \t]*(?:public|private|protected|internal)?"
+            r"[ \t]*(?:new[ \t]+)?"
             r"[ \t]*(?:static[ \t]+)?(?:const[ \t]+)?(?:readonly[ \t]+)?"
             r"(?:event[ \t]+)?"
             # Types may be generics: Dictionary<int, int> / List<Foo>, or T[].
@@ -22943,6 +22944,7 @@ _UNITY_API_SCENE = [
     _B("RenderSettings.ambientLight.g", "RenderSettings_ambient_g", "value"),
     _B("RenderSettings.ambientLight.b", "RenderSettings_ambient_b", "value"),
     _B("Camera.main.orthographicSize", "Camera_main_orthographicSize", "value"),
+    _B("Camera.main.aspect", "Camera_main_aspect", "value"),
     _B("Camera.main.rect", "Camera_main_rect", "getter"),
     _B("Camera.main.transform.position.x", "Camera_main_pos_x", "value"),
     _B("Camera.main.transform.position.y", "Camera_main_pos_y", "value"),
@@ -25755,6 +25757,33 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # before `gameObject` is lowered: the terrain calls take it as written
     text = _lower_terrain_boxes(text, cl, plan)
     text = _lower_translate(text)
+    # A `Camera` field every row authored as the Camera on its own
+    # GameObject, that GameObject the camera the engine drives for the row's
+    # scene (`_emit_engine_scene_camera`'s pick), and no script assigns, is
+    # Camera.main (CameraScript.camera); any other stays C#, and its method
+    # a stub.
+    def _drives(o):
+        cs = [c for c in plan.get("cameras") or []
+              if o.get("scene") is not None
+              and int(c.get("scene") or 0) == int(o["scene"])]
+        c = next((c for c in cs if c.get("main")), cs[0] if cs else None)
+        return c is not None and str(c.get("xf_id")) in (
+            o.get("comp_ids") or ())
+    for f in cl.get("fields") or []:
+        fn = f["name"]
+        if (f.get("ty") != "Camera" or f.get("static") or not insts
+                or not all((o.get("object_refs") or {}).get(fn)
+                           in (o.get("comp_ids") or ()) and _drives(o)
+                           for o in insts)
+                or any(re.search(r"(?<![\w.])(?:this\s*\.\s*)?%s\s*=(?!=)"
+                                 % re.escape(fn),
+                                 cs2cpp._blank(m.get("body") or ""))
+                       for ms in (plan.get("_methods_by") or {}).values()
+                       for _c, m in ms)):
+            continue
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:this\s*\.\s*)?%s\s*\.(?=\s*(?:aspect|"
+            r"orthographicSize|rect)\b)" % re.escape(fn), "Camera.main.", text)
     # a device is a pointer, not a packed index: null is 0, not -1
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\s*([!=])=\s*null\b",

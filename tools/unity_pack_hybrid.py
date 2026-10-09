@@ -674,7 +674,7 @@ def _scene_class(engine, natives):
                            " ".join("HybridNative.%s(value.%s);" % (s, a) for a, _g, s in tpos)))
         else:
             out.append("    public class CameraTransform { }\n")
-        for n in ("orthographicSize",):
+        for n in ("orthographicSize", "aspect"):
             if n in cam:
                 members.append(prop("", "float", n, "Camera_main_" + n))
         for n in ("nearClipPlane", "farClipPlane"):
