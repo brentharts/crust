@@ -3393,6 +3393,43 @@ class TestCameraField(unittest.TestCase):
             pack(self, self._project(2, main_tag=1))
 
 
+class TestRigidbodyRowWins(unittest.TestCase):
+    """Two scripts on one GameObject each keep a position copy; physics
+    moves the Rigidbody owner's, so `x.trs.position` reads that one
+    (GameCamera following `Player.instance.trs`, beside AffectedByVortex)."""
+
+    @needs_cc
+    def test_a_transform_read_follows_the_body(self):
+        a = ("using UnityEngine;\npublic class A : MonoBehaviour {\n"
+             "    float x;\n    void Update() { x = transform.position.x; }\n}\n")
+        pl = ("using UnityEngine;\npublic class P : MonoBehaviour {\n"
+              "    public Transform trs;\n    public Rigidbody2D rb;\n    float x;\n"
+              "    void Update() { x = transform.position.x; }\n}\n")
+        r = ("using UnityEngine;\npublic class R : MonoBehaviour {\n"
+             "    public P p;\n"
+             "    void Start() { transform.SetParent(null); }\n"
+             "    void Update() { Vector2 v = p.trs.position; Debug.Log(v.x); }\n}\n")
+        extra = ("--- !u!114 &{fid}\nMonoBehaviour:\n  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_Script: {{fileID: 11500000, guid: %032x}}\n"
+                 "--- !u!50 &104\nRigidbody2D:\n  m_GameObject: {{fileID: {go}}}\n"
+                 "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 0\n" % 1)
+        root = project(self, {"A": a, "P": pl, "R": r}, [
+            ("P", extra, "  trs: {fileID: 101}\n  rb: {fileID: 104}\n"),
+            ("R", None, "  p: {fileID: 102}\n")])
+        sc = os.path.join(root, "Assets", "Scenes", "S.unity")
+        with open(sc) as f:
+            t = f.read()
+        with open(sc, "w") as f:
+            f.write(t.replace("  - component: {fileID: 103}\n",
+                              "  - component: {fileID: 103}\n  - component: {fileID: 104}\n", 1))
+        out = pack(self, root)
+        got = run_frames(self, out, 1, body="engine_rb2d_set_pos(0, 7.f, 0.f); engine_tick();",
+                         pre="void engine_rb2d_set_pos(int rb, float x, float y);\n"
+                             "void engine_box2d_step(void) { }\n")
+        self.assertEqual(got[-1], "7")
+
+
+
 class TestMultipleCameras(unittest.TestCase):
     """Every enabled camera renders, lowest depth first: its own view,
     viewport and clear, and only the layers in its culling mask; the main

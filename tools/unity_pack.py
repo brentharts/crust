@@ -16035,11 +16035,17 @@ def _emit_engine_world_positions(
                 for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1])
                 if _class_has_position(plan["classes"][cname])
             ]
+            # the Rigidbody's row is the one physics moves (_xf_rows): its
+            # class first. ponytail: by class, not instance -- a GO with no
+            # Rigidbody under a class that owns one elsewhere reads that
+            # class's copy; a per-GO owner table is the upgrade.
+            rb_owners = {r["owner_class"] for r in (plan.get("rigidbody2d") or [])
+                         + (plan.get("rigidbody") or [])}
             p("/* GO → packed (class, inst) for SetParent / world composition. */")
             p("static int _engine_go_xf(int go, int *oc, unsigned *oi) {")
             p("    int inst;")
             p("    if (go < 0 || go >= %d) return 0;" % go_n)
-            for cname, cid, idn in pos_classes:
+            for cname, cid, idn in sorted(pos_classes, key=lambda c: c[0] not in rb_owners):
                 p("    inst = _engine_go_%s[go];" % idn)
                 p("    if (inst >= 0) { *oc = %d; *oi = (unsigned)inst; return 1; }"
                   % cid)
