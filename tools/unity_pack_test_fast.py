@@ -3465,6 +3465,24 @@ class TestRigidbodyRowWins(unittest.TestCase):
                              "void engine_box2d_step(void) { }\n")
         self.assertEqual(got[-1], "7")
 
+    @needs_cc
+    def test_simulated_takes_the_body_out(self):
+        """`rigid.simulated = false` (Slime Jump's Player.Death): the glue's
+        live gate disables the body until it is set again."""
+        pl = ("using UnityEngine;\npublic class P : MonoBehaviour {\n"
+              "    public Rigidbody2D rb;\n    int f;\n"
+              "    void Update() { f++; rb.simulated = f != 1;"
+              " Debug.Log(\"s\" + f + \" \" + (rb.simulated ? 1 : 0)); }\n}\n")
+        rb = ("--- !u!50 &{fid}\nRigidbody2D:\n  m_GameObject: {{fileID: {go}}}\n"
+              "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 0\n")
+        root = project(self, {"P": pl}, [("P", rb, "  rb: {fileID: 103}\n")])
+        got = run_frames(self, pack(self, root), 1, body=(
+            'printf("live %d\\n", engine_rb2d_live(0)); engine_tick();'
+            ' printf("live %d\\n", engine_rb2d_live(0));'),
+            pre="int engine_rb2d_live(int rb);\n"
+                "void engine_box2d_step(void) { }\n")
+        self.assertEqual([l for l in got if l[:1] in "sl"],
+                         ["s1 0", "live 0", "s2 1", "live 1"])
 
 
 class TestMultipleCameras(unittest.TestCase):

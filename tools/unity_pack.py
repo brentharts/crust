@@ -6864,6 +6864,8 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"\bSpriteRenderer\b", scan) and re.search(
             r"(?<![\w.])\w+\s*\.\s*enabled\s*=(?!=)", scan):
         apis.add("SpriteRenderer.enabled")
+    if re.search(r"\.\s*simulated\s*=(?!=)", scan):
+        apis.add("Rigidbody2D.simulated")
     if re.search(r"(?<![\w.])Sprite\b", scan) and re.search(
             r"\.\s*sprite\b", scan):
         apis.add("Renderer.sprite")
@@ -17443,6 +17445,8 @@ def _lower_rb2d_api(text, cl, plan, site):
              "isKinematic": "isKinematic", "rotation": "rotation",
              "angularVelocity": "angularVelocity",
              "freezeRotation": "freezeRotation"}
+    if plan.get("_rb_sim"):
+        props["simulated"] = "simulated"
     for pat, rx in recvs.items():
         def force(m, rx=rx):
             args = [a.strip() for a in cs2cpp.split_call_args(m.group(1))]
@@ -17799,6 +17803,18 @@ def _emit_rb2d_api(p, plan=None):
     p("static void Rigidbody2D_set_isKinematic(int rb, int v) {")
     p("    Rigidbody2D_set_bodyType(rb, v ? 1 : 0);")
     p("}")
+    if (plan or {}).get("_rb_sim"):
+        n = max(1, len(plan.get("rigidbody2d") or []) + int(
+            (plan.get("addcomponent_budget") or {}).get("Rigidbody2D") or 0))
+        p("/* simulated = false: out of the simulation (engine_rb2d_live) */")
+        p("static unsigned char _Rigidbody2D_unsim[%d];" % n)
+        p("static int Rigidbody2D_get_simulated(int rb) {")
+        p("    return !(rb >= 0 && rb < %d && _Rigidbody2D_unsim[rb]);" % n)
+        p("}")
+        p("static void Rigidbody2D_set_simulated(int rb, int v) {")
+        p("    if (rb >= 0 && rb < %d) _Rigidbody2D_unsim[rb] = (unsigned char)!v;"
+          % n)
+        p("}")
     # Rotation, in Unity's degrees; the tables and Box2D in radians. With no
     # body turning (every one frozen or static) it reads 0 and writes nothing.
     rot = bool((plan or {}).get("physics2d_rotation"))
@@ -18008,32 +18024,40 @@ def _emit_engine_box2d_exports(
         plan["_live_active"] = bool(
             plan.get("_want_active") and plan.get("_go_of_fn")
             and (plan.get("collider2d") or plan.get("rigidbody2d")))
-        if plan["_live_destroy"] or plan["_live_active"]:
+        if plan["_live_destroy"] or plan["_live_active"] or plan.get("_rb_sim"):
             plan["physics2d_live"] = True
         if plan.get("physics2d_live"):
-            p("/* Whether a body's GameObject is in the simulation (active, in a")
-            p(" * loaded scene); the glue disables the bodies that are not. */")
-            p("static int _engine_owner_go(int oc, unsigned oi) {")
-            p("    switch (oc) {")
-            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-                p("    case %d: return _engine_go_of_%s(oi);"
-                  % (cid, _c_ident(cname)))
-            p("    default: return -1;")
-            p("    }")
-            p("}")
             live = []
             if _multi_scene(plan) or plan.get("_live_active"):
                 live.append("_engine_go_active_in_hierarchy(go)")
             if plan.get("_live_destroy"):
                 live.append("!_engine_go_destroyed[go]")
+            owner = bool(live)
             live = " && ".join(live) or "1"
+            if owner:
+                p("/* Whether a body's GameObject is in the simulation (active,"
+                  " in a")
+                p(" * loaded scene); the glue disables the bodies that are not. */")
+                p("static int _engine_owner_go(int oc, unsigned oi) {")
+                p("    switch (oc) {")
+                for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                    p("    case %d: return _engine_go_of_%s(oi);"
+                      % (cid, _c_ident(cname)))
+                p("    default: return -1;")
+                p("    }")
+                p("}")
             p("int engine_rb2d_live(int rb) {")
-            p("    int go = _engine_owner_go(_Rigidbody2D_owner_class[rb],")
-            p("                              (unsigned)_Rigidbody2D_owner_inst[rb]);")
-            p("    return go < 0 || (%s);" % live)
+            if plan.get("_rb_sim"):
+                p("    if (!Rigidbody2D_get_simulated(rb)) return 0;")
+            if owner:
+                p("    int go = _engine_owner_go(_Rigidbody2D_owner_class[rb],")
+                p("                              (unsigned)_Rigidbody2D_owner_inst[rb]);")
+                p("    return go < 0 || (%s);" % live)
+            else:
+                p("    return rb >= 0;")
             p("}")
             p("int engine_col2d_live(int ci) {")
-            if want_col2d and col2d_list:
+            if want_col2d and col2d_list and owner:
                 p("    int go = _engine_owner_go(_Collider2D_owner_class[ci],")
                 p("                              (unsigned)_Collider2D_owner_inst[ci]);")
                 p("    return go < 0 || (%s);" % live)
@@ -18928,6 +18952,8 @@ def emit_engine(plan, analyses, used_apis):
     want_set_parent = "transform.SetParent" in used_apis
     want_get_sibling = "transform.GetSiblingIndex" in used_apis
     plan["_want_get_child"] = "transform.GetChild" in used_apis
+    plan["_rb_sim"] = bool("Rigidbody2D.simulated" in used_apis
+                           and plan.get("rigidbody2d"))
     plan["_rt_clone"] = False
     plan["_ui_gc_maps"] = []
     want_getcomponent = "GetComponent" in used_apis
