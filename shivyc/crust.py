@@ -4170,6 +4170,213 @@ class Parser:
                 self.err("struct `%s` has no field `%s`", ty.base, field)
         return Expr(code, ftype)
 
+    def scalar_method(self, recv, name):
+        """Integer, bool and raw-pointer methods Rust's core provides.
+
+        Called with the cursor just after `(`; returns None, having consumed
+        nothing, when `name` is not one of these. Integer arithmetic goes
+        through the unsigned type of the same width where C would otherwise
+        have undefined overflow, which is what `wrapping_*` means.
+        """
+        ty = recv.type
+        if ty is None:
+            return None
+        if ty.ptr:
+            if ty.ptr != 1 and name not in ("is_null",):
+                return None
+            if name not in _PTR_METHODS:
+                return None
+            args = [a.code for a in self._scalar_args()]
+            return self._ptr_method(recv, name, args)
+        if ty.base == "_Bool":
+            if name != "then_some":
+                return None
+            val = self._scalar_args()
+            if len(val) != 1 or val[0].type is None:
+                self.err("`then_some` takes one value")
+            opt = self.unit.option_type(val[0].type)
+            return Expr("(%s){.some = %s, .value = %s}"
+                        % (opt.base, recv.code, val[0].code), opt)
+        if ty.base not in _RANK or ty.base == "crust_char" \
+                or name not in _INT_METHODS:
+            return None
+        if name == "count_ones" and _SINGLE_FLOAT_LITERALS:
+            return None             # a GPU kernel's popcount; see below
+        args = self._scalar_args()
+        return self._int_method(recv, name, args)
+
+    def _scalar_args(self):
+        args = []
+        while not self.at(")", "punc"):
+            args.append(self.parse_expr())
+            if not self.accept(","):
+                break
+        self.expect(")")
+        return args
+
+    def _ptr_method(self, recv, name, args):
+        ty = recv.type
+        elem = RustCType(ty.base, ty.ptr - 1)
+        if name == "is_null":
+            return Expr("(%s == 0)" % recv.code, RustCType("_Bool"))
+        if name == "read_volatile":
+            return Expr("(*(volatile %s *)%s)" % (elem.decl(), recv.code),
+                        elem)
+        if name == "write_volatile":
+            return Expr("(*(volatile %s *)%s = %s)"
+                        % (elem.decl(), recv.code, args[0]), VOID)
+        if name in ("add", "offset", "wrapping_add"):
+            return Expr("(%s + %s)" % (recv.code, args[0]), ty)
+        if name in ("sub", "wrapping_sub"):
+            return Expr("(%s - %s)" % (recv.code, args[0]), ty)
+        return None
+
+    def _int_method(self, recv, name, args):
+        ty = RustCType(recv.type.base)
+        bits = _int_bits(ty)
+        unsigned = "unsigned" in ty.base
+        uty = ty if unsigned else RustCType(
+            "unsigned " + ("int" if ty.base == "int" else ty.base)
+            if ty.base != "signed char" else "unsigned char")
+        T, U = ty.decl(), uty.decl()
+        lo = 0 if unsigned else -(1 << (bits - 1))
+        hi = (1 << bits) - 1 if unsigned else (1 << (bits - 1)) - 1
+        MAX, MIN = (_format_int_literal(hi, ty),
+                    "(%s)" % _format_int_literal(lo, ty))
+        MAX = "((%s)%s)" % (T, MAX)
+        a = self.once(recv)
+        one = name in _INT_UNARY
+        if one and args:
+            self.err("`%s` takes no arguments", name)
+        if not one and not (name in ("clamp",) and len(args) == 2) \
+                and len(args) != 1:
+            self.err("`%s` takes one argument", name)
+        b = self.once(args[0]) if args else None
+        ret = ty
+
+        def mk(code, t=None):
+            return Expr(code, t or ret)
+
+        if name in ("wrapping_add", "wrapping_sub", "wrapping_mul"):
+            op = {"add": "+", "sub": "-", "mul": "*"}[name[9:]]
+            return mk("((%s)((%s)%s %s (%s)%s))" % (T, U, a, op, U, b))
+        if name == "wrapping_neg":
+            return mk("((%s)(0 - (%s)%s))" % (T, U, a))
+        if name == "saturating_add":
+            if unsigned:
+                return mk("(%s > %s - %s ? %s : (%s)(%s + %s))"
+                          % (a, MAX, b, MAX, T, a, b))
+            return mk("(%s > 0 ? (%s > %s - %s ? %s : (%s)(%s + %s)) : "
+                      "(%s < %s - %s ? %s : (%s)(%s + %s)))"
+                      % (b, a, MAX, b, MAX, T, a, b, a, MIN, b, MIN, T, a, b))
+        if name == "saturating_sub":
+            if unsigned:
+                return mk("(%s < %s ? 0 : (%s)(%s - %s))" % (a, b, T, a, b))
+            return mk("(%s > 0 ? (%s < %s + %s ? %s : (%s)(%s - %s)) : "
+                      "(%s > %s + %s ? %s : (%s)(%s - %s)))"
+                      % (b, a, MIN, b, MIN, T, a, b, a, MAX, b, MAX, T, a, b))
+        if name in ("checked_add", "checked_sub", "checked_mul"):
+            opt = self.unit.option_type(ty)
+            if name == "checked_add":
+                bad = ("%s > %s - %s" % (a, MAX, b)) if unsigned else (
+                    "(%s > 0 && %s > %s - %s) || (%s < 0 && %s < %s - %s)"
+                    % (b, a, MAX, b, b, a, MIN, b))
+                val = "(%s)(%s + %s)" % (T, a, b)
+            elif name == "checked_sub":
+                bad = ("%s < %s" % (a, b)) if unsigned else (
+                    "(%s < 0 && %s > %s + %s) || (%s > 0 && %s < %s + %s)"
+                    % (b, a, MAX, b, b, a, MIN, b))
+                val = "(%s)(%s - %s)" % (T, a, b)
+            else:
+                if not unsigned:
+                    self.err("`checked_mul` is supported on unsigned "
+                             "integers only")
+                bad = "%s != 0 && %s > %s / %s" % (b, a, MAX, b)
+                val = "(%s)(%s * %s)" % (T, a, b)
+            return Expr("(%s){.some = !(%s), .value = %s}"
+                        % (opt.base, bad, val), opt)
+        if name in ("min", "max"):
+            op = "<" if name == "min" else ">"
+            return mk("(%s %s %s ? %s : %s)" % (a, op, b, a, b))
+        if name == "clamp":
+            lo_, hi_ = self.once(args[0]), self.once(args[1])
+            return mk("(%s < %s ? %s : (%s > %s ? %s : %s))"
+                      % (a, lo_, lo_, a, hi_, hi_, a))
+        if name == "abs":
+            return mk("(%s < 0 ? (%s)(0 - %s) : %s)" % (a, T, a, a))
+        if name == "abs_diff":
+            return mk("(%s > %s ? (%s)((%s)%s - (%s)%s) : (%s)((%s)%s - "
+                      "(%s)%s))" % (a, b, U, U, a, U, b, U, U, b, U, a),
+                      uty)
+        if name in ("is_positive", "is_negative"):
+            return mk("(%s %s 0)" % (a, ">" if name == "is_positive" else "<"),
+                      RustCType("_Bool"))
+        if name == "signum":
+            return mk("(%s > 0 ? 1 : (%s < 0 ? -1 : 0))" % (a, a))
+        if name == "is_power_of_two":
+            return mk("(%s != 0 && (%s & (%s - 1)) == 0)" % (a, a, a),
+                      RustCType("_Bool"))
+        if name == "div_ceil":
+            return mk("(%s)(%s / %s + (%s %% %s != 0))" % (T, a, b, a, b))
+        if name == "next_multiple_of":
+            return mk("(%s)((%s + %s - 1) / %s * %s)" % (T, a, b, b, b))
+        if name == "rem_euclid":
+            return mk("((%s %% %s) < 0 ? (%s)((%s %% %s) + (%s < 0 ? -%s : "
+                      "%s)) : (%s)(%s %% %s))"
+                      % (a, b, T, a, b, b, b, b, T, a, b))
+        if name in ("rotate_left", "rotate_right"):
+            k = "(%s %% %d)" % (b, bits)
+            first, second = (("<<", ">>") if name == "rotate_left"
+                             else (">>", "<<"))
+            return mk("((%s)(((%s)%s %s %s) | ((%s)%s %s ((%d - %s) %% %d))))"
+                      % (T, U, a, first, k, U, a, second, bits, k, bits))
+        # The rest are loops, so each is a helper function per type.
+        helper = self._int_helper(name, ty, uty, bits)
+        call = "%s(%s%s)" % (helper, a, ", " + b if b is not None else "")
+        if name in ("count_ones", "count_zeros", "leading_zeros",
+                    "trailing_zeros"):
+            return mk(call, RustCType("unsigned int"))
+        return mk(call)
+
+    def _int_helper(self, name, ty, uty, bits):
+        key = "crust_i_%s_%s" % (name, _mangle(ty))
+        u = self.unit
+        if key in u.fn_thunks:
+            return key
+        u.fn_thunks.add(key)
+        T, U = ty.decl(), uty.decl()
+        if name == "pow":
+            ps, ret = [ty, RustCType("unsigned int")], ty
+            body = ("%s r = 1; while (e) { if (e & 1) r = (%s)((%s)r * (%s)b); "
+                    "b = (%s)((%s)b * (%s)b); e >>= 1; } return r;"
+                    % (T, T, U, U, T, U, U))
+            text = "static %s(%s b, unsigned int e) { %s }" % (
+                ret.decl(key), T, body)
+        elif name == "next_power_of_two":
+            ps, ret = [ty], ty
+            text = ("static %s(%s x) { %s r = 1; while (r < x) r <<= 1; "
+                    "return r; }" % (ty.decl(key), T, T))
+        else:
+            ps, ret = [ty], RustCType("unsigned int")
+            if name == "count_ones":
+                loop = ("while (v) { n += v & 1; v >>= 1; }")
+            elif name == "count_zeros":
+                loop = ("int i; for (i = 0; i < %d; i++) { n += !((v >> i) & "
+                        "1); }" % bits)
+            elif name == "leading_zeros":
+                loop = ("int i; for (i = %d - 1; i >= 0 && !((v >> i) & 1); "
+                        "i--) n++;" % bits)
+            else:                                   # trailing_zeros
+                loop = ("int i; for (i = 0; i < %d && !((v >> i) & 1); i++) "
+                        "n++;" % bits)
+            text = ("static unsigned int %s(%s x) { %s v = (%s)x; "
+                    "unsigned int n = 0; %s return n; }"
+                    % (key, T, U, U, loop))
+        u.fn_sigs[key] = (ret, ps)
+        u.statics.add(key)
+        u.emitted.append(text)
+        return key
+
     def float_method(self, recv, name, args):
         """`x.sqrt()`, `x.min(y)`, `x.clamp(lo, hi)`, `x.mul_add(a, b)` on an
         f32 / f64: a libm call, or for `clamp`/`fract` a short expression."""
@@ -4304,6 +4511,11 @@ class Parser:
                 and (recv.type.base, name) not in self.unit.methods \
                 and self._deref_info(recv.type) is not None:
             recv = self.auto_deref(recv)
+        if recv.type is not None and not recv.type.array \
+                and (recv.type.base, name) not in self.unit.methods:
+            got = self.scalar_method(recv, name)
+            if got is not None:
+                return got
         if recv.type is not None and not recv.type.ptr \
                 and not recv.type.array \
                 and recv.type.base in ("crust_char", "unsigned char") \
@@ -5059,6 +5271,14 @@ class Parser:
             # `unsafe { expr }` and the inline `const { expr }` block are, as
             # values, their single tail expression.
             return self.parse_block_expr()
+        while ((t.kind == "kw" and t.val in ("crate", "super"))
+               or (t.val == "self" and t.kind == "ident")) \
+                and self.at("::", "punc"):
+            # `crate::a::B` / `super::B`: a path rooted at the crate. Paths
+            # are flattened and resolved by their remaining segments, so the
+            # root carries nothing and is dropped.
+            self.next()
+            t = self.next()
         if t.kind == "ident" and self.at("!", "punc") and \
                 self.peek().val in ("(", "[", "{"):
             return self.parse_macro(t.val)
@@ -12402,6 +12622,18 @@ def _strip_compound_casts(text):
         out.append(text[i])
         i += 1
     return "".join(out)
+
+
+_PTR_METHODS = ("is_null", "read_volatile", "write_volatile", "add", "sub",
+                "offset", "wrapping_add", "wrapping_sub")
+_INT_UNARY = ("wrapping_neg", "abs", "is_positive", "is_negative", "signum",
+              "is_power_of_two", "next_power_of_two", "count_ones",
+              "count_zeros", "leading_zeros", "trailing_zeros")
+_INT_METHODS = frozenset(_INT_UNARY) | frozenset((
+    "wrapping_add", "wrapping_sub", "wrapping_mul", "saturating_add",
+    "saturating_sub", "checked_add", "checked_sub", "checked_mul", "min",
+    "max", "clamp", "abs_diff", "pow", "div_ceil", "next_multiple_of",
+    "rem_euclid", "rotate_left", "rotate_right"))
 
 
 def _fold_int_const(init, env):
