@@ -1857,12 +1857,12 @@ fn main() -> i32 {
         c = crust.translate("fn f() -> i32 { let g = |x: i32| x + 1; g(1) }")
         self.assertIn("crust_fn_int_int g = _crust_closure", c)
 
-    def test_returning_impl_fn_is_reported(self):
+    def test_returning_impl_trait_other_than_fn_is_reported(self):
         with self.assertRaises(crust.CrustError) as cm:
             crust.translate("""
-fn make(k: i32) -> impl Fn(i32) -> i32 { move |x: i32| x + k }
+fn make() -> impl Iterator<Item = i32> { 0..3 }
 """)
-        self.assertIn("impl", str(cm.exception))
+        self.assertIn("impl Iterator", str(cm.exception))
 
 
 class TestContracts(unittest.TestCase):

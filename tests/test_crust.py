@@ -2104,7 +2104,7 @@ class TestCrustExternPathCalls(unittest.TestCase):
 
 
 class TestCrustAtomics(unittest.TestCase):
-    """Bundled AtomicU32 / AtomicUsize stubs."""
+    """Bundled AtomicU32 / AtomicUsize / AtomicU64 / AtomicBool."""
 
     def test_atomic_static_init(self):
         c = crust.translate(
@@ -2732,7 +2732,7 @@ class TestCrustSyncWrappers(unittest.TestCase):
     def test_mutex_roundtrip(self):
         self.assertEqual(_run("""
 fn main() -> i32 {
-    let mut m: Mutex<i32> = Mutex { value: 42 };
+    let mut m: Mutex<i32> = Mutex::new(42);
     m.read()
 }
 """, suffix=".rs"), 42)
@@ -2747,11 +2747,13 @@ fn main() -> i32 {
 }
 """, suffix=".rs"), 42)
 
-    def test_mutex_does_not_synchronise(self):
-        # Documented explicitly because the name promises otherwise: there is
-        # no lock in the generated C at all.
-        c = crust.translate("fn f(m: *mut Mutex<i32>) -> i32 { m.read() }")
-        self.assertNotIn("lock(", c.replace("Mutex_int_lock", ""))
+    def test_mutex_really_locks(self):
+        # The name promises exclusion, and the generated C now delivers it:
+        # a compare-and-swap loop to acquire, an exchange to release.
+        c = crust.translate("fn f(m: *mut Mutex<i32>) -> i32 "
+                            "{ let g = m.lock(); g.get() }")
+        self.assertIn("crust_atomic_cas32", c)
+        self.assertIn("lock cmpxchg", c)
 
     def test_unused_wrappers_cost_nothing(self):
         c = crust.translate("fn f() -> i32 { 1 }")
