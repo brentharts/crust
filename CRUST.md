@@ -86,6 +86,7 @@ its definition.
 | Enums | C-like variants with optional discriminants, `E::V` paths, exhaustiveness-checked `match`, `impl` blocks |
 | Tuple structs | `struct P(T, U);`, construction `P(a, b)`, positional access `p.0` |
 | Unit structs | `struct S;`, used as its own value, with `impl` blocks |
+| Patterns | literals, ranges, `|` alternatives, `name @ pat`, enum variants, `Some`/`Ok`/`Err`, tuples, plain structs `S { a, b: p, .. }` and tuple structs `S(p, q)`, slices and arrays `[a, .., z]` / `[h, rest @ ..]`; in `match`, `matches!`, `let`, `let .. else`, `if let` and `while let` |
 
 Type mapping is the obvious one (`i32` → `int`, `u64` → `unsigned long`,
 `f64` → `double`, `bool` → `_Bool`, `()` → `void`). An unrecognized named type
@@ -986,12 +987,13 @@ These count references and free at zero. Scope-exit Drop covers `Vec` /
 `release()`**. An unmatched clone leaks
 rather than corrupting anything, which is the right direction to fail.
 
-`Arc` is `Rc` with a different name. Its refcount is not atomic, because Crust
-has no threads for it to race with — the same reasoning as `Mutex<T>`, and it
-stops holding the moment real concurrency exists.
+`Arc` is `Rc` with a different name. Its refcount is **not atomic**, so an
+`Arc` shared across real threads can race on the count. `Mutex<T>` no longer
+has that excuse (it is a real lock, see the sync section); `Arc` still does,
+and wants the same treatment before it is used concurrently.
 
-`MutexGuard<T>` exists so a signature written that way resolves. There is no
-lock held, so there is nothing to release.
+`MutexGuard<T>` holds the lock it came from and releases it on drop; see the
+sync section.
 
 ## Qualified paths to core types
 
@@ -1011,20 +1013,72 @@ suspend, so the wrapper carries the same information here — none. `NonNull<T>`
 is a pointer plus a promise the programmer makes, not a runtime check.
 
 `Once<T>` is faithful for a single-threaded caller. What is missing is the
-blocking half: a real `Once` makes a second thread wait. There are no threads,
-so there is nothing to wait for.
+blocking half: a real `Once` makes a second thread wait.
 
-**`Mutex<T>` and `RwLock<T>` do not synchronise.** `lock()` hands back a
-pointer to the inner value and nothing else happens. This is defensible only
-because Crust has no threads at all — no spawn, no atomics, no memory model —
-so there is nothing for a lock to protect against, and a lock that does nothing
-is consistent with the rest of the model rather than a hole in it. **The moment
-real concurrency exists, these become actively dangerous and must be replaced,
-not extended.**
+### Atomics
 
-They are deliberately not named something honest like `FakeMutex`, because the
-entire point is to accept source written as `Mutex<T>`. The warning has to live
-in the documentation instead, which is why it is stated this plainly.
+`AtomicU32`, `AtomicUsize`, `AtomicU64` and `AtomicBool` are real. Each
+operation is one locked x86-64 instruction -- `lock xadd` for `fetch_add` and
+`fetch_sub`, `xchg` for `swap` and `store`, `lock cmpxchg` for
+`compare_exchange`, and a CAS loop for `fetch_or` / `fetch_and` -- written as
+`crust_atomic_*` helpers into any unit that uses one. A load is a volatile
+read followed by a compiler barrier, so a spin loop cannot cache it in a
+register. Every `Ordering` is treated as `SeqCst`: the strongest answer is
+always a correct one, and on x86 the weaker orderings save little.
+`compare_exchange` returns the value that was there rather than std's
+`Result`; the swap happened iff it equals `current`. (Before this, all of them
+were plain reads and writes. The `__atomic_*` macros in the preprocessor are
+still single-threaded; code that calls those builtins directly is unchanged.)
+
+### `Mutex<T>` and `RwLock<T>`
+
+Both are spinlocks over those atomics. `lock()` spins on a compare-and-swap and
+returns a `MutexGuard<T>`, which dereferences to the value and releases the
+lock when it is dropped:
+
+```rust
+static COUNTER: Mutex<i64> = Mutex::new(0);
+*COUNTER.lock() += 1;
+let g = m.lock();      // held until `g` goes out of scope
+```
+
+A guard bound to a variable is released at the end of its scope, or on an early
+`return`. A guard that was only a temporary -- `*m.lock() += 1;`,
+`m.lock().field`, `m.lock().method()` -- is released at the end of its
+statement, as Rust does; without that, the second `m.lock()` in a block would
+spin forever. The lock state is a field *after* `value`, so a
+`Mutex::new(v)` is a constant and `static M: Mutex<T> = Mutex::new(..)` works,
+including with a struct literal for the value.
+
+`RwLock<T>` allows many `read()` guards or one `write()` guard. `lock().unwrap()`
+is accepted and returns the guard. These are spinlocks, which is the right
+primitive for the kernels and runtimes this core is aimed at and the wrong one
+for a general-purpose program: they do not park a waiting thread, a thread
+that holds one for long wastes the others' time, there is no poisoning, and
+locking twice on one thread deadlocks, exactly as with `spin::Mutex`.
+
+**Limits.** A temporary guard in an `if` or `while` *condition* is released at
+the end of the whole statement rather than the condition; bind it to a variable
+first. `Mutex<[T; N]>` is not supported, because C cannot pass or assign an
+array by value through the generic `new`; wrap the array in a struct
+(`Mutex<Jobs>` with `jobs.slots[i]`), which works. `Arc<T>`'s count is still
+not atomic.
+
+This was checked with real threads: four pthreads each doing 50,000
+`*COUNTER.lock() += 1` and `fetch_add`, which total exactly 200,000 on every
+run, against an identical program without the lock that loses updates on every
+run (`tests/test_crust_sync.py`). Crust has no `thread::spawn`; the tests drive
+threads from a C `main` in a mixed file.
+
+### `Deref` and `DerefMut` on user types
+
+Any type with a `deref` (or `deref_mut`) method taking `&self` gets Rust's
+auto-deref: `*x` is the place it returns, and `x.field`, `x.method()` and
+`x[i]` reach through it when `x` has no such field or method itself. The place
+is a real lvalue, so a `&mut self` method acts on the pointee and not a copy.
+A generic `impl<T> Drop` is honoured too: an instance such as
+`MutexGuard<i32>` is an owning type, which is what makes scope-exit release
+work.
 
 ## Data-carrying enums
 
@@ -1216,10 +1270,35 @@ in it returns from the closure, and its locals are dropped on the way out.
 Closures inlined into `Option`/`Result`/iterator methods reject both, since
 there they would leave the enclosing function.
 
-**Not supported:** returning a closure (`-> impl Fn(..)`), reported rather
-than lowered, and `dyn Fn` / `Box<dyn Fn>`, which would need a vtable. The
-borrow checker's guarantee that a by-reference closure does not outlive what
-it captured is not checked; Crust relies on the program being valid Rust.
+**Returning a closure** (`-> impl Fn(..)`, `FnMut`, `FnOnce`) and **`dyn Fn`**
+(`Box<dyn Fn(..)>`, `&dyn Fn(..)`, `&mut dyn FnMut(..)`) share one lowering,
+because a closure that outlives its frame must carry its environment with it.
+The type is an owning *closure object*:
+
+```c
+struct crust_fnbox_int_int { void *env; int (*call)(void *, int); void (*drop)(void *); };
+```
+
+The environment is copied to the heap when a closure is coerced to the object
+(`Box::new(c)`, a `let` annotation, a return, a struct field, an argument).
+`call` is a generated thunk that casts `env` back to its own type; `drop`
+runs the destructor of anything the closure took by `move`, and the object's
+`T_drop` then frees the environment. It is an ordinary owning type, so scope
+exit, moves, struct fields and `Vec<Box<dyn Fn(..)>>` all drop it through the
+hooks they already use, and a closure moved into a callee is dropped there
+once. A call `f(x)` on one is `f.call(f.env, x)`; calling a call's result,
+`adder(1)(2)`, drops the temporary.
+
+`&dyn Fn(..)` *borrows*: the object is a temporary whose `env` points at the
+closure's own environment and whose `drop` is empty, so nothing is allocated
+or freed. A closure passed to a generic `F: Fn(..)` is still the zero-cost
+static call described above; only the spellings that name a type-erased
+closure pay for the heap environment.
+
+**Not supported:** `impl Trait` returns other than the `Fn` family (reported
+with the trait's name), and `Rc<dyn Fn>`. The borrow checker's guarantee that
+a by-reference closure does not outlive what it captured is not checked;
+Crust relies on the program being valid Rust.
 
 ### C keyword collisions
 
@@ -1312,8 +1391,7 @@ C fails to compile instead.
 Trait paths are flattened, so `impl fmt::Debug for X` -- which Redox writes
 constantly -- gives `X_fmt`.
 
-**Not supported:** `dyn Trait` and trait objects (which would need the vtable
-this design deliberately avoids), associated types and associated consts
+**Not supported:** associated types and associated consts
 (parsed and skipped), generic traits with their own parameters, blanket impls,
 and operator-trait sugar -- `a + b` never becomes `Add::add`.
 
@@ -2114,16 +2192,139 @@ same other reasons. So the core's real value is that it makes OS-shaped code
 upstream Redox. Compiling Redox itself needs traits, and after that macros;
 there is no shortcut left that avoids them.
 
+## Struct, slice and `let` patterns
+
+A pattern is lowered to a C condition over a *place* plus the bindings it
+introduces, and every place a pattern can appear uses that one lowering.
+
+```rust
+struct Point { x: i32, y: i32 }
+struct Pair(i32, i32);
+
+match p {
+    Point { x: 0, y: 0 } => 0,        // literals in fields
+    Point { x, y: 0 }    => x,        // shorthand binding
+    Point { y: h, .. }   => h,        // rename, and `..` for the rest
+}
+match pair { Pair(0, b) => b, Pair(a, b) => a + b }   // tuple struct
+match s {                                             // &[T] or [T; N]
+    []                => 0,
+    [a]               => *a,
+    [first, .., last] => first + last,
+    [head, rest @ ..] => head + rest.len() as i32,
+}
+```
+
+A pointer to the struct is looked through (`match &p`, `fn f(p: &Pair)`),
+a generic struct is matched against the instantiation being tested, and a
+struct pattern nests in `Some(..)`, `Ok(..)`, tuples and other structs.
+
+`let`, `if let` and `while let` used to accept only `Some(name)`. They now
+take any pattern, including enum variants and `Ok`/`Err`:
+
+```rust
+let Point { x, y } = p;
+let [a, b, c] = triple;
+let Some(v) = opt else { return 0; };        // the else block must leave
+if let Shape::Rect { w, h } = s { .. } else if let Shape::Circle(r) = s { .. }
+while let Ok(k) = next() { .. }
+```
+
+A `let` pattern that can fail needs the `else` block; without it the
+translator says so rather than guessing.
+
+How it lowers, and what to know:
+
+- A `match` on a struct, slice or array is always an if/else chain, never a
+  `switch`. The result cannot be proved exhaustive without a range analysis
+  Crust does not have, so the impossible fall-through traps with `abort()`
+  exactly as an integer `match` does; an irrefutable arm (`P { x, y }`,
+  `[..]`) is recognised as a catch-all.
+- Slice patterns are a length test (`len == N`, or `len >= N` with a `..`)
+  plus a sub-pattern per element at `ptr[i]`, or `ptr[len - j]` after the
+  `..`. On an array the length is constant, so a mismatch is a compile
+  error instead.
+- `rest @ ..` binds a slice of the middle. On an array that is a slice, not
+  a shorter array: the same reads, with no copy.
+- Bindings are copies, as everywhere else in Crust, and an owning field
+  bound this way is not dropped a second time. An array subject is tested in
+  place, since C cannot copy an array by assignment.
+- Still refused: a binding inside `|` alternatives, string patterns, and
+  more than one `..` in a slice pattern.
+
+## `From`, `Into` and `?` conversions
+
+```rust
+impl From<Feet> for Meters { fn from(f: Feet) -> Meters { Meters(f.0 / 3) } }
+impl From<Inches> for Meters { fn from(i: Inches) -> Self { Meters(i.0 / 40) } }
+
+let a = Meters::from(Feet(30));          // chosen by the argument's type
+let b: Meters = Inches(80).into();       // chosen by the type expected here
+takes_meters(Feet(6).into());            // a parameter, a return, a field ...
+
+fn run(n: i32) -> Result<i32, AppError> {
+    let v = parse(n)?;                   // ParseError -> AppError via From
+    Ok(v * 2)
+}
+```
+
+A type may have several `impl From<S> for T`. The first keeps the plain C
+name `T_from`, so existing C callers and single-impl code are unchanged; each
+later one is `T_from__S`. The name depends only on source order, which the
+signature pass and the body pass both see, so they always agree.
+
+`x.into()` takes its target from the type the context expects -- an
+annotation, a parameter, a return type or a struct field (struct-literal
+fields now carry their declared type as the expectation, which is what lets
+`Track { len: f.into() }` work). It resolves to `impl From<typeof x> for T`,
+to a numeric conversion between C arithmetic types, or to `x` itself when the
+types already agree. An explicit `impl Into<B> for A` is an ordinary method
+and wins. With nothing to infer from, `.into()` is refused and says to
+annotate.
+
+`?` on a `Result` whose error type differs from the function's calls
+`From` on the error. With no such impl the diagnostic names the one to add.
+
+Not covered: generic `impl<T> From<T> for ..`, `TryFrom`/`try_into`, and
+`From` between types Crust cannot name (`Box<dyn Error>`).
+
+## `dyn Trait` and `Box<dyn Trait>`
+
+Static dispatch stays the default; a trait object is opt-in and costs only
+where it is written. `&dyn T`, `&mut dyn T` and `*const dyn T` are fat
+pointers -- a data pointer and a vtable pointer -- lowered to a generated
+`crust_dyn_T` struct. A call is `place.vt->m(place.data, args)`.
+
+The vtable for a (trait, type) pair is a `static const` table of thunks,
+generated only when that type is coerced to the trait object somewhere
+(parameter, `let` annotation, `as &dyn T`, struct field, return type). A
+program that never uses `dyn Shape` emits no `crust_vt_Shape` at all.
+Supertraits are in the vtable, default methods are filled in, and
+`+ Send` / `+ 'a` bounds are accepted. Methods taking `self` by value cannot
+be called on a trait object, and the diagnostic says so.
+
+`Box<dyn T>` is an *owning* fat pointer. It has a drop slot, so leaving scope
+calls the concrete type's `Drop` exactly once and then frees the allocation.
+A move out of a named `Box<Concrete>` into a `Box<dyn T>`, into a callee, or
+into a struct field is memset-zero like any other move, so nothing runs twice.
+`Vec<Box<dyn T>>` drops each element.
+
+Generic associated calls (`Box::new(x)`, `Vec::new()`) infer their type
+parameter from the expected type, which is what lets
+`let b: Box<dyn Shape> = Box::new(Circle { .. })` work.
+
+Not covered: `dyn Fn` (use a generic `F: Fn`), `dyn Any`/downcasting,
+generic methods on trait objects, and `Rc<dyn T>`.
+
 ## Not yet supported
 
-`From`/`Into` conversions, `dyn Trait` and trait objects, returning closures
-(`impl Fn`), and the borrow checker. `match` has no slice patterns, struct patterns on
-plain structs, or bindings inside `|` alternatives. Slices carry no bounds checking. A repeat
+The borrow checker. `match` has no bindings inside `|`
+alternatives. Slices carry no bounds checking. A repeat
 initializer whose length is not a literal or `const` is rejected, since C has
 no repeat syntax to lower it to. Lifetimes are accepted and dropped rather
 than checked. Paths (`a::b`) are flattened to `a_b`. `Rc`/`Arc` do not
-auto-`release`, and there are no threads, so `Mutex`/`RwLock` do not
-synchronise. These are the natural next increments — the parser is a few
+auto-`release`, and there is no `thread::spawn` (threads must be started
+from C; see the sync section). These are the natural next increments — the parser is a few
 hundred lines of legible Python, in keeping with the rest of the front end.
 
 (This list had drifted badly: it still named traits, generics, `Vec`,
