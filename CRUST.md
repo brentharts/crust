@@ -2337,6 +2337,27 @@ generic methods on trait objects, and `Rc<dyn T>`.
   still cannot be resolved from one file. `[0_u8; N]` is typed, so it needs no
   annotation.
 
+## Integer, bool and pointer methods
+
+Rust's core methods on scalars are lowered inline (or to a small per-type
+helper function) rather than looked up in a prelude: `wrapping_*`,
+`saturating_*`, `checked_*` (an `Option`), `min`/`max`/`clamp`, `abs`,
+`abs_diff`, `signum`, `pow`, `div_ceil`, `next_multiple_of`, `rem_euclid`,
+`is_power_of_two`, `next_power_of_two`, `count_ones`/`count_zeros`,
+`leading_zeros`/`trailing_zeros`, `rotate_left`/`rotate_right`; on raw
+pointers `is_null`, `read_volatile`, `write_volatile`; on `bool`,
+`then_some`. Operands are evaluated once. Signed `wrapping_*` computes in the
+unsigned type so C's signed overflow never happens. A user method of the same
+name on the type always wins. Signed `checked_mul` is refused (unsigned only).
+
+`crate::`, `super::` and `self::` path prefixes are accepted in expressions;
+paths are flattened, so the root is dropped and the remaining segments resolve.
+
+`crust_port.py` (in Ginux) runs a cross-file constant pre-pass: it prepends
+flattened `const a_b_NAME` definitions to a *copy* of each source so that
+`[T; other::LEN]` repeat lengths resolve. The tree itself is never modified;
+`--no-consts` turns it off.
+
 ## Not yet supported
 
 The borrow checker. `match` has no bindings inside `|`

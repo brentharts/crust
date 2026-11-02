@@ -97,6 +97,7 @@ test_crust:
 	python3 -m unittest tests.test_crust_closure_objects -v 2>&1 | tail -5
 	python3 -m unittest tests.test_crust_sync -v 2>&1 | tail -5
 	python3 -m unittest tests.test_crust_literals -v 2>&1 | tail -5
+	python3 -m unittest tests.test_crust_intmethods -v 2>&1 | tail -5
 	python3 tools/crust_examples.py -v
 
 test_fast_crust:
