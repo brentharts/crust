@@ -373,33 +373,48 @@ impl<T> Once<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Mutex<T> / RwLock<T> -- NOT synchronising. Read this before using them.
+// Mutex<T> / RwLock<T> -- spinlocks over the bundled atomics.
 //
-// These exist so that code written against `std` parses and lowers. They do
-// no locking whatsoever: `lock()` hands back a pointer to the inner value and
-// nothing else happens.
+// `lock()` spins on a compare-and-swap until it owns the lock and returns a
+// guard; the guard dereferences to the protected value (`*m.lock() += 1`,
+// `m.lock().field`, `m.lock()[i]`) and releases the lock when it is dropped,
+// which is at the end of its scope -- or, for a guard that was only a
+// temporary, at the end of its statement. The lock state is a field after
+// `value`, so a zero-initialised or `{ value }`-initialised mutex is
+// unlocked, and `static M: Mutex<T> = Mutex::new(v)` is a constant.
 //
-// That is defensible only because Crust has no threads at all -- no spawn, no
-// atomics, no memory model. There is nothing here for a lock to protect
-// against, so a lock that does nothing is consistent with the rest of the
-// model rather than a hole in it. The moment real concurrency exists, these
-// become actively dangerous and must be replaced, not extended.
-//
-// They are deliberately *not* named something honest like `FakeMutex`,
-// because the whole point is to accept source written as `Mutex<T>`. The
-// warning has to live here instead.
+// A spinlock is the right primitive for the code this core targets (kernels
+// and runtimes with no scheduler to park on). It does not block: a thread
+// that holds one for long wastes the others' time, and locking twice on one
+// thread deadlocks, exactly as with `spin::Mutex`. There is no poisoning, so
+// `lock().unwrap()` is accepted and returns the guard itself.
 // ---------------------------------------------------------------------------
 struct Mutex<T> {
     value: T,
+    state: u32,
 }
 
 impl<T> Mutex<T> {
     fn new(value: T) -> Mutex<T> {
-        Mutex { value: value }
+        Mutex { value: value, state: 0 }
     }
 
-    fn lock(&self) -> *mut T {
-        &self.value as *mut T
+    fn lock(&self) -> MutexGuard<T> {
+        let state = &self.state as *mut u32;
+        while crust_atomic_cas32(state, 0, 1) != 0 {
+            while crust_atomic_load32(state) != 0 {
+                crust_atomic_pause();
+            }
+        }
+        MutexGuard { ptr: &self.value as *mut T, state: state }
+    }
+
+    fn is_locked(&self) -> bool {
+        crust_atomic_load32(&self.state as *mut u32) != 0
+    }
+
+    fn into_inner(self) -> T {
+        self.value
     }
 
     fn read(&self) -> T {
@@ -413,27 +428,36 @@ impl<T> Mutex<T> {
 
 struct RwLock<T> {
     value: T,
+    state: u32,
 }
 
 impl<T> RwLock<T> {
     fn new(value: T) -> RwLock<T> {
-        RwLock { value: value }
+        RwLock { value: value, state: 0 }
     }
 
-    fn read_ptr(&self) -> *mut T {
-        &self.value as *mut T
+    // Many readers or one writer. State: 0 free, 1.. readers, 0x80000000 a
+    // writer. A reader waits for a writer to leave; a writer waits for all.
+    fn read(&self) -> RwLockReadGuard<T> {
+        let state = &self.state as *mut u32;
+        loop {
+            let seen: u32 = crust_atomic_load32(state);
+            if seen < 0x80000000 {
+                if crust_atomic_cas32(state, seen, seen + 1) == seen {
+                    break;
+                }
+            }
+            crust_atomic_pause();
+        }
+        RwLockReadGuard { ptr: &self.value as *mut T, state: state }
     }
 
-    fn write_ptr(&self) -> *mut T {
-        &self.value as *mut T
-    }
-
-    fn read(&self) -> T {
-        self.value
-    }
-
-    fn write(&mut self, value: T) {
-        self.value = value;
+    fn write(&self) -> RwLockWriteGuard<T> {
+        let state = &self.state as *mut u32;
+        while crust_atomic_cas32(state, 0, 0x80000000) != 0 {
+            crust_atomic_pause();
+        }
+        RwLockWriteGuard { ptr: &self.value as *mut T, state: state }
     }
 }
 
@@ -633,19 +657,28 @@ impl<T> Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// MutexGuard<T> -- what `Mutex::lock()` returns in real Rust.
-//
-// There is no lock to hold, so there is nothing to release; this exists so a
-// signature written `MutexGuard<T>` resolves. See `Mutex<T>` above for why
-// that is defensible here and why it stops being so the moment threads exist.
+// MutexGuard<T> and the RwLock guards -- what `lock()` / `read()` / `write()`
+// return. Each holds the lock until it is dropped; `deref` / `deref_mut`
+// reach the value, so `*g`, `g.field`, `g.method()` and `g[i]` all work. The
+// pointer is cleared on release, so a guard dropped twice (by a path the
+// translator cannot see) cannot unlock a lock someone else now holds.
 // ---------------------------------------------------------------------------
 struct MutexGuard<T> {
     ptr: *mut T,
+    state: *mut u32,
 }
 
 impl<T> MutexGuard<T> {
-    fn new(ptr: *mut T) -> MutexGuard<T> {
-        MutexGuard { ptr: ptr }
+    fn deref(&self) -> &T {
+        self.ptr
+    }
+
+    fn deref_mut(&mut self) -> &mut T {
+        self.ptr
+    }
+
+    fn unwrap(self) -> MutexGuard<T> {
+        self
     }
 
     fn get(&self) -> T {
@@ -658,6 +691,59 @@ impl<T> MutexGuard<T> {
 
     fn as_ptr(&self) -> *mut T {
         self.ptr
+    }
+}
+
+impl<T> Drop for MutexGuard<T> {
+    fn drop(&mut self) {
+        if self.state as usize != 0 {
+            crust_atomic_xchg32(self.state, 0);
+            self.state = 0 as *mut u32;
+        }
+    }
+}
+
+struct RwLockReadGuard<T> {
+    ptr: *mut T,
+    state: *mut u32,
+}
+
+impl<T> RwLockReadGuard<T> {
+    fn deref(&self) -> &T {
+        self.ptr
+    }
+}
+
+impl<T> Drop for RwLockReadGuard<T> {
+    fn drop(&mut self) {
+        if self.state as usize != 0 {
+            crust_atomic_xadd32(self.state, 0xFFFFFFFF);
+            self.state = 0 as *mut u32;
+        }
+    }
+}
+
+struct RwLockWriteGuard<T> {
+    ptr: *mut T,
+    state: *mut u32,
+}
+
+impl<T> RwLockWriteGuard<T> {
+    fn deref(&self) -> &T {
+        self.ptr
+    }
+
+    fn deref_mut(&mut self) -> &mut T {
+        self.ptr
+    }
+}
+
+impl<T> Drop for RwLockWriteGuard<T> {
+    fn drop(&mut self) {
+        if self.state as usize != 0 {
+            crust_atomic_xchg32(self.state, 0);
+            self.state = 0 as *mut u32;
+        }
     }
 }
 
@@ -952,11 +1038,16 @@ struct PhantomData<T> {
 }
 
 // ---------------------------------------------------------------------------
-// AtomicU32 / AtomicUsize / Ordering -- stubs for kernel-style code.
+// AtomicU32 / AtomicUsize / AtomicU64 / AtomicBool / Ordering.
 //
-// No real concurrency: load/store/compare_exchange/fetch_add are ordinary
-// reads and writes. They exist so `static LOCK: AtomicU32 = AtomicU32::new(0)`
-// and the common methods typecheck. A local definition always wins.
+// Real atomics on x86-64: each operation is one `lock`-prefixed instruction
+// (or, for loads, a volatile read the compiler may not hoist), supplied as
+// `crust_atomic_*` helpers that the translator writes into any unit that uses
+// one. They are sequentially consistent whatever `Ordering` is asked for --
+// the strongest answer is always a correct one, and on x86 the cost of the
+// weaker orderings is small. `compare_exchange` returns the value that was
+// there, as the C11 builtin does, rather than std's `Result`; the swap
+// happened iff it equals `current`.
 // ---------------------------------------------------------------------------
 enum Ordering {
     Relaxed,
@@ -976,21 +1067,22 @@ impl AtomicU32 {
     }
 
     fn load(&self, _order: Ordering) -> u32 {
-        self.value
+        crust_atomic_load32(&self.value as *mut u32)
     }
 
     fn store(&mut self, value: u32, _order: Ordering) {
-        self.value = value;
+        crust_atomic_xchg32(&mut self.value, value);
     }
 
+    fn swap(&mut self, value: u32, _order: Ordering) -> u32 {
+        crust_atomic_xchg32(&mut self.value, value)
+    }
+
+    // Returns the value that was there, like the C11 builtin; the swap
+    // happened iff it equals `current`.
     fn compare_exchange(&mut self, current: u32, new: u32,
                         _success: Ordering, _failure: Ordering) -> u32 {
-        if self.value == current {
-            self.value = new;
-            current
-        } else {
-            self.value
-        }
+        crust_atomic_cas32(&mut self.value, current, new)
     }
 
     fn compare_exchange_weak(&mut self, current: u32, new: u32,
@@ -999,15 +1091,33 @@ impl AtomicU32 {
     }
 
     fn fetch_add(&mut self, value: u32, _order: Ordering) -> u32 {
-        let prev: u32 = self.value;
-        self.value = self.value + value;
-        prev
+        crust_atomic_xadd32(&mut self.value, value)
     }
 
     fn fetch_sub(&mut self, value: u32, _order: Ordering) -> u32 {
-        let prev: u32 = self.value;
-        self.value = self.value - value;
-        prev
+        crust_atomic_xadd32(&mut self.value, (0 as u32) - value)
+    }
+
+    fn fetch_or(&mut self, value: u32, _order: Ordering) -> u32 {
+        let mut old: u32 = crust_atomic_load32(&self.value as *mut u32);
+        loop {
+            let seen: u32 = crust_atomic_cas32(&mut self.value, old, old | value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+
+    fn fetch_and(&mut self, value: u32, _order: Ordering) -> u32 {
+        let mut old: u32 = crust_atomic_load32(&self.value as *mut u32);
+        loop {
+            let seen: u32 = crust_atomic_cas32(&mut self.value, old, old & value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
     }
 }
 
@@ -1021,21 +1131,22 @@ impl AtomicUsize {
     }
 
     fn load(&self, _order: Ordering) -> usize {
-        self.value
+        crust_atomic_load64(&self.value as *mut usize)
     }
 
     fn store(&mut self, value: usize, _order: Ordering) {
-        self.value = value;
+        crust_atomic_xchg64(&mut self.value, value);
     }
 
+    fn swap(&mut self, value: usize, _order: Ordering) -> usize {
+        crust_atomic_xchg64(&mut self.value, value)
+    }
+
+    // Returns the value that was there, like the C11 builtin; the swap
+    // happened iff it equals `current`.
     fn compare_exchange(&mut self, current: usize, new: usize,
                         _success: Ordering, _failure: Ordering) -> usize {
-        if self.value == current {
-            self.value = new;
-            current
-        } else {
-            self.value
-        }
+        crust_atomic_cas64(&mut self.value, current, new)
     }
 
     fn compare_exchange_weak(&mut self, current: usize, new: usize,
@@ -1044,14 +1155,129 @@ impl AtomicUsize {
     }
 
     fn fetch_add(&mut self, value: usize, _order: Ordering) -> usize {
-        let prev: usize = self.value;
-        self.value = self.value + value;
-        prev
+        crust_atomic_xadd64(&mut self.value, value)
     }
 
     fn fetch_sub(&mut self, value: usize, _order: Ordering) -> usize {
-        let prev: usize = self.value;
-        self.value = self.value - value;
-        prev
+        crust_atomic_xadd64(&mut self.value, (0 as usize) - value)
+    }
+
+    fn fetch_or(&mut self, value: usize, _order: Ordering) -> usize {
+        let mut old: usize = crust_atomic_load64(&self.value as *mut usize);
+        loop {
+            let seen: usize = crust_atomic_cas64(&mut self.value, old, old | value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+
+    fn fetch_and(&mut self, value: usize, _order: Ordering) -> usize {
+        let mut old: usize = crust_atomic_load64(&self.value as *mut usize);
+        loop {
+            let seen: usize = crust_atomic_cas64(&mut self.value, old, old & value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+}
+
+struct AtomicU64 {
+    value: u64,
+}
+
+impl AtomicU64 {
+    fn new(value: u64) -> AtomicU64 {
+        AtomicU64 { value: value }
+    }
+
+    fn load(&self, _order: Ordering) -> u64 {
+        crust_atomic_load64(&self.value as *mut u64)
+    }
+
+    fn store(&mut self, value: u64, _order: Ordering) {
+        crust_atomic_xchg64(&mut self.value, value);
+    }
+
+    fn swap(&mut self, value: u64, _order: Ordering) -> u64 {
+        crust_atomic_xchg64(&mut self.value, value)
+    }
+
+    // Returns the value that was there, like the C11 builtin; the swap
+    // happened iff it equals `current`.
+    fn compare_exchange(&mut self, current: u64, new: u64,
+                        _success: Ordering, _failure: Ordering) -> u64 {
+        crust_atomic_cas64(&mut self.value, current, new)
+    }
+
+    fn compare_exchange_weak(&mut self, current: u64, new: u64,
+                             success: Ordering, failure: Ordering) -> u64 {
+        self.compare_exchange(current, new, success, failure)
+    }
+
+    fn fetch_add(&mut self, value: u64, _order: Ordering) -> u64 {
+        crust_atomic_xadd64(&mut self.value, value)
+    }
+
+    fn fetch_sub(&mut self, value: u64, _order: Ordering) -> u64 {
+        crust_atomic_xadd64(&mut self.value, (0 as u64) - value)
+    }
+
+    fn fetch_or(&mut self, value: u64, _order: Ordering) -> u64 {
+        let mut old: u64 = crust_atomic_load64(&self.value as *mut u64);
+        loop {
+            let seen: u64 = crust_atomic_cas64(&mut self.value, old, old | value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+
+    fn fetch_and(&mut self, value: u64, _order: Ordering) -> u64 {
+        let mut old: u64 = crust_atomic_load64(&self.value as *mut u64);
+        loop {
+            let seen: u64 = crust_atomic_cas64(&mut self.value, old, old & value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+}
+
+// `AtomicBool` stores a u32 so the same instructions serve it.
+struct AtomicBool {
+    value: u32,
+}
+
+impl AtomicBool {
+    fn new(value: bool) -> AtomicBool {
+        AtomicBool { value: value as u32 }
+    }
+
+    fn load(&self, _order: Ordering) -> bool {
+        crust_atomic_load32(&self.value as *mut u32) != 0
+    }
+
+    fn store(&mut self, value: bool, _order: Ordering) {
+        crust_atomic_xchg32(&mut self.value, value as u32);
+    }
+
+    fn swap(&mut self, value: bool, _order: Ordering) -> bool {
+        crust_atomic_xchg32(&mut self.value, value as u32) != 0
+    }
+
+    fn compare_exchange(&mut self, current: bool, new: bool,
+                        _success: Ordering, _failure: Ordering) -> bool {
+        crust_atomic_cas32(&mut self.value, current as u32, new as u32) != 0
+    }
+
+    fn compare_exchange_weak(&mut self, current: bool, new: bool,
+                             success: Ordering, failure: Ordering) -> bool {
+        self.compare_exchange(current, new, success, failure)
     }
 }
