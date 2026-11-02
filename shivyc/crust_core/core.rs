@@ -765,12 +765,32 @@ impl<T> MaybeUninit<T> {
         MaybeUninit { value: value }
     }
 
+    // Storage with nothing in it. The local is declared and never assigned,
+    // which is what the name promises; reading it before `write` is as
+    // undefined here as it is in Rust.
+    fn uninit() -> MaybeUninit<T> {
+        let m: MaybeUninit<T>;
+        m
+    }
+
     fn write(&mut self, value: T) {
         self.value = value;
     }
 
     fn assume_init(&self) -> T {
         self.value
+    }
+
+    fn assume_init_ref(&self) -> &T {
+        &self.value
+    }
+
+    fn assume_init_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut T {
+        &mut self.value as *mut T
     }
 
     fn as_ptr(&self) -> *mut T {
