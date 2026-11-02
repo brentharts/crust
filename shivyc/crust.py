@@ -222,6 +222,28 @@ class RustToken:
         return "<%s %r @%d>" % (self.kind, self.val, self.line)
 
 
+def _decode_byte_escapes(body):
+    """The bytes a Rust byte-string body denotes (`\\n`, `\\xFF`, `\\0`..)."""
+    out, k = [], 0
+    simple = {"n": 10, "r": 13, "t": 9, "0": 0, "\\": 92, "'": 39, '"': 34}
+    while k < len(body):
+        ch = body[k]
+        if ch != "\\":
+            out.append(ord(ch) & 0xFF)
+            k += 1
+        elif k + 1 < len(body) and body[k + 1] == "x":
+            out.append(int(body[k + 2:k + 4], 16))
+            k += 4
+        elif k + 1 < len(body) and body[k + 1] == "\n":
+            k += 2
+            while k < len(body) and body[k] in " \t\r\n":
+                k += 1
+        else:
+            out.append(simple.get(body[k + 1], ord(body[k + 1])))
+            k += 2
+    return out
+
+
 def tokenize(src, line0=1):
     """Lex Rust-subset source into a token list."""
     toks = []
@@ -256,6 +278,29 @@ def tokenize(src, line0=1):
             if depth:
                 raise CrustError("line %d: unterminated block comment" % line)
             i = j
+            continue
+        # byte strings and byte chars: b"abc", b'a'
+        if c == "b" and i + 1 < n and src[i + 1] in "\"'":
+            q = src[i + 1]
+            j = i + 2
+            while j < n and src[j] != q:
+                if src[j] == "\\":
+                    j += 1
+                if src[j] == "\n":
+                    line += 1
+                j += 1
+            if j >= n:
+                raise CrustError("line %d: unterminated byte literal" % line)
+            body = src[i + 2:j]
+            if q == '"':
+                toks.append(RustToken("bstr", '"' + body + '"', line))
+            else:
+                n_bytes = _decode_byte_escapes(body)
+                if len(n_bytes) != 1:
+                    raise CrustError("line %d: byte literal must be one byte"
+                                     % line)
+                toks.append(RustToken("num", str(n_bytes[0]) + "u8", line))
+            i = j + 1
             continue
         # identifiers / keywords
         if c.isalpha() or c == "_":
@@ -951,7 +996,38 @@ def _literal_count(code, unit):
             return int(text, 0)
         except ValueError:
             continue
-    return None
+    # A length that is itself arithmetic over consts (`N * 2`,
+    # `A + B`) folds through the same evaluator integer consts use.
+    env = {}
+    for _round in range(4):
+        grew = False
+        for cname, ctext in unit.const_values.items():
+            if cname in env:
+                continue
+            v = _fold_int_const(_strip_int_casts(ctext), env)
+            if v is not None:
+                env[cname] = v
+                grew = True
+        if not grew:
+            break
+    folded = code
+    for cty in set(PRIMITIVES.values()):
+        folded = folded.replace("(%s)" % cty, "")
+    return _fold_int_const(_strip_int_casts(folded), env)
+
+
+def _strip_int_casts(text):
+    """`N as usize` -> `N`: an integer cast does not change a constant."""
+    words = text.replace("(", " ( ").replace(")", " ) ").split()
+    out, k = [], 0
+    while k < len(words):
+        if words[k] == "as" and k + 1 < len(words) \
+                and words[k + 1] in PRIMITIVES:
+            k += 2
+            continue
+        out.append(words[k])
+        k += 1
+    return " ".join(out).replace("( ", "(").replace(" )", ")")
 
 
 class Parser:
@@ -4388,9 +4464,18 @@ class Parser:
         self.expect("{")
         inits = []
         seen = set()
+        base = None
         while not self.at("}", "punc"):
+            if self.accept(".."):
+                # Functional update: `S { a: 1, ..other }`.
+                base = self.once(self.parse_expr_as(RustCType(name)))
+                break
             field = self.expect_ident()
-            self.expect(":")
+            if self.at(",", "punc") or self.at("}", "punc"):
+                # Field init shorthand: `S { a, b }` is `S { a: a, b: b }`.
+                self.i -= 1
+            else:
+                self.expect(":")
             val = self.parse_expr_as(self.unit.field_type(name, field))
             self.reject_borrow(val, self.unit.field_type(name, field),
                                "the field `%s`" % field)
@@ -4403,6 +4488,11 @@ class Parser:
             if not self.accept(","):
                 break
         self.expect("}")
+        if base is not None:
+            for f, _ in self.unit.structs.get(name, ()):
+                if f not in seen:
+                    seen.add(f)
+                    inits.append(".%s = %s.%s" % (f, base, f))
         missing = [f for f, _ in self.unit.structs.get(name, ())
                    if f not in seen]
         if missing:
@@ -4822,8 +4912,13 @@ class Parser:
         if self.accept(";"):
             count = self.parse_expr()
             self.expect("]")
-            if first.code.strip() in ("0", "0.0"):
-                return Expr("{0}", None)
+            if first.code.strip().rstrip("uUlL") in ("0", "0.0", "0.0f"):
+                zty = None
+                if first.type is not None and not first.type.array:
+                    # Typed, so `let h = [0u8; N];` needs no annotation.
+                    zty = RustCType(first.type.base, first.type.ptr,
+                                    [count.code.strip()])
+                return Expr("{0}", zty)
             n = _literal_count(count.code, self.unit)
             if n is None:
                 self.err("the repeat length in `[v; N]` must be an integer "
@@ -4866,6 +4961,18 @@ class Parser:
                         normalize_number_type(t))
         if t.kind == "str":
             return Expr(_c_string(t.val, self), RustCType("const char", 1))
+        if t.kind == "bstr":
+            # `b"abc"` is a `&[u8; 3]`: a pointer to its bytes. Where a
+            # `&[u8]` is wanted it becomes the slice struct, length included.
+            n = len(_decode_byte_escapes(t.val[1:-1]))
+            ptr = '(unsigned char *)%s' % _c_string(t.val, self)
+            want = self.target
+            elem = self.unit.slices.get(want.base) if want is not None \
+                and not want.ptr and not want.array else None
+            if elem is not None and elem.base == "unsigned char" \
+                    and not elem.ptr and not elem.array:
+                return Expr("(%s){%s, %d}" % (want.base, ptr, n), want)
+            return Expr(ptr, RustCType("unsigned char", 1))
         if t.kind == "chr":
             return Expr(_char_code(t.val, self), RustCType("crust_char"))
         if t.val == "true":
@@ -4947,8 +5054,10 @@ class Parser:
             # it. Its value is its tail expression.
             self.i -= 1
             return self.parse_block_expr()
-        if t.val == "unsafe" and t.kind == "kw" and self.at("{", "punc"):
-            # `unsafe { expr }` as a value is its single tail expression.
+        if t.val in ("unsafe", "const") and t.kind == "kw" \
+                and self.at("{", "punc"):
+            # `unsafe { expr }` and the inline `const { expr }` block are, as
+            # values, their single tail expression.
             return self.parse_block_expr()
         if t.kind == "ident" and self.at("!", "punc") and \
                 self.peek().val in ("(", "[", "{"):
@@ -12232,8 +12341,67 @@ def _render_const(kw, name, ty, init):
     compound = _struct_new_to_compound(init, ty)
     if compound is not None:
         init = compound
+    if init.lstrip().startswith("{"):
+        init = _expand_new_calls(init, ty.base)
+        init = _strip_compound_casts(init)
+    elif init.lstrip().startswith("(") and "){" in init \
+            and not ty.ptr and not ty.array:
+        init = _strip_compound_casts(init)
     prefix = "static const " if kw == "const" else "static "
     return "%s%s = %s;" % (prefix, ty.decl(name), init)
+
+
+def _expand_new_calls(text, base):
+    """Inside an aggregate initializer, `T_new(a, b)` -> `{ a, b }`.
+
+    Static storage cannot call a function, but a bundled `new` is a struct
+    literal in disguise, so `[AtomicU64::new(0); 512]` can still be a constant
+    when the element is `T`.
+    """
+    head = base + "_new("
+    out, i = [], 0
+    while i < len(text):
+        if text.startswith(head, i) and (i == 0 or not (
+                text[i - 1].isalnum() or text[i - 1] == "_")):
+            depth, j = 1, i + len(head)
+            while j < len(text) and depth:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            out.append("{ %s }" % text[i + len(head):j - 1].strip())
+            i = j
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _strip_compound_casts(text):
+    """`{(P){.e = {0}}, (P){..}}` -> `{{.e = {0}}, {..}}`.
+
+    A compound literal is not a constant expression in a static initializer,
+    but the same braces without the `(P)` are: the element type is already
+    known from the array or field being initialised. Only `(Name){` is
+    rewritten, a shape that cannot otherwise occur in an initializer.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] == "(":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            if j > i + 1 and j < n and text[j] == ")":
+                k = j + 1
+                while k < n and text[k] == " ":
+                    k += 1
+                if k < n and text[k] == "{":
+                    i = k
+                    continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
 
 def _fold_int_const(init, env):
