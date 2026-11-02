@@ -159,5 +159,28 @@ fn main() -> i32 { crate::BASE + crate::two() + self::two() - 2 }
 """), 42)
 
 
+class TestRestrictedVisibilityGenerics(unittest.TestCase):
+
+    def test_pub_crate_generic_struct_stays_a_template(self):
+        # `pub(crate)` used to hide the generics from the template scan, so
+        # `T` was resolved eagerly and the struct failed to compile.
+        self.assertEqual(_rs("""
+pub(crate) struct Slot<T> { value: UnsafeCell<MaybeUninit<T>>, set: bool }
+impl<T> Slot<T> {
+    pub(crate) const fn empty() -> Self {
+        Slot { value: UnsafeCell::new(MaybeUninit::uninit()), set: false }
+    }
+    pub(crate) fn mark(&mut self) { self.set = true; }
+}
+pub(in crate::x) struct Pair<A, B> { a: A, b: B }
+fn main() -> i32 {
+    let mut s: Slot<i32> = Slot::empty();
+    s.mark();
+    let p: Pair<i32, i32> = Pair { a: 3, b: 4 };
+    if s.set { p.a + p.b } else { 0 }
+}
+"""), 7)
+
+
 if __name__ == "__main__":
     unittest.main()
