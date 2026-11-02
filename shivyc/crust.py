@@ -749,6 +749,34 @@ class Unit:
         # compiler writes at the end: (template, mangled, element type).
         self.elem_drop_insts = []
         self.static_prefixes = set()  # core type method prefixes
+        # `impl From<S> for T`: T -> [(S's RustCType, MethodInfo)], in source
+        # order. Several may coexist -- `T::from(a)` and `a.into()` pick one
+        # by the argument's or the expected type -- so each needs its own C
+        # name. The first keeps the plain `T_from`; the rest are `T_from__S`.
+        self.from_impls = {}
+        # Trait objects. `&dyn Trait` is a two-word fat pointer, one struct
+        # per trait: `crust_dyn_Trait { void *data; const crust_vt_Trait *vt; }`.
+        # The vtable struct and its per-type instances are built at the end
+        # (`finalize_dyn`), once every trait is known, so a `dyn` may be named
+        # before its trait is defined.
+        self.dyn_types = {}         # fat pointer struct -> trait name
+        self.dyn_used = set()       # (trait, concrete type) coerced somewhere
+        # `Box<dyn Trait>`: the same two words, but owning. Also in dyn_types,
+        # so calls and vtables are shared; this table is what says "owns".
+        self.dyn_boxes = {}         # owning fat pointer struct -> trait name
+        # `Box<dyn Fn(..)>` and `-> impl Fn(..)`: an owning closure object,
+        # `{ void *env; call; drop }`, keyed by its struct -> (ret, params).
+        self.fn_boxes = {}
+        self.fn_thunks = set()      # thunks already written
+        # The atomic helpers the bundled core's atomics are written against.
+        # Their bodies are `_ATOMIC_C`, put in any unit that mentions one.
+        for w, cty in ((32, "unsigned int"), (64, "unsigned long")):
+            t, pt = RustCType(cty), RustCType(cty, 1)
+            self.fn_sigs["crust_atomic_load%d" % w] = (t, [pt])
+            self.fn_sigs["crust_atomic_xchg%d" % w] = (t, [pt, t])
+            self.fn_sigs["crust_atomic_xadd%d" % w] = (t, [pt, t])
+            self.fn_sigs["crust_atomic_cas%d" % w] = (t, [pt, t, t])
+        self.fn_sigs["crust_atomic_pause"] = (VOID, [])
 
     def result_type(self, ok, err):
         """Return (and register) the tagged struct for `Result<ok, err>`."""
@@ -805,6 +833,90 @@ class Unit:
             self.structs[name] = [("ptr", RustCType(elem.base, elem.ptr + 1)),
                                   ("len", RustCType("unsigned long"))]
         return RustCType(name)
+
+    def dyn_type(self, trait):
+        """Return (and register) the fat-pointer type for `&dyn trait`."""
+        name = "crust_dyn_" + trait
+        if name not in self.dyn_types:
+            self.dyn_types[name] = trait
+            self.structs[name] = [("data", RustCType("void", 1)),
+                                  ("vt", RustCType("const crust_vt_" + trait, 1))]
+        return RustCType(name)
+
+    def dynbox_type(self, trait):
+        """Return (and register) the owning fat pointer for `Box<dyn trait>`.
+
+        It has a `T_drop` like any owning type, so scope exit, moves and
+        container element drops all reach it through the hooks they already
+        use. The body is written by `finalize_dyn`: it runs the concrete
+        type's destructor through the vtable, then frees the allocation.
+        """
+        name = "crust_dynbox_" + trait
+        if name not in self.dyn_boxes:
+            self.dyn_boxes[name] = trait
+            self.dyn_types[name] = trait
+            self.structs[name] = [("data", RustCType("void", 1)),
+                                  ("vt", RustCType("const crust_vt_" + trait,
+                                                   1))]
+            info = MethodInfo(name, "drop", VOID, "ref", [])
+            self.methods[(name, "drop")] = info
+            self.fn_sigs[info.mangled] = (VOID, [RustCType(name, 1)])
+            self.statics.add(info.mangled)
+        return RustCType(name)
+
+    def fnbox_type(self, ret, params):
+        """Return (and register) the owning closure object for `Fn(params)`.
+
+        The environment lives on the heap so the object can outlive the frame
+        that built it, which is the whole point of returning a closure. `call`
+        is a thunk that casts the environment back to its own type; `drop`
+        (or 0) runs the destructor of whatever the closure captured by move.
+        Like `Box<dyn Trait>` it has a `T_drop`, written by `finalize_dyn`, so
+        scope exit, moves and container drops reach it by the usual hooks.
+        """
+        name = "crust_fnbox_%s_%s" % (_mangle(ret),
+                                      "_".join(_mangle(t) for t in params)
+                                      or "void")
+        if name not in self.fn_boxes:
+            self.fn_boxes[name] = (ret, list(params))
+            vp = RustCType("void", 1)
+            self.structs[name] = [
+                ("env", vp),
+                ("call", self.fn_ptr_type(ret, [vp] + list(params))),
+                ("drop", self.fn_ptr_type(VOID, [vp]))]
+            info = MethodInfo(name, "drop", VOID, "ref", [])
+            self.methods[(name, "drop")] = info
+            self.fn_sigs[info.mangled] = (VOID, [RustCType(name, 1)])
+            self.statics.add(info.mangled)
+        return RustCType(name)
+
+    def note_from(self, info, src):
+        """Record `impl From<src> for info.owner` and settle its C name.
+
+        Called from the signature parse, which runs once while items are
+        collected and again when the body is emitted. The name depends only
+        on the impl's position in source order, so both passes agree.
+        """
+        lst = self.from_impls.setdefault(info.owner, [])
+        key = src.decl()
+        for idx, (have, _old) in enumerate(lst):
+            if have.decl() == key:
+                lst[idx] = (have, info)
+                break
+        else:
+            idx = len(lst)
+            lst.append((src, info))
+        if idx > 0:
+            info.mangled = "%s_from__%s" % (info.owner, _mangle(src))
+
+    def from_impl(self, target, src):
+        """The `From<src>` method that builds `target`, or None."""
+        if target is None or src is None or target.ptr or target.array:
+            return None
+        for have, info in self.from_impls.get(target.base, ()):
+            if have.decl() == src.decl():
+                return info
+        return None
 
     def field_type(self, struct_name, field):
         for fname, ftype in self.structs.get(struct_name, ()):
@@ -904,12 +1016,16 @@ class Parser:
         self.ret_type = VOID
         self.impl_n = 0                 # `impl Trait` params seen so far
         self.impl_type = None           # enclosing `impl` type name, if any
+        self.impl_trait = None          # trait of the enclosing `impl`, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
         self.behind_ref = 0             # >0 while parsing the pointee of `&`
         self.expected = []              # target types, for inferring `None`
         self.synth_main = False         # parsing a unit `fn main` as C main
         self.tmp_n = 0                  # counter for generated temporaries
         self.pending = []               # statements hoisted out of `?`
+        # Guards spilled to a temporary so a `*m.lock()` could reach through
+        # them: dropped when the statement ends, as Rust drops a temporary.
+        self.stmt_temps = []
         # While a `match` in value position is being lowered, a tail
         # expression assigns to this temporary instead of returning. Every
         # construct that already threads `tail_returns` (blocks, `if`,
@@ -1059,7 +1175,8 @@ class Parser:
         # Either way the type has a `T_drop(T *self)` -- the same symbol
         # cpprust emits for `~T()` -- so everything below works unchanged;
         # only this lookup was ever hardcoded to the bundled core's table.
-        if ty.base in self.unit.drop_types:
+        if ty.base in self.unit.drop_types or ty.base in self.unit.dyn_boxes \
+                or ty.base in self.unit.fn_boxes:
             return "drop"
         if ty.base == "String":
             return "free_buf"
@@ -1279,11 +1396,15 @@ class Parser:
             if not (self.accept("const") or self.accept("mut")):
                 raise CrustError("line %d: raw pointer needs `const` or `mut`"
                                  % t.line)
+            if self.at("dyn", "kw"):
+                return self._ref_dyn()
             inner = self.parse_type()
             return RustCType(inner.base, inner.ptr + 1)
         if t.val == "&":
             self.next()
             self.accept("mut")
+            if self.at("dyn", "kw"):
+                return self._ref_dyn()
             if self.at("[", "punc") and self._is_slice_type():
                 self.next()
                 elem = self.parse_type()
@@ -1294,6 +1415,9 @@ class Parser:
                 inner = self.parse_type()
             finally:
                 self.behind_ref -= 1
+            if inner.base in self.unit.dyn_types and not inner.ptr \
+                    and inner.base not in self.unit.dyn_boxes:
+                return inner            # `&(dyn T + Send)`: already fat
             return RustCType(inner.base, inner.ptr + 1)
         if t.val == "[":
             self.next()
@@ -1303,6 +1427,11 @@ class Parser:
             self.expect("]")
             dims = (inner.array or []) + [size.code]
             return RustCType(inner.base, inner.ptr, dims)
+        if t.val == "dyn" and t.kind == "kw":
+            if not self.behind_ref:
+                self.err("`dyn Trait` is unsized; write `&dyn Trait`, "
+                         "`*const dyn Trait` or `Box<dyn Trait>`")
+            return self.parse_dyn()
         if t.kind in ("ident", "kw"):
             name = self.next().val
             was_path = False
@@ -1355,6 +1484,19 @@ class Parser:
             if name in self.unit.structs and not self.at("<", "punc") \
                     and name not in self.unit.generic_structs:
                 return RustCType(name)
+            if name == "Box" and self.at("<", "punc") \
+                    and self.peek().val == "dyn" \
+                    and "Box" not in self.unit.structs:
+                self.next()
+                self.behind_ref += 1
+                try:
+                    fat = self.parse_dyn()
+                finally:
+                    self.behind_ref -= 1
+                self.expect_gt()
+                if fat.base in self.unit.fn_boxes:
+                    return fat
+                return self.unit.dynbox_type(self.unit.dyn_types[fat.base])
             if name == "Result":
                 self.expect("<")
                 ok = self.parse_type()
@@ -1624,6 +1766,10 @@ class Parser:
             p = Parser(list(toks), self.unit, sub)
             p.parse_impl_header()
             p.impl_type = mangled
+            if p.impl_trait == "Drop":
+                # `impl<T> Drop for Guard<T>`: this instance owns something,
+                # so scope exit, moves and field drops must reach `drop`.
+                self.unit.drop_types.add(mangled)
             while not p.at("}", "punc") and p.cur.kind != "eof":
                 if p.is_assoc_type():
                     p.parse_assoc_type(mangled)
@@ -2184,6 +2330,12 @@ class Parser:
             e = self.parse_expr()
         finally:
             self.expected.pop()
+        if ty is not None and not ty.ptr and not ty.array \
+                and ty.base in self.unit.dyn_types:
+            e = self.coerce_dyn(e, ty)
+        elif ty is not None and ty.ptr <= 1 and not ty.array \
+                and ty.base in self.unit.fn_boxes:
+            e = self.coerce_fn(e, ty)
         # Associated types (`Self::Target`) and other opaque names often
         # disagree with the concrete pointer the body produces. GCC 14+
         # rejects that as an error; insert an explicit cast.
@@ -2335,12 +2487,287 @@ class Parser:
             left = Expr("(%s %s %s)" % (left.code, op, right.code), type_)
         return left
 
+    def _ref_dyn(self):
+        """`dyn ..` behind `&` / `*const`: fat already, except for `Fn`."""
+        t = self.parse_dyn()
+        if t.base in self.unit.fn_boxes:
+            return RustCType(t.base, 1)
+        return t
+
+    def parse_fn_bound_rest(self):
+        """`(A, B) -> R [+ Send + 'a]` after `Fn`; the owning closure type.
+
+        The caller has consumed `Fn`/`FnMut`/`FnOnce`. A `&dyn Fn(..)` wraps
+        the result in a pointer; `Box<dyn Fn(..)>` and `impl Fn(..)` in return
+        position use it as is.
+        """
+        self.expect("(")
+        params = []
+        while not self.at(")", "punc"):
+            params.append(self.parse_type())
+            if not self.accept(","):
+                break
+        self.expect(")")
+        ret = self.parse_type() if self.accept("->") else VOID
+        while self.accept("+"):
+            if self.cur.kind not in ("ident", "kw"):
+                break
+            self.next()
+        return self.unit.fnbox_type(ret, params)
+
+    def parse_dyn(self):
+        """`dyn Trait [+ Send + 'a ..]` after the `&` / `*const`; a fat pointer."""
+        self.expect("dyn")
+        trait = self.parse_path_name()
+        if trait in ("Fn", "FnMut", "FnOnce"):
+            return self.parse_fn_bound_rest()
+        if self.at("<", "punc"):
+            self.err("`dyn %s<..>` is not supported: a trait object's trait "
+                     "must not be generic", trait)
+        # `+ Send`, `+ Sync`. A `+ 'a` lifetime bound is dropped by the lexer,
+        # like every lifetime, which leaves the `+` with nothing after it.
+        while self.accept("+"):
+            if self.cur.kind not in ("ident", "kw"):
+                break
+            self.next()
+            while self.at("::", "punc"):
+                self.next()
+                self.expect_ident()
+        return self.unit.dyn_type(trait)
+
+    def coerce_dyn(self, e, ty):
+        """Turn a `&T` into a `&dyn Trait` when `T` implements the trait.
+
+        The fat pointer pairs the data pointer with the vtable for this
+        (trait, type) pair, which `finalize_dyn` writes at the end. Anything
+        that is not a pointer to a concrete type is left for C to judge.
+        """
+        if e is None or e.type is None or e.type.base == ty.base \
+                or e.type.array:
+            return e
+        if ty.base in self.unit.dyn_boxes:
+            return self.coerce_dynbox(e, ty)
+        trait = self.unit.dyn_types[ty.base]
+        if e.type.base in self.unit.dyn_boxes and e.type.ptr == 1 \
+                and self.unit.dyn_types[e.type.base] == trait:
+            # `&b` where `b: Box<dyn T>` is a `&dyn T`: same data, same vtable.
+            box = self.once(e)
+            return Expr("(%s){%s->data, %s->vt}" % (ty.base, box, box), ty)
+        if e.type.ptr != 1:
+            return e
+        owner = e.type.base
+        self._check_implements(owner, trait)
+        self.unit.dyn_used.add((trait, owner))
+        return Expr("(%s){(void *)(%s), &crust_vtinst_%s_%s}"
+                    % (ty.base, e.code, trait, owner), ty)
+
+    def _check_implements(self, owner, trait):
+        for mname, info in _dyn_methods(self.unit, trait).items():
+            if info.self_kind == "ref" \
+                    and (owner, mname) not in self.unit.methods:
+                self.err("`%s` does not implement `%s` (no method `%s`), so "
+                         "it cannot be used as a `dyn %s`", owner, trait,
+                         mname, trait)
+
+    def coerce_dynbox(self, e, ty):
+        """`Box<T>` to `Box<dyn Trait>`: the allocation changes hands.
+
+        The box is copied to a temporary and, when it was a named local, the
+        original is zeroed -- the same move `take(v)` does -- so that only the
+        trait object frees it.
+        """
+        inst = self.unit.instances.get(e.type.base)
+        if e.type.ptr or inst is None or inst[0] != "Box":
+            return e
+        trait = self.unit.dyn_types[ty.base]
+        owner = inst[1][0].base
+        self._check_implements(owner, trait)
+        self.unit.dyn_used.add((trait, owner))
+        tmp = self.new_temp()
+        moved = self.simple_owning_local(e)
+        self.pending.append("%s = %s;" % (e.type.decl(tmp), e.code))
+        if moved is not None:
+            csrc = _c_name(moved[0])
+            self.unit.needs.add("memset")
+            self.pending.append("memset(&%s, 0, sizeof(%s));" % (csrc, csrc))
+            self.live_unregister(moved[0])
+            self.mark_moved(moved[0], self.toks[max(self.i - 1, 0)].line)
+        return Expr("(%s){(void *)%s.ptr, &crust_vtinst_%s_%s}"
+                    % (ty.base, tmp, trait, owner), ty)
+
+    def coerce_fn(self, e, ty):
+        """A closure (or `Box` of one, or a fn pointer) to a closure object.
+
+        By value the object takes ownership: the environment is copied to the
+        heap and a named source is zeroed, as every move here is, so only the
+        object frees it. Behind a `&dyn Fn` it borrows instead -- the data
+        pointer is the closure's own address and nothing is freed.
+        """
+        if e is None or e.type is None or e.type.base == ty.base:
+            return e
+        u = self.unit
+        ret, params = u.fn_boxes[ty.base]
+        et = e.type
+        suffix = ty.base[len("crust_fnbox_"):]
+        pdecl = ", ".join(["void *e"] + [t.decl("a%d" % i)
+                                         for i, t in enumerate(params)])
+        args = "".join(", a%d" % i for i in range(len(params)))
+
+        def thunk(key, callee):
+            name = "crust_fnthunk_%s_%s" % (suffix, key)
+            if name not in u.fn_thunks:
+                u.fn_thunks.add(name)
+                u.fn_sigs[name] = (ret, [RustCType("void", 1)] + list(params))
+                u.statics.add(name)
+                u.emitted.append("static %s(%s) { %s%s; }" % (
+                    ret.decl(name), pdecl,
+                    "" if ret.is_void() else "return ", callee))
+            return name
+
+        owner, via_box = et, None
+        inst = u.instances.get(et.base)
+        if not et.ptr and inst is not None and inst[0] == "Box":
+            owner, via_box = inst[1][0], True
+        if ty.ptr and et.ptr == 1 and not et.array:
+            owner = RustCType(et.base)      # `&closure`: a borrowed view
+        if owner.ptr or owner.array:
+            return e
+        if owner.base in u.closures:
+            fname = u.closures[owner.base][0]
+            env_t = owner.base
+            call = thunk(env_t, "%s((%s *)e%s)" % (fname, env_t, args))
+            drop = "0"
+            if env_t in u.drop_types:
+                dm = u.methods.get((env_t, "drop"))
+                if dm is not None:
+                    drop = "crust_fndrop_" + env_t
+                    if drop not in u.fn_thunks:
+                        u.fn_thunks.add(drop)
+                        u.fn_sigs[drop] = (VOID, [RustCType("void", 1)])
+                        u.statics.add(drop)
+                        u.emitted.append(
+                            "static void %s(void *e) { %s((%s *)e); }"
+                            % (drop, dm.mangled, env_t))
+        elif owner.base in u.fn_ptrs:
+            fp = owner.base
+            env_t = fp
+            call = thunk(fp, "(*(%s *)e)(%s)" % (fp, ", ".join(
+                "a%d" % i for i in range(len(params)))))
+            drop = "0"
+        else:
+            return e
+        if ty.ptr:
+            # `&dyn Fn`: a borrowed view, built in a temporary.
+            if via_box or et.ptr != 1:
+                return e
+            tmp = self.new_temp()
+            self.pending.append("%s = {(void *)(%s), %s, 0};"
+                                % (RustCType(ty.base).decl(tmp), e.code, call))
+            return Expr("&" + tmp, ty)
+        u.needs.add("alloc")
+        u.needs.add("memset")
+        tmp = self.new_temp()
+        if via_box:
+            src = self.new_temp()
+            self.pending.append("%s = %s;" % (et.decl(src), e.code))
+            moved = self.simple_owning_local(e)
+            if moved is not None:
+                csrc = _c_name(moved[0])
+                self.pending.append("memset(&%s, 0, sizeof(%s));"
+                                    % (csrc, csrc))
+                self.live_unregister(moved[0])
+                self.mark_moved(moved[0], self.toks[max(self.i - 1, 0)].line)
+            self.pending.append("%s = (void *)%s.ptr;" % ("void *" + tmp, src))
+        elif et.ptr == 0:
+            moved = self.simple_owning_local(e)
+            self.pending.append("%s *%s = malloc(sizeof(%s));"
+                                % (env_t, tmp, env_t))
+            self.pending.append("*%s = %s;" % (tmp, e.code))
+            if moved is not None:
+                csrc = _c_name(moved[0])
+                self.pending.append("memset(&%s, 0, sizeof(%s));"
+                                    % (csrc, csrc))
+                self.live_unregister(moved[0])
+                self.mark_moved(moved[0], self.toks[max(self.i - 1, 0)].line)
+        else:
+            return e
+        return Expr("(%s){(void *)%s, %s, %s}" % (ty.base, tmp, call, drop),
+                    ty)
+
+    def _dyn_info(self, recv, name):
+        """The trait's signature for `name` if `recv` is a trait object."""
+        t = recv.type
+        if t is None or t.ptr > 1 or t.array or t.base not in self.unit.dyn_types:
+            return None
+        return _dyn_methods(self.unit, self.unit.dyn_types[t.base]).get(name)
+
+    def dyn_call(self, recv, name, args):
+        """`obj.method(args)` on a trait object: through the vtable."""
+        trait = self.unit.dyn_types[recv.type.base]
+        info = _dyn_methods(self.unit, trait).get(name)
+        if info is None:
+            self.err("no method `%s` on `dyn %s`", name, trait)
+        if info.self_kind != "ref":
+            self.err("`%s::%s` takes `self` by value or has no receiver, so "
+                     "it cannot be called on a `dyn %s`", trait, name, trait)
+        obj = recv
+        if recv.type.ptr:
+            obj = Expr("(*%s)" % recv.code, RustCType(recv.type.base))
+        place = self.once(obj)
+        return Expr("%s.vt->%s(%s)" % (
+            place, name, ", ".join(["%s.data" % place] + args)), info.ret)
+
     def parse_cast(self):
         e = self.parse_unary()
         while self.accept("as"):
             ty = self.parse_type()
+            if ty.base in self.unit.dyn_types and not ty.ptr:
+                e = self.coerce_dyn(e, ty)
+                continue
             e = Expr("(%s)(%s)" % (ty.decl(), e.code), ty)
         return e
+
+    def _deref_info(self, ty):
+        """The `deref` / `deref_mut` method of a smart pointer type, if any."""
+        if ty is None or ty.ptr > 1 or ty.array:
+            return None
+        for m in ("deref_mut", "deref"):
+            info = self.unit.methods.get((ty.base, m))
+            if info is not None and info.self_kind == "ref":
+                return info
+        return None
+
+    def auto_deref(self, e):
+        """`*e` for a user type that implements `Deref`/`DerefMut`.
+
+        The result is the place `deref` points at, so it can be read, assigned
+        through or indexed. A smart pointer that is not yet a variable -- the
+        guard returned by `m.lock()` -- is spilled to one first, and released
+        when the statement ends.
+        """
+        info = self._deref_info(e.type)
+        if info is None:
+            return None
+        ret = self.unit.fn_sigs[info.mangled][0]
+        if e.type.ptr == 1:
+            recv = e.code
+        else:
+            code = e.code.strip()
+            if not _is_lvalue(code):
+                tmp = self.new_temp()
+                self.pending.append("%s = %s;" % (e.type.decl(tmp), e.code))
+                if self.owning_free(e.type) is not None:
+                    self.live_register(tmp, e.type)
+                    self.stmt_temps.append((tmp, e.type))
+                code = tmp
+            recv = "&" + _addressable(code)
+        # The pointer goes in a variable and the place is `p[0]`: that is
+        # something C can take the address of, so a method taking `&mut self`
+        # changes the protected value rather than a copy of it.
+        ptr = self.new_temp()
+        self.pending.append("%s = %s(%s);" % (ret.decl(ptr), info.mangled,
+                                              recv))
+        return Expr("%s[0]" % ptr, RustCType(ret.base, max(ret.ptr - 1, 0)))
 
     def parse_unary(self):
         t = self.cur
@@ -2349,13 +2776,23 @@ class Parser:
             if t.val == "&":
                 self.accept("mut")
                 e = self.parse_unary()
-                if e.type is not None and e.type.base in self.unit.slices:
+                if e.type is not None and not e.type.ptr and (
+                        e.type.base in self.unit.slices
+                        or (e.type.base in self.unit.dyn_types
+                            and e.type.base not in self.unit.dyn_boxes)):
                     return e            # already a fat pointer
                 return Expr("&%s" % e.code,
                             RustCType(e.type.base, e.type.ptr + 1)
                             if e.type else None)
             e = self.parse_unary()
             if t.val == "*":
+                if e.type is not None and not e.type.ptr \
+                        and self._deref_info(e.type) is not None:
+                    return self.auto_deref(e)
+                if e.type is not None and not e.type.ptr \
+                        and e.type.base in self.unit.dyn_types \
+                        and e.type.base not in self.unit.dyn_boxes:
+                    return e          # `*p` on a `*const dyn T`: the object
                 if e.type is not None and not e.type.ptr \
                         and self.is_refcopy(e.code.strip()):
                     return e          # `*x` on a `&T` bound as a copy
@@ -2407,6 +2844,29 @@ class Parser:
                     self._move_by_value_args(cps, cargs, caexprs)
                     e = self.call_closure(e, cargs, catys)
                     continue
+                if e.type is not None and e.type.ptr <= 1 \
+                        and e.type.base in self.unit.fn_boxes:
+                    fret, fptys = self.unit.fn_boxes[e.type.base]
+                    fargs = []
+                    while not self.at(")", "punc"):
+                        want = fptys[len(fargs)] if len(fargs) < len(fptys) \
+                            else None
+                        fargs.append(self.parse_expr_as(want).code)
+                        if not self.accept(","):
+                            break
+                    self.expect(")")
+                    if e.type.ptr:
+                        obj = "(*%s)" % self.once(e)
+                    elif _is_lvalue(e.code):
+                        obj = e.code
+                    else:
+                        obj = self.new_temp()
+                        self.pending.append("%s = %s;" % (e.type.decl(obj),
+                                                          e.code))
+                        self.live_register(obj, e.type)
+                    e = Expr("%s.call(%s)" % (
+                        obj, ", ".join(["%s.env" % obj] + fargs)), fret)
+                    continue
                 generic = e.code in self.unit.generic_fns
                 targs = e.targs
                 # A locally defined function of the same name always wins:
@@ -2443,6 +2903,9 @@ class Parser:
                         and e.type.base in self.unit.fn_ptrs:
                     sig = self.unit.fn_ptrs[e.type.base]
                 params = (sig[1] if sig else []) or []
+                over = self._from_overloads(e.code)
+                if over is not None:
+                    params = []         # no one signature to hint with
                 if not params and e.code in self.unit.variants:
                     # a variant's payload is its signature: `Box::new(3)`
                     # as a `Box<i64>` payload is `Box_long_new`
@@ -2460,12 +2923,29 @@ class Parser:
                     if not self.accept(","):
                         break
                 self.expect(")")
+                if sig is None and not generic and e.from_path \
+                        and e.type is None:
+                    fixed = self._infer_generic_assoc(e.code, atypes)
+                    if fixed is not None:
+                        e = Expr(fixed, None)
+                        sig = self.fn_sigs.get(fixed)
+                        params = (sig[1] if sig else []) or []
+                if over is not None:
+                    chosen = self._pick_from(e.code, over, atypes)
+                    e = Expr(chosen.mangled, e.type)
+                    sig = self.fn_sigs.get(chosen.mangled)
+                    params = (sig[1] if sig else []) or []
                 self._move_by_value_args(params, args, aexprs)
                 if generic:
                     # No turbofish: infer the type arguments from what was
                     # actually passed, then instantiate.
                     e = Expr(self.instantiate_fn(
                         e.code, self.infer_type_args(e.code, atypes)), None)
+                    sig = self.fn_sigs.get(e.code)
+                    # Only now are the parameter types known, so only now can
+                    # a by-value argument that owns something be seen to move.
+                    self._move_by_value_args((sig[1] if sig else []) or [],
+                                             args, aexprs)
                 if e.code in self.unit.variants and \
                         self._payload_of(e.code) is not None:
                     e = self.data_variant_literal(e.code, args)
@@ -2591,18 +3071,23 @@ class Parser:
                 self.err("`?` on a `Result` needs the enclosing function to "
                          "return a `Result`")
             _, ret_err = self.unit.results[ret.base]
+            conv = "%s.error" % tmp
             if ret_err.decl() != err.decl():
-                self.err("`?` cannot convert error type `%s` to `%s`; Crust "
-                         "has no `From` conversions", err.decl(),
-                         ret_err.decl())
+                # `?` converts the error with `From`, as Rust does.
+                via = self.unit.from_impl(ret_err, err)
+                if via is None:
+                    self.err("`?` cannot convert error type `%s` to `%s`; "
+                             "add `impl From<%s> for %s`", err.decl(),
+                             ret_err.decl(), err.decl(), ret_err.decl())
+                conv = "%s(%s.error)" % (via.mangled, tmp)
             # Built before it is appended: checking an `ensures` parses the
             # clause, which rebinds `self.pending`, and `self.pending.append`
             # would already be bound to the list that replaced.
             stmt = ("if (!%s.ok) { %s%sreturn (%s){.ok = 0, .error = "
-                    "%s.error}; }"
+                    "%s}; }"
                     % (tmp, self._early_ensures("(%s){.ok = 0, .error = "
-                                                "%s.error}" % (ret.base, tmp)),
-                       self._early_exit_drops(), ret.base, tmp))
+                                                "%s}" % (ret.base, conv)),
+                       self._early_exit_drops(), ret.base, conv))
             self.pending.append(stmt)
             if ok.is_void():
                 return Expr("(void)0", VOID)
@@ -3522,6 +4007,11 @@ class Parser:
     def index(self, recv, idx):
         """Lower `recv[idx]`, reaching through a slice's data pointer."""
         ty = recv.type
+        if ty is not None and not ty.array and ty.base in self.unit.structs \
+                and ty.base not in self.unit.slices \
+                and self._deref_info(ty) is not None:
+            recv = self.auto_deref(recv)
+            ty = recv.type
         # A slice value, not an array *of* slices: `rows[0]` on
         # `[&[i32]; 2]` indexes the array. Checking the element type first
         # read it as `rows.ptr[0]`.
@@ -3586,6 +4076,10 @@ class Parser:
         pointer type lowers to `->`.
         """
         ty = recv.type
+        if ty is not None and ty.base in self.unit.structs \
+                and self.unit.field_type(ty.base, field) is None \
+                and self._deref_info(ty) is not None:
+            return self.field_access(self.auto_deref(recv), field)
         if ty is not None and ty.ptr == 1:
             code = "%s->%s" % (recv.code, field)
         elif ty is not None and ty.ptr > 1:
@@ -3631,6 +4125,88 @@ class Parser:
         self.unit.needs.add("fmath:" + full)
         return full
 
+    def _infer_generic_assoc(self, code, atypes):
+        """Resolve `Name::func(args)` on a generic struct with no turbofish.
+
+        `Vec::new()` and `Box::new(x)` name a generic without saying which
+        instantiation. Rust infers it; here it comes from the type expected
+        at the call (`let v: Vec<i32> = Vec::new()`), or else from the
+        argument types, where a parameter declared as a bare type parameter
+        (`fn new(value: T)`) binds that parameter to its argument's type.
+        Returns the C name of the instantiated function, or None.
+        """
+        if code in self.unit.fn_sigs or code in self.unit.generic_fns:
+            return None
+        for gname in sorted(self.unit.generic_structs, key=len, reverse=True):
+            if not code.startswith(gname + "_"):
+                continue
+            method = code[len(gname) + 1:]
+            want = self.target
+            if want is not None and not want.ptr and not want.array:
+                inst = self.unit.instances.get(want.base)
+                if inst is not None and inst[0] == gname:
+                    return "%s_%s" % (want.base, method)
+            gparams = self.unit.generic_structs[gname][0]
+            for iparams, owner, toks in self.unit.generic_impls:
+                if owner != gname or len(iparams) != len(gparams):
+                    continue
+                bound = _bind_assoc_params(iparams, toks, method, atypes)
+                if bound is not None and all(q in bound for q in iparams):
+                    ct = self.instantiate_struct(
+                        gname, [bound[q] for q in iparams])
+                    return "%s_%s" % (ct.base, method)
+        return None
+
+    def _from_overloads(self, code):
+        """The `From` impls behind a call to `T_from`, if there are several."""
+        if code.endswith("_from"):
+            lst = self.unit.from_impls.get(code[:-5])
+            if lst and len(lst) > 1:
+                return lst
+        return None
+
+    def _pick_from(self, code, impls, atypes):
+        """Choose among several `From` impls by the argument's type."""
+        got = atypes[0] if atypes else None
+        owner = code[:-5]
+        if got is not None:
+            for src, info in impls:
+                if src.decl() == got.decl():
+                    return info
+        self.err("no `From<%s>` for `%s`; it implements From for: %s",
+                 got.decl() if got is not None else "this argument", owner,
+                 ", ".join("`%s`" % src.decl() for src, _ in impls))
+
+    _NUMERIC = frozenset((
+        "char", "signed char", "unsigned char", "short", "unsigned short",
+        "int", "unsigned int", "long", "unsigned long", "long long",
+        "unsigned long long", "float", "double", "_Bool", "crust_char"))
+
+    def into_conversion(self, recv):
+        """`recv.into()`: the target comes from the type expected here.
+
+        Rust infers `T` in `Into<T>` from context; so does this, from the
+        annotation, parameter, field or return type being filled. It finds
+        `impl From<recv's type> for T`, or a lossless-looking numeric
+        conversion, or the identity.
+        """
+        want = self.target
+        if want is None:
+            self.err("cannot tell what `.into()` converts to; annotate the "
+                     "target (`let x: T = ..`) or call `T::from(..)`")
+        have = recv.type
+        if have.decl() == want.decl():
+            return recv                                 # `T: From<T>`
+        info = self.unit.from_impl(want, have)
+        if info is not None:
+            return Expr("%s(%s)" % (info.mangled, recv.code), want)
+        if not have.ptr and not have.array and not want.ptr \
+                and not want.array and have.base in self._NUMERIC \
+                and want.base in self._NUMERIC:
+            return Expr("((%s)%s)" % (want.decl(), recv.code), want)
+        self.err("no `From<%s>` for `%s`; add `impl From<%s> for %s`",
+                 have.decl(), want.decl(), have.decl(), want.decl())
+
     def parse_method_call(self, recv, name):
         """Lower `recv.method(args)` to the free function `Type_method`."""
         self.expect("(")
@@ -3647,6 +4223,11 @@ class Parser:
             ch.ops = [(name, [])]
             return self.iter_value(ch)
         self.method_targs = None
+        if recv.type is not None and not recv.type.array \
+                and recv.type.base in self.unit.structs \
+                and (recv.type.base, name) not in self.unit.methods \
+                and self._deref_info(recv.type) is not None:
+            recv = self.auto_deref(recv)
         if recv.type is not None and not recv.type.ptr \
                 and not recv.type.array \
                 and recv.type.base in ("crust_char", "unsigned char") \
@@ -3676,6 +4257,8 @@ class Parser:
         info = None
         if recv.type is not None:
             info = self.unit.methods.get((recv.type.base, name))
+            if info is None:
+                info = self._dyn_info(recv, name)
         params = [t for _, t in info.params] if info is not None else []
         args, aexprs = [], []
         while not self.at(")", "punc"):
@@ -3758,7 +4341,12 @@ class Parser:
             self.err("cannot infer the type of the receiver of `.%s()`; "
                      "annotate it", name)
         owner = recv.type.base
+        if owner in self.unit.dyn_types and recv.type.ptr <= 1 \
+                and not recv.type.array:
+            return self.dyn_call(recv, name, args)
         info = self.unit.methods.get((owner, name))
+        if info is None and name == "into" and not args:
+            return self.into_conversion(recv)
         if info is None and name in _ITERATOR_METHODS:
             self.err("`.%s()` is supported only in the subject of a `for` "
                      "loop -- `for x in v.iter().rev()` -- since Crust has no "
@@ -3803,7 +4391,7 @@ class Parser:
         while not self.at("}", "punc"):
             field = self.expect_ident()
             self.expect(":")
-            val = self.parse_expr()
+            val = self.parse_expr_as(self.unit.field_type(name, field))
             self.reject_borrow(val, self.unit.field_type(name, field),
                                "the field `%s`" % field)
             known = self.unit.structs.get(name) is not None
@@ -4540,6 +5128,19 @@ class Parser:
         out.line_at(close.line, "}", indent)
 
     def parse_stmt(self, out, indent, tail_returns):
+        mark = len(self.stmt_temps)
+        self._parse_stmt(out, indent, tail_returns)
+        # A guard that was only a temporary (`*m.lock() += 1;`) is released
+        # here, at the end of its statement, not at the end of the block --
+        # otherwise the next `m.lock()` in the same block would spin forever.
+        while len(self.stmt_temps) > mark:
+            name, ty = self.stmt_temps.pop()
+            self.live_unregister(name)
+            info = self.unit.methods.get((ty.base, "drop"))
+            if info is not None:
+                out.write(" %s(&%s);" % (info.mangled, name))
+
+    def _parse_stmt(self, out, indent, tail_returns):
         if self.at("#", "punc"):
             # Attributes on a statement: `#[allow(..)]` and friends are
             # ignored as they are on items; `#[invariant]`/`#[variant]`
@@ -4588,6 +5189,13 @@ class Parser:
                 # temporary holding the tuple and one binding per element, so
                 # the initialiser is evaluated exactly once.
                 self.parse_tuple_let(out, indent, t)
+                return
+            if self.at("[", "punc") or (
+                    self.cur.kind == "ident"
+                    and self.peek().val in ("{", "(", "::")):
+                # `let Point { x, y } = p;`, `let [a, b] = pair;`,
+                # `let Some(v) = o else { return };` -- a general pattern.
+                self.parse_pattern_let(out, indent, t)
                 return
             name = self.expect_ident()
             ty = None
@@ -6115,12 +6723,167 @@ class Parser:
                      "subject if its type cannot be inferred")
         return binding, subject, self.unit.options[subject.type.base]
 
+    # -- `let` with a general pattern ----------------------------------------
+    #
+    # `if let`, `while let` and `let` used to take only `Some(name)`. A
+    # pattern comes *before* the `=`, but how to test it depends on the type
+    # of what follows the `=`, so these collect the pattern's tokens, parse the
+    # subject, and only then run `pattern_test` -- the same lowering a `match`
+    # arm uses -- over those tokens.
+
+    def _pattern_tokens(self, stops):
+        """Consume pattern tokens up to a top-level `stops` token; return them."""
+        depth, start = 0, self.i
+        while True:
+            tk = self.cur
+            if tk.kind == "eof":
+                self.err("unterminated pattern")
+            if tk.kind == "punc" and tk.val in ("(", "[", "{"):
+                depth += 1
+            elif tk.kind == "punc" and tk.val in (")", "]", "}"):
+                depth -= 1
+            elif depth == 0 and tk.kind in ("punc", "kw") and tk.val in stops:
+                if self.i == start:
+                    self.err("expected a pattern")
+                return self.toks[start:self.i]
+            self.next()
+
+    def _sub_pattern(self, pat, subj, ty):
+        """`pattern_test` over collected pattern tokens: (condition, binds)."""
+        if ty is None:
+            self.err("cannot infer the type of the value this pattern tests; "
+                     "annotate it")
+        p = Parser(list(pat) + [RustToken("eof", "", pat[-1].line)],
+                   self.unit, self.tysubst)
+        p.scopes = self.scopes
+        p.aliases = self.aliases
+        p.impl_type = self.impl_type
+        cond, binds = p.pattern_test(subj, ty)
+        if p.cur.kind != "eof":
+            p.err("unexpected %r in pattern", p.cur.val)
+        return cond, binds
+
+    def _simple_some_let(self, k):
+        """True if the tokens from offset `k` are `let Some(name) =`."""
+        v = [self.peek(k + j).val for j in range(6)]
+        return (v[0] == "let" and v[1] == "Some" and v[2] == "("
+                and self.peek(k + 3).kind == "ident" and v[4] == ")"
+                and v[5] == "=")
+
+    def _subject_temp(self, e):
+        """(place to test, declaration of it or ""): a copy of `e` in a
+        temporary, except for an array, which C cannot copy by assignment and
+        which is tested in place."""
+        if e.type is not None and e.type.array:
+            return e.code.strip(), ""
+        tmp = self.new_temp()
+        if e.type is None:
+            return tmp, ""
+        return tmp, "%s = %s;" % (e.type.decl(tmp), e.code)
+
+    def _binding_decls(self, binds):
+        """C declarations for pattern bindings, and the `(name, type, ..)`
+        tuples `emit_bound_block` declares in the block's own frame."""
+        decls, scoped = [], []
+        for bname, bty, place in binds:
+            if bname == "_":
+                continue
+            decls.append("%s = %s;" % (bty.decl(_c_name(bname)), place))
+            scoped.append((bname, bty, False, False))
+        return " ".join(decls), scoped
+
+    def parse_pattern_let(self, out, indent, t):
+        """`let PATTERN = e;` and `let PATTERN = e else { .. };`.
+
+        The value is held in a temporary and each binding is a copy of a
+        place in it, as for `let (a, b) = ..`. A pattern that can fail to
+        match needs the `else` block, which must leave the scope, so the
+        bindings are only reached when the pattern matched.
+        """
+        pat = self._pattern_tokens(("=", ":"))
+        want = self.parse_type() if self.accept(":") else None
+        self.expect("=")
+        init = self.parse_expr_as(want)
+        ty = want or init.type
+        tmp, setup = self._subject_temp(Expr(init.code, ty))
+        cond, binds = self._sub_pattern(pat, tmp, ty)
+        self.emit_pending(out, t.line, indent)
+        if setup:
+            out.line_at(t.line, setup, indent)
+        if self.accept("else"):
+            out.write(" if (!(%s))" % cond)
+            self.parse_block(out, indent, False)
+        elif cond != "1":
+            self.err("this `let` pattern can fail to match; add an `else` "
+                     "block that leaves the scope")
+        self.expect(";")
+        for bname, bty, place in binds:
+            if bname == "_":
+                continue
+            self.declare(bname, bty)
+            out.write(" %s = %s;" % (bty.decl(_c_name(bname)), place))
+
+    def _parse_if_let_pattern(self, out, indent, tail_returns):
+        """`if let PATTERN = e { .. } else { .. }` for any pattern."""
+        t = self.expect("if")
+        self.expect("let")
+        pat = self._pattern_tokens(("=",))
+        self.expect("=")
+        subject = self.parse_cond()
+        tmp, setup = self._subject_temp(subject)
+        cond, binds = self._sub_pattern(pat, tmp, subject.type)
+        self.emit_pending(out, t.line, indent)
+        out.line_at(t.line, "{ " + setup, indent)
+        out.write(" if (%s)" % cond)
+        decl, scoped = self._binding_decls(binds)
+        self.emit_bound_block(out, indent, decl, tail_returns=tail_returns,
+                              binds=scoped)
+        if self.accept("else"):
+            out.write(" else")
+            if self.at("if", "kw"):
+                if self.peek().val == "let":
+                    self.parse_if_let(out, indent, tail_returns)
+                else:
+                    self.parse_if_tail(out, indent, tail_returns)
+            else:
+                self.parse_block(out, indent, tail_returns)
+        out.write(" }")
+
+    def _parse_while_let_pattern(self, out, indent, label, clauses):
+        """`while let PATTERN = e { .. }` for any pattern."""
+        t = self.expect("while")
+        head = self.loop_checks(clauses) if clauses else []
+        self.expect("let")
+        pat = self._pattern_tokens(("=",))
+        self.expect("=")
+        subject = self.parse_cond()
+        tmp, setup = self._subject_temp(subject)
+        cond, binds = self._sub_pattern(pat, tmp, subject.type)
+        out.line_at(t.line, "for (;;) {", indent)
+        for stmt in head:
+            out.write(" " + stmt)
+        work = self.pending
+        self.pending = []
+        for stmt in work:
+            out.write(" " + stmt)
+        if setup:
+            out.write(" " + setup)
+        out.write(" if (!(%s)) break;" % cond)
+        decl, scoped = self._binding_decls(binds)
+        self.loop_enter(label)
+        self.emit_bound_block(out, indent, decl, kind="loop", binds=scoped)
+        out.write(" }")
+        self.loop_exit(out)
+
     def parse_if_let(self, out, indent, tail_returns):
         """Lower `if let Some(x) = e { .. } else { .. }`.
 
         The subject is held in a temporary so it is evaluated once, and the
-        whole construct is wrapped in a block to scope that temporary.
+        whole construct is wrapped in a block to scope that temporary. Any
+        other pattern goes through `_parse_if_let_pattern`.
         """
+        if not self._simple_some_let(1):
+            return self._parse_if_let_pattern(out, indent, tail_returns)
         t = self.expect("if")
         binding, subject, elem = self.parse_let_pattern()
         tmp = self.new_temp()
@@ -6144,6 +6907,8 @@ class Parser:
 
     def parse_while_let(self, out, indent, label=None, clauses=None):
         """Lower `while let Some(x) = e { .. }` to a loop with a break."""
+        if not self._simple_some_let(1):
+            return self._parse_while_let_pattern(out, indent, label, clauses)
         t = self.expect("while")
         head = self.loop_checks(clauses) if clauses else []
         binding, subject, elem = self.parse_let_pattern()
@@ -6229,9 +6994,15 @@ class Parser:
         so the lowering can be chosen. Anything it is unsure about answers
         False: the chain handles every pattern the switch does.
         """
-        if ty is not None and (ty.ptr or ty.base in self.unit.options
+        if ty is not None and (ty.ptr or ty.array
+                               or ty.base in self.unit.options
                                or ty.base in self.unit.results
-                               or ty.base in self.unit.tuples):
+                               or ty.base in self.unit.tuples
+                               or ty.base in self.unit.slices
+                               or (ty.base in self.unit.structs
+                                   and ty.base not in self.unit.data_enums)):
+            # A plain struct, a slice or an array is matched by struct and
+            # slice patterns, which are tests over places, not `case` labels.
             return False
         enum_name = ty.base if ty is not None else None
         toks, j = self.toks, self.i
@@ -6249,8 +7020,8 @@ class Parser:
                     return True
                 if kind == "punc" and v in ("(", "[", "{"):
                     depth += 1
-                    if depth > 1:
-                        return False        # a nested payload pattern
+                    if depth > 1 or v == "[":
+                        return False        # a nested payload, or a slice
                 elif kind == "punc" and v in (")", "]", "}"):
                     depth -= 1
                 elif depth == 0 and kind == "punc" and v == "=>":
@@ -6686,6 +7457,8 @@ class Parser:
             return "(%s == %s)" % (subj, val), []
         if t.val == "(" and t.kind == "punc":
             return self._tuple_pattern(subj, ty)
+        if t.val == "[" and t.kind == "punc":
+            return self._slice_pattern(subj, ty)
         if t.kind not in ("ident", "kw"):
             self.err("unsupported pattern %r", t.val or "<eof>")
         # A path, possibly with a payload: a variant, `Some`/`None`,
@@ -6738,6 +7511,9 @@ class Parser:
             if self.at("(", "punc") or self.at("{", "punc"):
                 self.err("`%s` carries no data to destructure", flat)
             return "(%s == %s)" % (subj, flat), []
+        sname = self._struct_of(name, ty)
+        if sname is not None:
+            return self._struct_pattern(subj, sname, ty)
         if path or self.at("(", "punc") or self.at("{", "punc"):
             self.err("`%s` is not a variant of `%s`", name,
                      ty.decl() if ty is not None else "this value")
@@ -6814,6 +7590,202 @@ class Parser:
             if not self.accept(","):
                 break
         self.expect(")")
+        return cond, binds
+
+    # -- struct and slice patterns ---------------------------------------
+
+    def _struct_of(self, name, ty):
+        """The plain struct a pattern's path names, or None.
+
+        `name` is the already-flattened path. A generic struct is matched by
+        the instantiation being tested (`Wrapper { v }` against a
+        `Wrapper<i32>`), since the mangled name is not what was written. A
+        bare name only counts when it is followed by a payload, or is a unit
+        struct: otherwise it is a binding that happens to look like a type.
+        """
+        base = ty.base if ty is not None else None
+        sname = None
+        if name in self.unit.generic_structs and base is not None:
+            inst = self.unit.instances.get(base)
+            if inst is not None and inst[0] == name:
+                sname = base
+        if sname is None and name in self.unit.structs \
+                and name not in self.unit.data_enums:
+            sname = name
+        if sname is None:
+            return None
+        if self.at("(", "punc") or self.at("{", "punc") \
+                or sname in self.unit.unit_structs:
+            return sname
+        return None
+
+    def _struct_pattern(self, subj, sname, ty):
+        """`S { a, b: p, .. }`, `S(p, q)` or a unit struct, against a struct.
+
+        Each named field is a place inside the value under test, so a
+        sub-pattern is just `pattern_test` on that place, and a shorthand or
+        `ref`/`mut` binding aliases it exactly as a payload binding does. A
+        pointer to the struct is looked through, which is Rust's match
+        ergonomics for `&S`.
+        """
+        if sname in self.unit.unit_structs and not (
+                self.at("(", "punc") or self.at("{", "punc")):
+            return "1", []
+        fields = self.unit.structs[sname]
+        place = subj
+        if ty is not None and ty.ptr == 1 and not ty.array:
+            place = "(*%s)" % subj
+        cond, binds = "1", []
+        if self.accept("("):
+            if sname not in self.unit.tuple_structs:
+                self.err("`%s` is not a tuple struct; use `%s { .. }`",
+                         sname, sname)
+            i = 0
+            while not self.at(")", "punc"):
+                if self.accept(".."):
+                    break
+                if i >= len(fields):
+                    self.err("`%s` has only %d field%s", sname, len(fields),
+                             "" if len(fields) == 1 else "s")
+                fname, fty = fields[i]
+                c, b = self.pattern_test("%s.%s" % (place, fname), fty)
+                cond = _and_cond(cond, c)
+                binds.extend(b)
+                i += 1
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            return cond, binds
+        self.expect("{")
+        by_name = dict(fields)
+        while not self.at("}", "punc"):
+            if self.accept(".."):
+                break
+            while self.cur.val in ("ref", "mut") \
+                    and self.peek().kind == "ident":
+                self.next()
+            fname = self.expect_ident()
+            if fname not in by_name:
+                self.err("`%s` has no field `%s`", sname, fname)
+            fplace = "%s.%s" % (place, fname)
+            if self.accept(":"):
+                c, b = self.pattern_test(fplace, by_name[fname])
+            else:
+                c, b = "1", [(fname, by_name[fname], fplace)]
+            cond = _and_cond(cond, c)
+            binds.extend(b)
+            if not self.accept(","):
+                break
+        self.expect("}")
+        return cond, binds
+
+    def _slice_shape(self):
+        """(elements before `..`, after it, has `..`) for the `[` at the cursor.
+
+        A read-only scan: element `k` of a slice pattern is `i` from the front
+        before the rest and `len - j` from the back after it, and which it is
+        depends on how many elements follow the `..`, which a single forward
+        parse cannot know.
+        """
+        toks, j, depth = self.toks, self.i + 1, 0
+        elems, cur, rest_at = [], [], None
+        while True:
+            tk = toks[j]
+            if tk.kind == "eof":
+                self.err("unterminated slice pattern")
+            if tk.kind == "punc" and tk.val in ("(", "[", "{"):
+                depth += 1
+            elif tk.kind == "punc" and tk.val in (")", "]", "}"):
+                if depth == 0:
+                    break
+                depth -= 1
+            if depth == 0 and tk.kind == "punc" and tk.val == ",":
+                elems.append(cur)
+                cur = []
+            else:
+                cur.append(tk)
+            j += 1
+        if cur:
+            elems.append(cur)
+        for k, e in enumerate(elems):
+            vals = [x.val for x in e]
+            if vals == [".."] or (len(vals) == 3 and vals[1] == "@"
+                                  and vals[2] == ".."):
+                if rest_at is not None:
+                    self.err("a slice pattern may contain only one `..`")
+                rest_at = k
+        if rest_at is None:
+            return len(elems), 0, False
+        return rest_at, len(elems) - rest_at - 1, True
+
+    def _slice_pattern(self, subj, ty):
+        """`[a, b]`, `[first, .., last]`, `[head, rest @ ..]` against a slice.
+
+        A slice is a `{ptr, len}` pair, so the pattern is a length test plus
+        a sub-pattern per element at `ptr[i]` (or `ptr[len - j]` after the
+        `..`). On an array the length is a constant, so a mismatch is
+        decided here and now. `rest @ ..` binds a slice of the middle; on an
+        array that is a slice rather than a shorter array, which reads the
+        same and avoids copying.
+        """
+        if ty is None:
+            self.err("cannot infer the type a slice pattern matches")
+        place = subj
+        if ty.ptr == 1 and not ty.array and ty.base in self.unit.slices:
+            place = "(*%s)" % subj
+        if ty.array and not ty.ptr:
+            elem = RustCType(ty.base, 0, ty.array[1:] or None)
+            n = _literal_count(ty.array[0], self.unit)
+            if n is None:
+                self.err("a slice pattern on an array needs a constant length")
+            data, length, fixed = place, str(n), n
+        elif ty.base in self.unit.slices and not ty.array:
+            elem = self.unit.slices[ty.base]
+            data, length, fixed = place + ".ptr", place + ".len", None
+        else:
+            self.err("a slice pattern needs a slice or an array to match "
+                     "against, not `%s`", ty.decl())
+        before, after, has_rest = self._slice_shape()
+        need = before + after
+        if fixed is not None:
+            if (has_rest and fixed < need) or (not has_rest and fixed != need):
+                self.err("this pattern covers %s%d element%s, but the array "
+                         "has %d", "at least " if has_rest else "", need,
+                         "" if need == 1 else "s", fixed)
+            cond = "1"
+        else:
+            cond = "(%s %s %d)" % (length, ">=" if has_rest else "==", need)
+        self.expect("[")
+        binds, i, from_end, seen_rest = [], 0, after, False
+        while not self.at("]", "punc"):
+            rest_name = None
+            if self.at("..", "punc") or (
+                    self.cur.kind == "ident" and self.peek().val == "@"
+                    and self.toks[self.i + 2].val == ".."):
+                if self.cur.kind == "ident":
+                    rest_name = self.next().val
+                    self.next()                         # `@`
+                self.next()                             # `..`
+                seen_rest = True
+                if rest_name is not None and rest_name != "_":
+                    sty = self.unit.slice_type(elem)
+                    start = "%s + %d" % (
+                        data if fixed is None else "&%s[0]" % data, before)
+                    binds.append((rest_name, sty, "(%s){%s, %s - %d}" % (
+                        sty.base, start, length, need)))
+            else:
+                if not seen_rest:
+                    idx = str(i)
+                    i += 1
+                else:
+                    idx = "%s - %d" % (length, from_end)
+                    from_end -= 1
+                c, b = self.pattern_test("%s[%s]" % (data, idx), elem)
+                cond = _and_cond(cond, c)
+                binds.extend(b)
+            if not self.accept(","):
+                break
+        self.expect("]")
         return cond, binds
 
     def parse_arm_body(self, out, indent, tail_returns):
@@ -6907,7 +7879,10 @@ class Parser:
         self.expect(":")
         ty = self.parse_type()
         self.expect("=")
-        init = self.parse_expr()
+        # The declared type is the initialiser's target, so that
+        # `static M: Mutex<i64> = Mutex::new(0)` builds a `Mutex<i64>` rather
+        # than the `Mutex<i32>` its literal would suggest.
+        init = self.parse_expr_as(ty)
         self.expect(";")
         return kw, name, ty, init
 
@@ -7326,7 +8301,11 @@ class Parser:
         if self.accept("->"):
             ret = self.parse_type()
         self.skip_where()
-        return start, MethodInfo(owner, name, ret, self_kind, params)
+        info = MethodInfo(owner, name, ret, self_kind, params)
+        if self.impl_trait == "From" and name == "from" \
+                and self_kind == "none" and len(params) == 1:
+            self.unit.note_from(info, params[0][1])
+        return start, info
 
     def skip_to_body_end(self):
         """Skip a `{ ... }` body, used when only collecting signatures."""
@@ -7448,10 +8427,15 @@ class Parser:
         ret = VOID
         if self.accept("->"):
             if self.at("impl", "kw"):
-                self.err("returning `impl Trait` (such as a closure) is not "
-                         "supported; pass the closure in as a generic "
-                         "`F: Fn(..)` parameter instead")
-            ret = self.parse_type()
+                self.next()
+                if self.cur.val not in ("Fn", "FnMut", "FnOnce"):
+                    self.err("returning `impl %s` is not supported; only "
+                             "`impl Fn(..)` / `FnMut` / `FnOnce` can be "
+                             "returned", self.cur.val)
+                self.next()
+                ret = self.parse_fn_bound_rest()
+            else:
+                ret = self.parse_type()
         self.skip_where()
         return start, name, params, ret
 
@@ -8083,6 +9067,37 @@ def _split_range(toks):
             hi = toks[k + 1:] or None
             return toks[:k], hi, t.val == "..="
     return None
+
+
+def _atomic_helpers():
+    """C for the `crust_atomic_*` helpers: one locked instruction apiece.
+
+    x86-64, where ShivyCX runs. `lock xadd`, `xchg` (implicitly locked) and
+    `lock cmpxchg` are full barriers, which is why every ordering can be
+    treated as sequentially consistent. A load is a volatile read followed by
+    a compiler barrier: x86 loads are already atomic and acquire-ordered, but
+    the compiler must not keep the value in a register across a spin loop.
+    """
+    out = []
+    for w, cty, sfx in ((32, "unsigned int", "l"), (64, "unsigned long", "q")):
+        out.append(
+            "static inline %(t)s crust_atomic_load%(w)d(%(t)s *p) { "
+            "%(t)s v = *(volatile %(t)s *)p; "
+            "__asm__ volatile(\"\" : : : \"memory\"); return v; } "
+            "static inline %(t)s crust_atomic_xchg%(w)d(%(t)s *p, %(t)s v) { "
+            "__asm__ volatile(\"xchg%(s)s %%0, %%1\" : \"+r\"(v), \"+m\"(*p) "
+            ": : \"memory\"); return v; } "
+            "static inline %(t)s crust_atomic_xadd%(w)d(%(t)s *p, %(t)s v) { "
+            "__asm__ volatile(\"lock xadd%(s)s %%0, %%1\" : \"+r\"(v), "
+            "\"+m\"(*p) : : \"memory\"); return v; } "
+            "static inline %(t)s crust_atomic_cas%(w)d(%(t)s *p, %(t)s e, "
+            "%(t)s n) { %(t)s old = e; "
+            "__asm__ volatile(\"lock cmpxchg%(s)s %%2, %%1\" : \"+a\"(old), "
+            "\"+m\"(*p) : \"r\"(n) : \"memory\", \"cc\"); return old; }"
+            % {"t": cty, "w": w, "s": sfx})
+    out.append("static inline void crust_atomic_pause(void) { "
+               "__asm__ volatile(\"pause\" : : : \"memory\"); }")
+    return " ".join(out)
 
 
 _CHAR_UTF8 = (
@@ -10107,6 +11122,13 @@ def _merge_unit(dst, src):
     dst.unit_structs |= src.unit_structs
     dst.generic_impls.extend(src.generic_impls)
     dst.trait_impls.extend(src.trait_impls)
+    dst.dyn_types.update(src.dyn_types)
+    dst.dyn_boxes.update(src.dyn_boxes)
+    dst.fn_boxes.update(src.fn_boxes)
+    for owner, lst in src.from_impls.items():
+        have = {t.decl() for t, _ in dst.from_impls.get(owner, ())}
+        dst.from_impls.setdefault(owner, []).extend(
+            x for x in lst if x[0].decl() not in have)
     dst.macros.update(src.macros)
 
 
@@ -10310,7 +11332,8 @@ def _needs_drop(unit, ty, drops):
         return False
     if ty.base == "String":
         return True
-    if ty.base in drops:
+    if ty.base in drops or ty.base in unit.dyn_boxes \
+            or ty.base in unit.fn_boxes:
         return True
     inst = unit.instances.get(ty.base)
     return bool(inst and _OWNING_FREE.get(inst[0]))
@@ -10320,7 +11343,8 @@ def _field_free(unit, ty, drops):
     """The C function that frees a by-value field, or None."""
     if not _needs_drop(unit, ty, drops):
         return None
-    if ty.base in drops:
+    if ty.base in drops or ty.base in unit.dyn_boxes \
+            or ty.base in unit.fn_boxes:
         mname = "drop"
     elif ty.base == "String":
         mname = "free_buf"
@@ -10349,12 +11373,15 @@ def compute_drop_glue(unit):
     other -- the symbol is shared, the order is not.
     """
     user = set(owner for trait, owner, _t in unit.trait_impls
-               if trait == "Drop")
+               if trait == "Drop") | set(unit.dyn_boxes) \
+        | set(unit.fn_boxes)
     # A core instance (`Vec_int`) already has its own free method and must
     # not be given a synthesized one; it only ever appears as a field.
     core = set(n for n in unit.structs if n in unit.instances
                and _OWNING_FREE.get(unit.instances[n][0]))
-    drops = set(user)
+    # An instance of a generic `impl<T> Drop` met while the items were still
+    # being read is already in `drop_types`; keep it.
+    drops = set(user) | set(unit.drop_types)
     for _round in range(len(unit.structs) + 1):
         grew = False
         for name in unit.structs:
@@ -10397,7 +11424,7 @@ def compute_drop_glue(unit):
             if fn is not None:
                 glue.append("%s(&self->%s);" % (fn, fname))
         unit.drop_glue[name] = glue
-        if name in user:
+        if name in user or (name, "drop") in unit.methods:
             # The user's own `fn drop` supplies the body; the glue is
             # appended to it when it is emitted, so `T_drop` stays the one
             # complete destructor -- which is what a C++ member epilogue
@@ -10535,6 +11562,154 @@ def emit_trait_defaults(unit):
                 unit.emitted.append(out.text())
 
 
+def _bind_assoc_params(iparams, toks, method, atypes):
+    """Bind impl type parameters from the argument types of `method`.
+
+    Looks up `fn method(..)` in the impl's tokens and, for each parameter
+    whose declared type is exactly one of `iparams`, binds that parameter to
+    the matching argument's type. Returns the binding, or None if the method
+    is not there or takes `self` (a call through the type, not a constructor).
+    """
+    for j in range(len(toks) - 2):
+        if toks[j].val == "fn" and toks[j + 1].val == method:
+            break
+    else:
+        return None
+    j += 2
+    depth = 0
+    if toks[j].val == "<":                      # skip the method's generics
+        while True:
+            depth += (toks[j].val == "<") - (toks[j].val == ">")
+            depth -= 2 * (toks[j].val == ">>")
+            j += 1
+            if depth <= 0:
+                break
+    if toks[j].val != "(":
+        return None
+    j += 1
+    params, cur, depth = [], [], 0
+    while j < len(toks):
+        v = toks[j].val
+        if v in ("(", "[", "<"):
+            depth += 1
+        elif v in (")", "]", ">"):
+            if depth == 0 and v == ")":
+                break
+            depth -= 1
+        elif v == ">>":
+            depth -= 2
+        if v == "," and depth == 0:
+            params.append(cur)
+            cur = []
+        else:
+            cur.append(toks[j])
+        j += 1
+    if cur:
+        params.append(cur)
+    bound = {}
+    for k, ptoks in enumerate(params):
+        vals = [t.val for t in ptoks]
+        if "self" in vals[:3]:
+            return None
+        if ":" not in vals:
+            continue
+        ty = vals[vals.index(":") + 1:]
+        if k < len(atypes) and atypes[k] is not None and len(ty) == 1 \
+                and ty[0] in iparams:
+            bound[ty[0]] = atypes[k]
+    return bound
+
+
+def _dyn_methods(unit, trait):
+    """Every method a `dyn trait` can offer: the trait's and its supertraits'.
+
+    A supertrait's methods are in the subtrait's vtable too, so `&dyn Sub`
+    can call them. The nearest definition of a name wins.
+    """
+    found = {}
+    for tr in _trait_chain(unit, trait):
+        for mname, info in unit.traits.get(tr, {}).items():
+            found.setdefault(mname, info)
+    return found
+
+
+def finalize_dyn(unit, included=()):
+    """Build the vtable structs and per-type vtables for the trait objects.
+
+    Done after every body is translated so that all traits are known and every
+    coercion has been seen. Returns (struct names to define, C for the
+    prelude). The vtables are `static const`, one per (trait, type) pair
+    actually coerced, so a unit pays nothing for a trait it never uses as
+    `dyn`, and two units never collide at link time.
+    """
+    names, text = [], []
+    for fname, _sig in sorted(unit.fn_boxes.items()):
+        if fname not in included:
+            unit.needs.add("alloc")
+            names.append(fname)
+            text.append(
+                "static void %s_drop(%s *self) { if (self->env) { "
+                "if (self->drop) self->drop(self->env); free(self->env); "
+                "self->env = 0; } }" % (fname, fname))
+    for dname, trait in sorted(unit.dyn_types.items()):
+        if trait not in unit.traits:
+            raise CrustError("`dyn %s`: no trait `%s` is defined in this "
+                             "unit" % (trait, trait))
+        vt = "crust_vt_" + trait
+        if vt not in unit.structs:
+            # Slot 0 destroys the concrete value: `Box<dyn T>` needs it, and
+            # it costs one word per vtable otherwise.
+            fields = [("_crust_drop", unit.fn_ptr_type(
+                VOID, [RustCType("void", 1)]))]
+            for mname, info in _dyn_methods(unit, trait).items():
+                if info.self_kind == "ref":
+                    ps = [RustCType("void", 1)] + [t for _, t in info.params]
+                    fields.append((mname, unit.fn_ptr_type(info.ret, ps)))
+            unit.structs[vt] = fields
+        if dname in unit.dyn_boxes:
+            unit.needs.add("alloc")
+            if dname not in included:
+                text.append(
+                    "static void %s_drop(%s *self) { if (self->data) { "
+                    "if (self->vt->_crust_drop) self->vt->_crust_drop("
+                    "self->data); free(self->data); self->data = 0; } }"
+                    % (dname, dname))
+        if dname not in included:
+            names.extend([vt, dname])
+    for trait, owner in sorted(unit.dyn_used):
+        inits = []
+        dinfo = unit.methods.get((owner, "drop"))
+        dfn = dinfo.mangled if dinfo is not None else (
+            "%s_drop" % owner if owner in unit.drop_types else None)
+        if dfn is None:
+            inits.append("0")
+        else:
+            thunk = "crust_dynthunk_%s_%s__drop" % (trait, owner)
+            text.append("static void %s(void *self) { %s((%s *)self); }"
+                        % (thunk, dfn, owner))
+            inits.append(thunk)
+        for mname, info in _dyn_methods(unit, trait).items():
+            if info.self_kind != "ref":
+                continue
+            impl = unit.methods.get((owner, mname))
+            if impl is None:
+                raise CrustError("`%s` does not implement `%s::%s`"
+                                 % (owner, trait, mname))
+            thunk = "crust_dynthunk_%s_%s_%s" % (trait, owner, mname)
+            decl = ["void *self"] + [
+                t.decl("a%d" % i) for i, (_, t) in enumerate(info.params)]
+            call = ["(%s *)self" % owner] + [
+                "a%d" % i for i in range(len(info.params))]
+            text.append("static %s(%s) { %s%s(%s); }" % (
+                info.ret.decl(thunk), ", ".join(decl),
+                "" if info.ret.is_void() else "return ", impl.mangled,
+                ", ".join(call)))
+            inits.append(thunk)
+        text.append("static const crust_vt_%s crust_vtinst_%s_%s = { %s };"
+                    % (trait, trait, owner, ", ".join(inits)))
+    return names, text
+
+
 def _trait_chain(unit, trait, seen=None):
     """`trait` and its supertraits, nearest first, without cycling."""
     seen = seen if seen is not None else set()
@@ -10654,7 +11829,7 @@ def ensure_core_concrete(unit, name):
             or name in unit.generic_structs:
         return
     # Atomics depend on Ordering for their method signatures.
-    if name in ("AtomicU32", "AtomicUsize"):
+    if name in ("AtomicU32", "AtomicUsize", "AtomicU64", "AtomicBool"):
         ensure_core_concrete(unit, "Ordering")
     core = _load_core_unit()
     if name in core.generic_structs:
@@ -11004,7 +12179,29 @@ def _struct_new_to_compound(init, ty):
     head = ty.base + "_new("
     if not text.startswith(head) or not text.endswith(")"):
         return None
-    return "{ %s }" % text[len(head):-1]
+    args, depth, cur = [], 0, []
+    for ch in text[len(head):-1]:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    args.append("".join(cur).strip())
+    # `Mutex::new(Jobs { .. })` passes a compound literal, `(Jobs){..}`. As a
+    # member of a static initializer the braces alone are the constant.
+    for k, a in enumerate(args):
+        if a.startswith("(") and "){" in a.replace(") {", "){") \
+                and a.endswith("}"):
+            close = a.index(")")
+            tname = a[1:close].strip()
+            if tname.replace("_", "a").isalnum() \
+                    and a[close + 1:].lstrip().startswith("{"):
+                args[k] = a[close + 1:].lstrip()
+    return "{ %s }" % ", ".join(a for a in args if a)
 
 
 def _render_const(kw, name, ty, init):
@@ -11418,6 +12615,7 @@ def translate(code, path=None):
     unit, struct_order = included
     included_fns = set(unit.fn_sigs)
     included_slices = set(unit.slices)
+    included_dyn = set(unit.dyn_types) | set(unit.fn_boxes)
     included_options = set(unit.options)
     included_results = set(unit.results)
 
@@ -11513,6 +12711,7 @@ def translate(code, path=None):
         prev = end
     pieces.append(code[prev:])
     body = "".join(pieces)
+    dyn_names, dyn_text = finalize_dyn(unit, included_dyn)
 
     # Prelude, on one physical line so no line numbers shift. Order matters:
     # incomplete-type forward declarations, then full struct definitions in
@@ -11614,6 +12813,7 @@ def translate(code, path=None):
         if name not in included_results and name not in included_options:
             generated.append(name)
     generated.extend(unit.tuples)
+    generated.extend(dyn_names)
     for name in generated:
         prelude.append("struct %s; typedef struct %s %s;" % (name, name, name))
     for name, (fret, fparams) in unit.fn_ptrs.items():
@@ -11698,6 +12898,7 @@ def translate(code, path=None):
                        % ("static " if is_static else "",
                           ret.decl(name),
                           ", ".join(t.decl() for t in ps) if ps else "void"))
+    prelude.extend(dyn_text)
     emit_elem_drops(unit)
     if unit.emitted:
         # Monomorphised bodies go after all original text, so no line number
@@ -11710,6 +12911,8 @@ def translate(code, path=None):
         # identical typedef is valid C11, so an included module declaring it
         # too is harmless.
         prelude.insert(0, "typedef unsigned int crust_char;")
+    if "crust_atomic_" in body or any("crust_atomic_" in x for x in prelude):
+        prelude.insert(0, _atomic_helpers())
     if not prelude:
         return body
     return _emit_prelude(body, prelude, path)
