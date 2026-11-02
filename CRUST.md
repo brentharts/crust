@@ -2316,6 +2316,27 @@ parameter from the expected type, which is what lets
 Not covered: `dyn Fn` (use a generic `F: Fn`), `dyn Any`/downcasting,
 generic methods on trait objects, and `Rc<dyn T>`.
 
+## Literal and initializer forms
+
+- **Byte strings.** `b"GOCICAT2"` is a `&[u8; 8]`, a pointer to its bytes; where
+  a `&[u8]` is expected (a `let` annotation, a parameter, a `static`) it is the
+  slice struct with its length, so `.len()` works. `b'A'` is the byte as a
+  `u8`. `\n`, `\0`, `\xNN` and `\\` count as one byte each. Without an
+  annotation a byte string is just the pointer, so `let z = b"ab"; z.len()` needs
+  `let z: &[u8]`.
+- **Struct literals.** Field shorthand (`S { a, b }`) and functional update
+  (`S { b: 1, ..base }`; the base is evaluated once).
+- **`const { expr }`** blocks are their expression, which is what lets
+  `[const { AtomicU64::new(0) }; N]` initialise a `static`.
+- **Repeats.** `[v; N]` accepts a length that is a `const` expression
+  (`N * 2`, `A + B`, `N as usize`), not only a literal or a bare `const`. In a
+  `static` the elements are made constant: `T::new(..)` of a bundled type
+  becomes its brace initializer and `(P){..}` loses its cast, so
+  `[Page { .. }; M]` and `[AtomicU64::new(0); 512]` are valid C constants. A
+  length that mentions another module's constant (`control_abi::DOMAIN_LIMIT`)
+  still cannot be resolved from one file. `[0_u8; N]` is typed, so it needs no
+  annotation.
+
 ## Not yet supported
 
 The borrow checker. `match` has no bindings inside `|`
