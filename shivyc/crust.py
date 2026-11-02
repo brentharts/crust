@@ -2988,6 +2988,18 @@ class Parser:
                     payload = self._payload_of(e.code)
                     if payload:
                         params = [ty for _, ty in payload]
+                if sig is None and not generic and e.from_path \
+                        and e.type is None:
+                    # `UnsafeCell::new(MaybeUninit::uninit())` into a field of
+                    # type `UnsafeCell<MaybeUninit<T>>`: the expected type
+                    # already names the instance, so its parameter types can
+                    # hint the arguments, which otherwise have no way to learn
+                    # their own type arguments.
+                    pre = self._assoc_from_target(e.code)
+                    if pre is not None:
+                        e = Expr(pre, None)
+                        sig = self.fn_sigs.get(pre)
+                        params = (sig[1] if sig else []) or []
                 args, atypes, aexprs = [], [], []
                 while not self.at(")", "punc"):
                     want = params[len(args)] if len(args) < len(params) \
@@ -4407,6 +4419,17 @@ class Parser:
         full = cname + "f" if single else cname
         self.unit.needs.add("fmath:" + full)
         return full
+
+    def _assoc_from_target(self, code):
+        """`Name_func` on the generic instance the expected type names."""
+        want = self.target
+        if want is None or want.ptr or want.array:
+            return None
+        inst = self.unit.instances.get(want.base)
+        if inst is None or not code.startswith(inst[0] + "_"):
+            return None
+        cand = "%s_%s" % (want.base, code[len(inst[0]) + 1:])
+        return cand if cand in self.fn_sigs else None
 
     def _infer_generic_assoc(self, code, atypes):
         """Resolve `Name::func(args)` on a generic struct with no turbofish.
@@ -11084,7 +11107,10 @@ def _generic_params_of(toks, kind):
     try:
         p.skip_attributes()
         while p.cur.val in ("pub", "unsafe", "extern") or p.cur.kind == "str":
-            p.next()
+            if p.cur.val == "pub":
+                p.skip_visibility()          # `pub(crate)`, `pub(in path)`
+            else:
+                p.next()
         if not p.at(kind, "kw"):
             return None
         p.next()
