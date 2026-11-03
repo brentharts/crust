@@ -319,6 +319,37 @@ fn main() -> i32 {
 """), 0)
 
 
+class TestArrayOfOptionsAndMaybeUninit(unittest.TestCase):
+
+    def test_get_on_an_array_of_options(self):
+        self.assertEqual(_rs("""
+#[derive(Clone, Copy)]
+struct E { a: u32 }
+struct Table { entries: [Option<E>; 4] }
+impl Table {
+    fn entry(&self, i: usize) -> Option<E> { self.entries.get(i).copied().flatten() }
+}
+fn main() -> i32 {
+    let mut t = Table { entries: [None; 4] };
+    t.entries[2] = Some(E { a: 7 });
+    if t.entry(2).unwrap().a != 7 { return 1; }
+    if t.entry(1).is_some() || t.entry(9).is_some() { return 2; }
+    0
+}
+"""), 0)
+
+    def test_assume_init_drop(self):
+        self.assertEqual(_rs("""
+use core::mem::MaybeUninit;
+fn main() -> i32 {
+    let mut m: MaybeUninit<u32> = MaybeUninit::uninit();
+    m.write(3u32);
+    unsafe { m.assume_init_drop(); }
+    0
+}
+"""), 0)
+
+
 class TestNotSupported(unittest.TestCase):
 
     def test_unknown_array_method_is_still_named(self):

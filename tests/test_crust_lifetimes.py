@@ -136,6 +136,25 @@ class TestCallsIntoOtherFiles(unittest.TestCase):
             out = crust.translate(fh.read(), user)
         self.assertIn("recover(3)", out)
 
+    def test_imported_type_constant_and_sibling_struct_in_a_seeded_file(self):
+        import os
+        d = self._crate({
+            "lib.rs": "mod memory;\nmod user;\n",
+            "memory.rs": "use core::mem::MaybeUninit;\n"
+                         "pub struct Owner { slot: MaybeUninit<Alloc> }\n"
+                         "pub struct Alloc { n: u32 }\n"
+                         "pub struct Lease { a: u64 }\n"
+                         "impl Lease { pub const EMPTY: Self = Self { a: 0 }; }\n",
+            "user.rs": "use crate::memory::{self, Lease};\n"
+                       "fn f() -> u64 { let last = Lease::EMPTY;"
+                       " let other = memory::Lease::EMPTY; last.a + other.a }\n",
+        })
+        path = os.path.join(d, "user.rs")
+        with open(path) as fh:
+            out = crust.translate(fh.read(), path)
+        self.assertIn("Lease last = Lease_EMPTY", out)
+        self.assertIn("Lease other = Lease_EMPTY", out)
+
 
 class TestBlockFinalJump(unittest.TestCase):
 
@@ -145,6 +164,128 @@ fn f(x: Option<u32>) -> u32 { let Some(v) = x else { return 1 }; v + 1 }
 fn g(n: u32) -> u32 { if n > 1 { return 10 } 20 }
 fn main() -> i32 { (f(None) + f(Some(4)) + g(5) + g(0)) as i32 - 36 }
 """), 0)
+
+
+class TestItemOrderAndReceivers(unittest.TestCase):
+
+    def test_by_value_mut_self_and_typed_self(self):
+        self.assertEqual(_rs("""
+struct C { n: u32 }
+impl C {
+    fn bump(mut self) -> C { self.n += 1; self }
+    fn get(self: &Self) -> u32 { self.n }
+}
+fn main() -> i32 { let c = C { n: 4 }; let d = c.bump(); d.get() as i32 - 5 }
+"""), 0)
+
+    def test_struct_consts_above_the_struct_and_alias_literals(self):
+        self.assertEqual(_rs("""
+type Alias = Real;
+const G1: Guid = Guid { a: 3, b: 4 };
+static G2: Guid = Guid { a: 5, b: 6 };
+struct Guid { a: u32, b: u32 }
+struct Real { x: u32 }
+fn main() -> i32 { let r = Alias { x: 2 }; (G1.a + G2.b + r.x) as i32 - 11 }
+"""), 0)
+
+    def test_addr_of_and_qualified_fn_pointer(self):
+        self.assertEqual(_rs("""
+type Cb = unsafe extern "C" fn(u32) -> u32;
+static mut COUNTER: u32 = 5;
+fn twice(x: u32) -> u32 { x * 2 }
+fn main() -> i32 {
+    let f: Cb = twice;
+    let p = core::ptr::addr_of!(COUNTER);
+    let q = std::ptr::addr_of_mut!(COUNTER);
+    unsafe { *q = 7; }
+    (f(4) + unsafe { *p }) as i32 - 15
+}
+"""), 0)
+
+
+class TestImplFnParameters(unittest.TestCase):
+
+    def test_impl_fn_in_methods_and_inferred_closure_params(self):
+        self.assertEqual(_rs("""
+struct S { n: u32 }
+impl S {
+    fn find(&self, p: impl Fn(&S) -> bool) -> bool { p(self) }
+    fn run(&self, d: impl FnOnce(bool, u64) -> bool) -> bool { d(true, 1) }
+}
+fn call(f: impl Fn(u32) -> u32, x: u32) -> u32 { f(x) }
+fn main() -> i32 {
+    let s = S { n: 5 };
+    let k = 10u32;
+    if !s.find(|x| x.n > 1) { return 1; }
+    if !s.run(|a, b| a && b > 0) { return 2; }
+    if call(|a| a + 1, 2) != 3 { return 3; }
+    if call(|a| a + k, 2) != 12 { return 4; }
+    0
+}
+"""), 0)
+
+
+class TestDeferredNone(unittest.TestCase):
+    """A bare `None` takes its type from a later use."""
+
+    def test_let_none_fixed_by_a_later_assignment(self):
+        self.assertEqual(_rs("""
+fn step(n: u64) -> Option<u64> { if n < 4 { Some(n + 1) } else { None } }
+fn find(id: u64) -> Option<(u64, Option<u64>)> {
+    let mut current = Some(1_u64);
+    let mut previous = None;
+    for _ in 0..8 {
+        let frame = current?;
+        if frame == id { return Some((frame, previous)); }
+        previous = Some(frame);
+        current = step(frame);
+    }
+    None
+}
+fn main() -> i32 {
+    let (a, b) = find(3).unwrap();
+    let (c, d) = find(1).unwrap();
+    if d.is_some() { return 1; }
+    (a + b.unwrap() + c) as i32 - 6
+}
+"""), 0)
+
+    def test_none_beside_some_in_if_and_match_arms(self):
+        self.assertEqual(_rs("""
+fn pick(flag: u64) -> u64 {
+    let chosen = if flag == 0 { None } else { let v = flag * 2; Some(v) };
+    match chosen { Some(v) => v, None => 0 }
+}
+fn arm(k: u64) -> u64 {
+    let r = match k { 0 => None, 1 => Some(10_u64), _ => None };
+    r.unwrap_or(7)
+}
+fn main() -> i32 { (pick(0) + pick(3) + arm(0) + arm(1) + arm(2)) as i32 - 30 }
+"""), 0)
+
+    def test_none_inside_tuples_of_an_if_chain(self):
+        self.assertEqual(_rs("""
+fn pair(k: u64) -> u64 {
+    let (a, b, c) = if k == 0 {
+        (1_u64, Some(2_u64), None)
+    } else if k == 1 {
+        (3_u64, None, Some((4_u64, 5_u64)))
+    } else {
+        (6_u64, None, Some((7_u64, 8_u64)))
+    };
+    let mut t = a;
+    if let Some(x) = b { t += x; }
+    if let Some((p, q)) = c { t += p + q; }
+    t
+}
+fn main() -> i32 { (pair(0) + pair(1) + pair(2)) as i32 - 36 }
+"""), 0)
+
+    def test_a_none_nothing_types_is_still_an_error(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn f() -> i32 {\n let x = None;\n 1\n}")
+        self.assertIn("line 2: cannot infer the type of `None`",
+                      str(cm.exception))
 
 
 if __name__ == "__main__":
