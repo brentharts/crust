@@ -793,6 +793,10 @@ impl<T> MaybeUninit<T> {
         &mut self.value as *mut T
     }
 
+    // Dropping the held value is the caller's contract; the storage itself
+    // has nothing to release.
+    fn assume_init_drop(&mut self) {}
+
     fn as_ptr(&self) -> *mut T {
         &self.value as *mut T
     }
