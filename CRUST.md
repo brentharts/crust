@@ -2418,6 +2418,61 @@ Also: the place on the left of `=` now names the type of the right side, so
 `u8::try_from(x)` are typed for the primitive types (`try_from` range-checks
 value and sign, and returns a `Result` whose error is a one-byte placeholder).
 
+
+### Lifetime parameters and definition order
+
+Lifetimes are erased by the lexer, so `struct Image<'a>`, `impl<'a> Image<'a>`
+and `Option<Image<'_>>` are an ordinary struct, impl and type. A generic
+instantiated over a struct defined *later* in the file
+(`UnsafeCell<MaybeUninit<Root>>` above `struct Root`) pulls that struct in
+first, and `static` items are read after every other item, so
+`static S: OwnedState<Manager>` may precede `struct Manager`.
+
+
+A `fn` may take const generic parameters, bound by a literal turbofish:
+`fn size<const N: usize>()` is called `size::<5>()`, and `N` is usable as a
+value and as an array length. Structs and impls with const parameters are still
+lowered as ordinary items, and a const argument is never inferred.
+
+### Arrays by value
+
+C cannot return or pass an array, so `[T; N]` as a return type, a parameter or
+an `Option`/`Result` payload travels in a generated one-field struct
+(`crust_arr_*`, field `v`). It is unwrapped wherever it is indexed, sliced,
+iterated, matched or destructured, so `let [a, b] = f()?;` and `x[0]` read as
+they do in Rust. `xs.get(a..b)` returns `Option<&[T]>` with a bounds check.
+
+### Calls into other files
+
+`crate::sync::kernel_entry_lock()`, `sync::pick::<2>(1)` and
+`memory::allocate_frames::<1>(..)` read only the *signature* of the callee from
+the file the path names (a `crate::`, `super::`, `self::` or `use`d module),
+register it under the flattened name the call lowers to and declare it extern.
+A generic callee needs a turbofish. Bodies are never read. A path whose first
+segment is another member of the same Cargo workspace (`use ginux_x::f;`) is
+found through the workspace's `Cargo.toml`, and `pub use` re-exports in that
+crate are followed.
+
+### Smaller forms
+
+`Option<()>` is a struct holding only the flag, so `fn f() -> Option<()>`,
+`f()?;` and `Some(())` work. `&[T; N]` is carried as a slice, which keeps the
+length (`.len()`, `copy_from_slice`, iteration); `&array` and `&x.to_le_bytes()`
+are accepted wherever a slice or array argument is. Slices gain `starts_with`
+and `ends_with`, and a raw pointer gains `as_ref()` / `as_mut()` returning an
+`Option` (null is `None`).
+
+### Byte conversions
+
+`u32::from_le_bytes(x)` (also `_be_`, `_ne_`, every integer width) accepts an
+array literal, an array local, a slice or a `*u8`. `x.to_le_bytes()` (and
+`_be_`, `_ne_`) yields a `[u8; N]` that `let` copies. `&array` coerces to a
+`&[T]` parameter, and `slice.try_into()` gives a `Result<&[u8], _>`.
+
+Divergence: the length check is deferred. A slice whose length does not match
+makes `from_*_bytes` abort, where Rust's `try_into()` would return `Err`.
+
+
 ## Not yet supported
 
 The borrow checker. `match` has no bindings inside `|`

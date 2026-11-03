@@ -100,6 +100,7 @@ test_crust:
 	python3 -m unittest tests.test_crust_intmethods -v 2>&1 | tail -5
 	python3 -m unittest tests.test_crust_asm -v 2>&1 | tail -5
 	python3 -m unittest tests.test_crust_arrays -v 2>&1 | tail -5
+	python3 -m unittest tests.test_crust_lifetimes -v 2>&1 | tail -5
 	python3 tools/crust_examples.py -v
 
 test_fast_crust:
