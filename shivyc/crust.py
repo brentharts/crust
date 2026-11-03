@@ -761,10 +761,16 @@ class Unit:
         self.generic_structs = {}   # name -> (params, tokens)
         self.define_now = None      # collect_items' on-demand struct hook
         self.demanded_fns = {}      # (module, fn) -> its tokens, or None
+        self.collected_code = {}    # source text -> item spans already read
         self.generic_fns = {}       # name -> (params, tokens)
         self.generic_impls = []     # (params, type name, tokens)
         self.instances = {}         # mangled -> (name, [RustCType])
         self.emitted = []           # generated C, appended after the unit
+        # Types a bare `None` (or a tuple holding one) could not name yet;
+        # see `Parser.new_deferred`. base -> resolved type, or None while
+        # open, and base -> (kind, element types, line).
+        self.deferred = {}
+        self.deferred_info = {}
         self.struct_order = []      # instantiated structs, in creation order
         self.emitting = set()       # guards against recursive instantiation
         self.core_names = set()     # generics seeded from the bundled core
@@ -898,6 +904,13 @@ class Unit:
         if name not in self.fn_ptrs:
             self.fn_ptrs[name] = (ret, params)
         return RustCType(name)
+
+    def deferred_real(self, base):
+        """The base name a placeholder type ended up as, or None if open."""
+        t = RustCType(base)
+        while self.deferred.get(t.base) is not None:
+            t = self.deferred[t.base]
+        return None if t.base in self.deferred else t.base
 
     def tuple_type(self, elems):
         """Return (and register) the struct for a tuple type `(A, B, ..)`.
@@ -1264,7 +1277,11 @@ class Parser:
     def lookup(self, name):
         for s in reversed(self.scopes):
             if name in s:
-                return s[name]
+                t = s[name]
+                if t is not None and not t.ptr and not t.array \
+                        and t.base in self.unit.deferred:
+                    t = s[name] = self.real(t)
+                return t
         return None
 
     def declare_alias(self, name, type_, code):
@@ -1444,6 +1461,16 @@ class Parser:
 
     def parse_type(self):
         t = self.cur
+        if t.val in ("unsafe", "extern") and t.kind == "kw":
+            # `unsafe extern "efiapi" fn(..)`: the qualifiers say how the
+            # pointer is called, which a C function pointer already assumes.
+            j = self.i
+            while self.toks[j].val in ("unsafe", "extern") \
+                    or self.toks[j].kind == "str":
+                j += 1
+            if self.toks[j].val == "fn":
+                self.i = j
+                t = self.cur
         if t.val == "fn" and t.kind == "kw" and self.peek().val == "(":
             # A function-pointer type. Crust already generates a typedef per
             # signature for closures, so this reuses that machinery and the
@@ -1468,6 +1495,13 @@ class Parser:
             # parameter, which `_generic_params_of` numbered `_impl0`,
             # `_impl1`, .. in order. Its bound is skipped like any other.
             self.next()
+            if self.cur.val in ("Fn", "FnMut", "FnOnce") \
+                    and self.peek().val == "(":
+                # A closure bound is not a type parameter: it is the closure
+                # object type, so it also works in a method, and the bound's
+                # parameter types reach the closure that is passed.
+                self.next()
+                return self.parse_fn_bound_rest()
             depth = 0
             while self.cur.kind != "eof":
                 v = self.cur.val
@@ -2070,7 +2104,9 @@ class Parser:
                     self.accept("mut")
                 depth += 1
             nm = self.cur.val if self.cur.kind in ("ident", "kw") else None
-            if nm == "impl":
+            if nm == "impl" and self.peek().val in ("Fn", "FnMut", "FnOnce"):
+                nm = None
+            elif nm == "impl":
                 nm = "_impl%d" % impls
                 impls += 1
             decls.append((nm, depth))
@@ -2179,6 +2215,15 @@ class Parser:
         "S": ("rsi", "esi", "si", "sil"), "D": ("rdi", "edi", "di", "dil"),
     }
     _ASM_BOUND = ("r8", "r9", "r10", "r11")     # bound with `register .. asm`
+
+    def m_addr_of(self, args, line):
+        """`addr_of!(place)` / `addr_of_mut!(place)`: the place's address."""
+        if len(args) != 1:
+            self.err("`addr_of!` takes one place")
+        e = self.sub_expr(args[0])
+        return Expr("(&%s)" % e.code,
+                    RustCType(e.type.base, e.type.ptr + 1, e.type.array)
+                    if e.type is not None else None)
 
     def m_asm(self, args, line):
         """`asm!("template", operands.., options(..))`.
@@ -2806,6 +2851,9 @@ class Parser:
             # Simple `dst = src` of owning locals: free the old destination
             # (if live), copy, then zero the source so Drop does not
             # double-free. Compound assigns (`+=`, …) are left alone.
+            if op == "=" and lhs.type is not None and rhs.type is not None:
+                self.unify(lhs.type, rhs.type)      # fixes a bare `None`
+                lhs.type = self.real(lhs.type)
             if op == "=":
                 self.reject_borrow(rhs, lhs.type, "this assignment")
             if op == "=" and lhs.type is not None \
@@ -3498,7 +3546,7 @@ class Parser:
         self.expect(")")
         if elem is None:
             elem = inner.type
-        if elem is None:
+        if elem is None or self.is_open(elem):
             self.err("cannot infer the type held by `Some`; annotate the "
                      "target (`let x: Option<i32> = ...`)")
         opt = self.unit.option_type(elem)
@@ -3858,12 +3906,107 @@ class Parser:
                     % (want.base, flag, field, inner.code), want)
 
     def none_expr(self):
-        """Lower `None`, whose type comes from the surrounding context."""
+        """Lower `None`, whose type comes from the surrounding context.
+
+        With no context to name it -- `let mut prev = None;` fixed by a later
+        `prev = Some(f)`, or `if c { None } else { Some(x) }` -- it is given
+        a placeholder type that the first thing to pin it down resolves.
+        """
         want = self.target
-        if want is None or want.base not in self.unit.options:
-            self.err("cannot infer the type of `None`; annotate the target "
-                     "(`let x: Option<i32> = None`)")
-        return Expr("(%s){0}" % want.base, want)
+        if want is not None and want.base in self.unit.options:
+            return Expr("(%s){0}" % want.base, want)
+        if want is not None and self.is_open(want) \
+                and self.unit.deferred_info[want.base][0] == "opt":
+            return Expr("(%s){0}" % want.base, want)
+        ty = self.new_deferred("opt")
+        return Expr("(%s){0}" % ty.base, ty)
+
+    # -- Placeholder types ---------------------------------------------------
+    #
+    # A `None` is an `Option<?>` and a tuple holding one is a `(.., Option<?>)`
+    # whose layout depends on that `?`. Both get a unique placeholder base
+    # name (`crust_defer_N_`) that is written into the C text as if it were a
+    # real type. The first use that names the type -- an assignment, a sibling
+    # `if`/`match` arm, an expected type -- resolves it, and `translate`
+    # swaps every placeholder for its type at the end. One that is never
+    # resolved is the old "cannot infer" error, reported when its function
+    # ends.
+
+    def new_deferred(self, kind, elems=None):
+        base = "crust_defer_%d_" % len(self.unit.deferred)
+        self.unit.deferred[base] = None
+        self.unit.deferred_info[base] = (kind, elems, self.cur.line)
+        return RustCType(base)
+
+    def real(self, t):
+        """`t` with any resolved placeholder replaced by its type."""
+        while t is not None and not t.ptr and not t.array \
+                and self.unit.deferred.get(t.base) is not None:
+            t = self.unit.deferred[t.base]
+        return t
+
+    def is_open(self, t):
+        t = self.real(t)
+        return t is not None and not t.ptr and not t.array \
+            and t.base in self.unit.deferred
+
+    def _fits(self, d, t):
+        """True if the closed type `t` can be what open placeholder `d` is."""
+        if t is None or t.ptr or t.array or t.base in self.unit.deferred:
+            return False
+        kind, elems, _ = self.unit.deferred_info[d.base]
+        if kind == "opt":
+            return t.base in self.unit.options
+        want = self.unit.tuples.get(t.base)
+        return want is not None and len(want) == len(elems)
+
+    def resolve(self, d, t):
+        d, t = self.real(d), self.real(t)
+        if not self.is_open(d) or not self._fits(d, t):
+            return
+        kind, elems, _ = self.unit.deferred_info[d.base]
+        self.unit.deferred[d.base] = t
+        if kind == "tuple":
+            for e, w in zip(elems, self.unit.tuples[t.base]):
+                self.unify(e, w)
+
+    def unify(self, a, b):
+        """Make two types that Rust gives the same type agree."""
+        a, b = self.real(a), self.real(b)
+        if a is None or b is None or a.base == b.base:
+            return
+        oa, ob = self.is_open(a), self.is_open(b)
+        if oa and not ob:
+            self.resolve(a, b)
+        elif ob and not oa:
+            self.resolve(b, a)
+        elif oa and ob:
+            ka, ea, _ = self.unit.deferred_info[a.base]
+            kb, eb, _ = self.unit.deferred_info[b.base]
+            if ka != kb:
+                return
+            if ka == "tuple":
+                if len(ea) != len(eb):
+                    return
+                for x, y in zip(ea, eb):
+                    self.unify(x, y)
+                for d, elems in ((a, ea), (b, eb)):
+                    got = [self.real(e) for e in elems]
+                    if self.is_open(d) and not any(self.is_open(e)
+                                                   for e in got):
+                        self.resolve(d, self.unit.tuple_type(got))
+            if self.is_open(a) and self.is_open(b):
+                self.unit.deferred[b.base] = a      # one type from now on
+
+    def check_deferred(self, first):
+        """Report a placeholder made since index `first` still unresolved."""
+        for k in range(first, len(self.unit.deferred)):
+            base = "crust_defer_%d_" % k
+            if self.is_open(RustCType(base)):
+                line = self.unit.deferred_info[base][2]
+                raise CrustError(
+                    "line %d: cannot infer the type of `None`; annotate the "
+                    "target (`let x: Option<i32> = None`)" % line)
 
     # -- Option and Result methods ----------------------------------------
     #
@@ -5003,7 +5146,8 @@ class Parser:
                                          self.unit.results):
             # `o: &mut Option<T>` -- auto-deref, as for a field access.
             recv = Expr("(*%s)" % recv.code, RustCType(recv.type.base))
-        if recv.type is not None and not recv.type.ptr and (
+        if recv.type is not None and not recv.type.ptr \
+                and not recv.type.array and (
                 recv.type.base in self.unit.options
                 or recv.type.base in self.unit.results):
             # Raw token slices, so a closure argument can be inlined rather
@@ -5428,6 +5572,16 @@ class Parser:
         """
         start = self.cur
         params = []
+        # The expected closure type -- an `impl Fn(u32) -> u32` parameter, a
+        # `Box<dyn Fn(..)>` field -- names the types of parameters that are
+        # written without one.
+        hint = self.target
+        hints = None
+        if hint is not None and not hint.ptr and not hint.array:
+            if hint.base in self.unit.fn_boxes:
+                hints = self.unit.fn_boxes[hint.base][1]
+            elif hint.base in self.unit.fn_ptrs:
+                hints = self.unit.fn_ptrs[hint.base][1]
         if self.accept("||"):
             pass
         else:
@@ -5436,6 +5590,9 @@ class Parser:
                 self.accept("mut")
                 pname = self.expect_ident()
                 pty = self.parse_type() if self.accept(":") else None
+                if pty is None and hints is not None \
+                        and len(params) < len(hints):
+                    pty = hints[len(params)]
                 if pty is None:
                     self.err("closure parameter `%s` needs a type "
                              "annotation; Crust does not infer them", pname)
@@ -5680,7 +5837,9 @@ class Parser:
         finally:
             self.expected.pop()
         other_work = self.take_pending(mark)
-        ty = then.type if then.type is not None else other.type
+        if then.type is not None and other.type is not None:
+            self.unify(then.type, other.type)
+        ty = self.real(then.type if then.type is not None else other.type)
         if not then_work and not other_work:
             return Expr("(%s ? %s : %s)" % (cond.code, then.code, other.code),
                         ty)
@@ -5766,6 +5925,9 @@ class Parser:
             leftover = self.pending
             self.pending = outer
             self.pending.extend(leftover)
+        for other_ty in types[1:]:
+            self.unify(types[0], other_ty)          # `{ None }` / `{ Some(x) }`
+        types = [self.real(t) for t in types]
         ty = _join_types(types)
         if ty is None or ty.is_void():
             if kind == "match":
@@ -5909,7 +6071,12 @@ class Parser:
                 if any(i.type is None for i in items):
                     self.err("cannot infer the type of a tuple element; "
                              "annotate it")
-                ty = self.unit.tuple_type([i.type for i in items])
+                if any(self.is_open(i.type) for i in items):
+                    # `(a, None)`: the arm that comes next names the rest.
+                    ty = self.new_deferred("tuple",
+                                           [i.type for i in items])
+                else:
+                    ty = self.unit.tuple_type([i.type for i in items])
             inits = ", ".join("._%d = %s" % (k, i.code)
                               for k, i in enumerate(items))
             return Expr("(%s){%s}" % (ty.base, inits), ty)
@@ -5979,6 +6146,15 @@ class Parser:
                 # that does not exist -- `T_N` rather than `X_N`. This is what
                 # makes a trait's associated consts reachable through a bound.
                 name = self.tysubst[name].base
+            if self.at("::", "punc") and name in self.unit.imports \
+                    and name not in self.unit.structs \
+                    and name not in self.unit.enums \
+                    and name not in self.unit.generic_structs \
+                    and self.lookup(name) is None:
+                # `FrameLease::EMPTY` / `Table::new()` as the first mention
+                # of an imported type: read its file now, so its associated
+                # items are known by the time the path is resolved.
+                demand_seed(self.unit, name)
             while self.at("::", "punc"):        # path: foo::bar -> foo_bar
                 saw_path = True
                 self.next()
@@ -5996,6 +6172,25 @@ class Parser:
                 seg = self.expect_ident()
                 path_segs.append(seg)
                 name += "_" + seg
+            if saw_path and len(path_segs) >= 3 and name not in self.unit.consts \
+                    and name not in self.unit.fn_sigs \
+                    and name not in self.unit.variants \
+                    and name not in self.unit.structs \
+                    and self.lookup(name) is None:
+                # `memory::FrameLease::EMPTY`: the type is the last capitalised
+                # segment before the item. Resolve it (reading its file if
+                # need be) and name the item through the type alone.
+                for k in range(len(path_segs) - 1, 0, -1):
+                    if not path_segs[k - 1][:1].isupper():
+                        continue
+                    ty = self._resolve_path(path_segs[:k])
+                    if ty in self.unit.structs or ty in self.unit.enums:
+                        name = "_".join([ty] + path_segs[k:])
+                    break
+            if saw_path and self.at("!", "punc") \
+                    and self.peek().val in ("(", "[", "{") \
+                    and path_segs[-1] in _BUILTIN_MACROS:
+                return self.parse_macro(path_segs[-1])   # `ptr::addr_of!(x)`
             if saw_path and name in _INT_LIMITS \
                     and name not in self.unit.consts \
                     and self.lookup(name) is None:
@@ -6003,6 +6198,27 @@ class Parser:
                 # named nothing, and the C front end refused it.
                 prim, code = _INT_LIMITS[name]
                 return Expr(code, RustCType(PRIMITIVES[prim]))
+            if self.at("{", "punc") and not self.no_struct_lit \
+                    and name not in self.unit.structs \
+                    and name not in self.unit.generic_structs \
+                    and self._payload_of(name) is None:
+                # `Rootfs { .. }` where `type Rootfs = Layer;`, or where the
+                # struct is imported from another file.
+                if name not in self.unit.type_aliases \
+                        and name in self.unit.imports:
+                    demand_seed(self.unit, name)
+                alias = self.unit.type_aliases.get(name)
+                if alias is not None and alias.base in self.unit.structs \
+                        and not alias.ptr and not alias.array:
+                    name = alias.base
+            if saw_path and self.at("{", "punc") and not self.no_struct_lit \
+                    and name not in self.unit.structs \
+                    and name not in self.unit.generic_structs \
+                    and self._payload_of(name) is None:
+                # `cpu::Mapping { .. }`: a struct named through its module.
+                got = self._resolve_path(path_segs)
+                if got in self.unit.structs:
+                    name = got
             # `Name { ... }` is a struct literal, except in a condition
             # position, where Rust also treats the brace as a block.
             if (self.at("{", "punc") and not self.no_struct_lit
@@ -6053,6 +6269,13 @@ class Parser:
                 # construction.
                 return Expr("(%s){0}" % name, RustCType(name))
             ty = self.lookup(name)
+            if ty is not None and self.is_open(ty) \
+                    and self.cur.kind == "punc" \
+                    and self.cur.val in (",", ")", ";", "}", "]"):
+                # A `let mut prev = None;` used whole where a type is
+                # expected -- `Some((frame, prev))` -- is that type.
+                self.resolve(ty, self.target)
+                ty = self.lookup(name)
             if ty is None:
                 if name in self.unit.variants:
                     owner = self.unit.variants[name]
@@ -9330,8 +9553,15 @@ class Parser:
             self.accept("mut")
             self.next()                          # self
             return "ref"
-        if self.cur.val == "self":
+        if self.cur.val == "self" or (self.cur.val == "mut"
+                                      and self.peek().val == "self"):
+            self.accept("mut")           # `mut self`: a by-value receiver
             self.next()
+            if self.accept(":"):
+                # `self: &Self` / `self: Self`
+                is_ref = self.at("&", "punc")
+                self.parse_type()
+                return "ref" if is_ref else "value"
             return "value"
         return "none"
 
@@ -9554,6 +9784,7 @@ class Parser:
         their name mangling and in the synthetic `self` parameter.
         """
         prev_ret = self.ret_type
+        first_open = len(self.unit.deferred)
         # A unit `fn main()` becomes C's `int main` only in its signature: its
         # body is still a unit function's, so a tail `println!(..)` is a
         # statement and the process exits 0 -- not with printf's byte count.
@@ -9611,6 +9842,7 @@ class Parser:
                                  % self.cur.line)
             self.parse_stmt(out, 1, True)
         close = self.expect("}")
+        self.check_deferred(first_open)
         if not self.terminated and self.ret_type.is_void():
             # Falling off the end is a return too.
             for stmt in self.ensures_checks(None):
@@ -9657,6 +9889,8 @@ def wider(a, b):
 
 _BUILTIN_MACROS = {
     "asm": Parser.m_asm,
+    "addr_of": Parser.m_addr_of,
+    "addr_of_mut": Parser.m_addr_of,
     "assert": Parser.m_assert,
     "body_invariant": Parser.m_body_invariant,
     "debug_assert": Parser.m_dbg_noop,
@@ -12072,7 +12306,9 @@ def _generic_params_of(toks, kind):
                     depth -= 1
                     if depth == 0:
                         break
-                elif v == "impl" and p.toks[j].kind == "kw":
+                elif v == "impl" and p.toks[j].kind == "kw" \
+                        and p.toks[j + 1].val not in ("Fn", "FnMut",
+                                                      "FnOnce"):
                     params = params + ["_impl%d" % k]
                     k += 1
                 j += 1
@@ -12082,7 +12318,7 @@ def _generic_params_of(toks, kind):
         return None
 
 
-def collect_items(code, spans, unit, struct_order, fail=None):
+def collect_items(code, spans, unit, struct_order, fail=None, scope=None):
     """Populate `unit` from the Rust items in `code`; return struct names.
 
     Only signatures and layouts are read here -- no bodies are translated --
@@ -12096,14 +12332,29 @@ def collect_items(code, spans, unit, struct_order, fail=None):
     # that the types it names, and the generics it instantiates over them,
     # are already known; the relative order of everything else is unchanged.
     def _is_static(sp):
-        return sp[2] == "const" and re.match(
-            r"(?:pub(?:\s*\([^)]*\))?\s+)?static\b", code[sp[0]:sp[0] + 64])
+        # A static, or a const whose type is not a plain scalar: its
+        # initialiser may build a struct that is defined further down.
+        if sp[2] != "const":
+            return False
+        head = code[sp[0]:sp[1]]
+        if re.match(r"(?:pub(?:\s*\([^)]*\))?\s+)?static\b", head):
+            return True
+        m = re.match(r"(?:pub(?:\s*\([^)]*\))?\s+)?const\s+\w+\s*:\s*"
+                     r"([^=]*?)\s*=", head)
+        return bool(m) and "{" in head and not re.match(
+            r"(?:&\s*)?(?:\[|u\d+|i\d+|usize|isize|bool|char|str|f\d+)",
+            m.group(1))
 
     spans = ([sp for sp in spans if not _is_static(sp)]
              + [sp for sp in spans if _is_static(sp)])
-    handled = set()
+    # `scope` is every item of the file when `spans` is just one of them (a
+    # demand-seeded module is read item by item): a generic instantiated
+    # over a sibling struct finds it there.
+    if code not in unit.collected_code:
+        unit.collected_code[code] = set()
+    handled = unit.collected_code[code]
     pending_defs = {}
-    for sp in spans:
+    for sp in (scope if scope is not None else spans):
         if sp[2] in ("struct", "tuple_struct", "unit_struct", "enum"):
             m = re.match(r"(?:#\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?"
                          r"(?:struct|enum)\s+(\w+)\s*[^<\w]",
@@ -13252,6 +13503,10 @@ def demand_fn(unit, segs, targs, flat, depth=0, imports=None):
         modpath = (imports or unit.imports)[last]  # `use a::b::f; f(..)`
     elif parts[0] in unit.imports and len(parts) > 1:
         modpath = "::".join([unit.imports[parts[0]]] + parts[:-1])
+    elif len(parts) > 1 and os.path.basename(unit.import_from or "") in (
+            "lib.rs", "main.rs", "mod.rs") and resolve_use_path(
+                "self::" + parts[0], unit.import_from, strict=True):
+        modpath = "::".join(["self"] + parts[:-1])  # `arch::timer::f()`
     elif len(parts) > 1:
         modpath = "::".join(parts[:-1])            # `other_crate::f(..)`
     else:
@@ -13384,7 +13639,8 @@ def demand_seed(unit, name, depth=0):
                                                  filename)
     for span in spans:
         try:
-            got = collect_items(text, [span], unit, unit.demand_structs)
+            got = collect_items(text, [span], unit, unit.demand_structs,
+                                scope=spans)
         except (CrustError, RecursionError):
             continue
         for n in got["structs"]:
@@ -14421,6 +14677,16 @@ def translate(code, path=None):
                           ", ".join(t.decl() for t in ps) if ps else "void"))
     prelude.extend(dyn_text)
     emit_elem_drops(unit)
+    if unit.deferred:
+        # Placeholder types (see `Parser.none_expr`) become what they were
+        # resolved to; same length of line count, so nothing shifts.
+        def settle(m):
+            t = unit.deferred_real(m.group(0))
+            return t if t is not None else m.group(0)
+        pat = re.compile(r"crust_defer_\d+_")
+        body = pat.sub(settle, body)
+        prelude = [pat.sub(settle, x) for x in prelude]
+        unit.emitted = [pat.sub(settle, x) for x in unit.emitted]
     if unit.emitted:
         # Monomorphised bodies go after all original text, so no line number
         # in the user's own source moves. Their prototypes are in the prelude,
