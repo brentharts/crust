@@ -98,6 +98,8 @@ test_crust:
 	python3 -m unittest tests.test_crust_sync -v 2>&1 | tail -5
 	python3 -m unittest tests.test_crust_literals -v 2>&1 | tail -5
 	python3 -m unittest tests.test_crust_intmethods -v 2>&1 | tail -5
+	python3 -m unittest tests.test_crust_asm -v 2>&1 | tail -5
+	python3 -m unittest tests.test_crust_arrays -v 2>&1 | tail -5
 	python3 tools/crust_examples.py -v
 
 test_fast_crust:
@@ -185,10 +187,10 @@ test_gles2_wasm:
 test_godot_fast:
 	python3 tools/godot_pack_test_fast.py
 
-# Unity scenes built with CCSharp (tools/unity/unity_pack.py).
+# Packed Unity MiniScene → GLES2 view (native surfaceless).
 #     make test_unity_gles2
 test_unity_gles2:
-	python3 -m unittest tests.test_unity_pack_ccs -v
+	python3 -m unittest tests.test_unity_pack.TestGLES2View -v
 
 SEED  ?= 1
 COUNT ?= 200

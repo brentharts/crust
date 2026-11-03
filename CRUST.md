@@ -1017,7 +1017,8 @@ blocking half: a real `Once` makes a second thread wait.
 
 ### Atomics
 
-`AtomicU32`, `AtomicUsize`, `AtomicU64` and `AtomicBool` are real. Each
+`AtomicU8`, `AtomicU16`, `AtomicU32`, `AtomicUsize`, `AtomicU64` and
+`AtomicBool` are real. Each
 operation is one locked x86-64 instruction -- `lock xadd` for `fetch_add` and
 `fetch_sub`, `xchg` for `swap` and `store`, `lock cmpxchg` for
 `compare_exchange`, and a CAS loop for `fetch_or` / `fetch_and` -- written as
@@ -1025,8 +1026,9 @@ operation is one locked x86-64 instruction -- `lock xadd` for `fetch_add` and
 read followed by a compiler barrier, so a spin loop cannot cache it in a
 register. Every `Ordering` is treated as `SeqCst`: the strongest answer is
 always a correct one, and on x86 the weaker orderings save little.
-`compare_exchange` returns the value that was there rather than std's
-`Result`; the swap happened iff it equals `current`. (Before this, all of them
+`compare_exchange` (and `_weak`) returns std's `Result<T, T>`: `Ok(previous)`
+when the swap happened and `Err(actual)` when it did not, so `.is_ok()`,
+`.ok()`, `match` and `?` work as in Rust. (Before this, all of them
 were plain reads and writes. The `__atomic_*` macros in the preprocessor are
 still single-threaded; code that calls those builtins directly is unchanged.)
 
@@ -2343,12 +2345,18 @@ Rust's core methods on scalars are lowered inline (or to a small per-type
 helper function) rather than looked up in a prelude: `wrapping_*`,
 `saturating_*`, `checked_*` (an `Option`), `min`/`max`/`clamp`, `abs`,
 `abs_diff`, `signum`, `pow`, `div_ceil`, `next_multiple_of`, `rem_euclid`,
+`is_multiple_of`,
 `is_power_of_two`, `next_power_of_two`, `count_ones`/`count_zeros`,
 `leading_zeros`/`trailing_zeros`, `rotate_left`/`rotate_right`; on raw
 pointers `is_null`, `read_volatile`, `write_volatile`; on `bool`,
-`then_some`. Operands are evaluated once. Signed `wrapping_*` computes in the
+`then_some` and `then(|| ..)` (the closure is inlined into the true arm, so
+it runs only when the condition holds). Operands are evaluated once. Signed `wrapping_*` computes in the
 unsigned type so C's signed overflow never happens. A user method of the same
 name on the type always wins. Signed `checked_mul` is refused (unsigned only).
+
+`pub(crate)`, `pub(super)` and `pub(in path)` are accepted wherever `pub` is --
+on generic structs, functions and impl items (a generic item behind one used
+to lose its type parameters), and on associated consts.
 
 `crate::`, `super::` and `self::` path prefixes are accepted in expressions;
 paths are flattened, so the root is dropped and the remaining segments resolve.
@@ -2357,6 +2365,58 @@ paths are flattened, so the root is dropped and the remaining segments resolve.
 flattened `const a_b_NAME` definitions to a *copy* of each source so that
 `[T; other::LEN]` repeat lengths resolve. The tree itself is never modified;
 `--no-consts` turns it off.
+
+## Inline assembly: `asm!`
+
+`asm!("template", operands.., options(..))` is lowered to ShivyCX's GCC-style
+`asm`, with the template kept in Intel syntax -- Rust's default, and what the
+compiler's own output uses. The statement is wrapped in
+`.intel_syntax noprefix`, so no syntax conversion happens.
+
+* Placeholders `{}`, `{0}` and `{name}` become `%N`; `{{` and `}}` are
+  literal braces. Several template strings are joined as lines.
+* `in`, `out`, `inout`, `lateout`, `inlateout`; `reg` and `reg_byte`, or an
+  explicit register -- `rax/eax/ax/al`, `rbx`, `rcx`, `rdx`, `rsi`, `rdi` map to
+  GCC constraint letters, `r8`-`r11` to a `register T v __asm__("r10")`
+  binding. `inout(reg) x => y` ties an input to a separate output.
+  `lateout("rcx") _` is a clobber. An explicit-register operand cannot be named
+  from the template (as in Rust).
+* `const expr` operands are substituted as text; `options(noreturn)` marks the
+  statement as diverging. Other options are accepted and ignored, because
+  ShivyCX never reorders across inline asm.
+* Not supported, and refused with a message: `sym`, `options(att_syntax)`,
+  operand modifiers (`{:e}`), registers outside the list above, and
+  `global_asm!` inside a function body. (`global_asm!` at file scope is
+  erased, as described under file-scope macros -- it is not translated, so
+  the symbols it defines must come from elsewhere.)
+
+`core::arch::x86_64::__cpuid` and `__cpuid_count` return a `CpuidResult`
+(`eax`, `ebx`, `ecx`, `edx`). `cpuid` writes `rbx`, which this compiler's code
+never saves, so the bundled query keeps it on the stack around the instruction.
+
+Smaller item forms that came with this: generic tuple structs
+(`struct Wrap<T>(Inner<T>);`, named by the target type when built outside an
+impl), a stray `;` after a block statement, and empty `;` statements.
+
+## Arrays, slices and raw pointers
+
+`len`, `is_empty`, `get`, `get_mut`, `first`, `last`, `copy_from_slice`,
+`clone_from_slice`, `fill`, `contains` and `swap` work on arrays and slices
+alike. An array carries its length in its type and a slice in its fat
+pointer, so each is lowered once against a pointer and a length. `get` and
+friends return `Option<&T>`, bounds-checked; `copy_from_slice` aborts if the
+lengths differ, as Rust panics. A `&[T; N]` parameter is a bare element
+pointer here, so its length is not known and `.len()` on it is refused.
+
+On raw pointers, `cast::<T>()` (or `.cast()` with a pointer target),
+`read`, `write`, `read_unaligned` and `write_unaligned` join the arithmetic
+methods. `read`/`write` are taken only for a pointee Crust knows, so an
+unrelated `file.read(buf)` is still an error.
+
+Also: the place on the left of `=` now names the type of the right side, so
+`self.slots[i] = None;` and `*v = Vec::new();` infer; and `u64::from(x)` and
+`u8::try_from(x)` are typed for the primitive types (`try_from` range-checks
+value and sign, and returns a `Result` whose error is a one-byte placeholder).
 
 ## Not yet supported
 
