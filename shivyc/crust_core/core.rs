@@ -1053,6 +1053,34 @@ impl String {
 // that such a struct still parses. It lowers to the same one-byte placeholder
 // any unit struct does.
 // ---------------------------------------------------------------------------
+// CpuidResult -- what `core::arch::x86_64::__cpuid` returns.
+//
+// `cpuid` writes rbx, which this compiler's code never saves, so the query
+// keeps it on the stack around the instruction and reads ebx out through esi.
+// `__cpuid(leaf)` and `__cpuid_count(leaf, sub)` are lowered to `query`.
+// ---------------------------------------------------------------------------
+struct CpuidResult {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+impl CpuidResult {
+    fn query(leaf: u32, sub: u32) -> CpuidResult {
+        let mut a: u32 = leaf;
+        let mut c: u32 = sub;
+        let d: u32;
+        let b: u32;
+        unsafe {
+            asm!("push rbx", "cpuid", "mov esi, ebx", "pop rbx",
+                 inlateout("eax") a, inlateout("ecx") c, out("edx") d, out("esi") b);
+        }
+        CpuidResult { eax: a, ebx: b, ecx: c, edx: d }
+    }
+}
+
+// ---------------------------------------------------------------------------
 struct PhantomData<T> {
     _marker: u8,
 }
@@ -1101,12 +1129,17 @@ impl AtomicU32 {
     // Returns the value that was there, like the C11 builtin; the swap
     // happened iff it equals `current`.
     fn compare_exchange(&mut self, current: u32, new: u32,
-                        _success: Ordering, _failure: Ordering) -> u32 {
-        crust_atomic_cas32(&mut self.value, current, new)
+                        _success: Ordering, _failure: Ordering) -> Result<u32, u32> {
+        let seen: u32 = crust_atomic_cas32(&mut self.value, current, new);
+        if seen == current {
+            Ok(seen)
+        } else {
+            Err(seen)
+        }
     }
 
     fn compare_exchange_weak(&mut self, current: u32, new: u32,
-                             success: Ordering, failure: Ordering) -> u32 {
+                             success: Ordering, failure: Ordering) -> Result<u32, u32> {
         self.compare_exchange(current, new, success, failure)
     }
 
@@ -1165,12 +1198,17 @@ impl AtomicUsize {
     // Returns the value that was there, like the C11 builtin; the swap
     // happened iff it equals `current`.
     fn compare_exchange(&mut self, current: usize, new: usize,
-                        _success: Ordering, _failure: Ordering) -> usize {
-        crust_atomic_cas64(&mut self.value, current, new)
+                        _success: Ordering, _failure: Ordering) -> Result<usize, usize> {
+        let seen: usize = crust_atomic_cas64(&mut self.value, current, new);
+        if seen == current {
+            Ok(seen)
+        } else {
+            Err(seen)
+        }
     }
 
     fn compare_exchange_weak(&mut self, current: usize, new: usize,
-                             success: Ordering, failure: Ordering) -> usize {
+                             success: Ordering, failure: Ordering) -> Result<usize, usize> {
         self.compare_exchange(current, new, success, failure)
     }
 
@@ -1229,12 +1267,17 @@ impl AtomicU64 {
     // Returns the value that was there, like the C11 builtin; the swap
     // happened iff it equals `current`.
     fn compare_exchange(&mut self, current: u64, new: u64,
-                        _success: Ordering, _failure: Ordering) -> u64 {
-        crust_atomic_cas64(&mut self.value, current, new)
+                        _success: Ordering, _failure: Ordering) -> Result<u64, u64> {
+        let seen: u64 = crust_atomic_cas64(&mut self.value, current, new);
+        if seen == current {
+            Ok(seen)
+        } else {
+            Err(seen)
+        }
     }
 
     fn compare_exchange_weak(&mut self, current: u64, new: u64,
-                             success: Ordering, failure: Ordering) -> u64 {
+                             success: Ordering, failure: Ordering) -> Result<u64, u64> {
         self.compare_exchange(current, new, success, failure)
     }
 
@@ -1270,6 +1313,144 @@ impl AtomicU64 {
 }
 
 // `AtomicBool` stores a u32 so the same instructions serve it.
+struct AtomicU8 {
+    value: u8,
+}
+
+impl AtomicU8 {
+    fn new(value: u8) -> AtomicU8 {
+        AtomicU8 { value: value }
+    }
+
+    fn load(&self, _order: Ordering) -> u8 {
+        crust_atomic_load8(&self.value as *mut u8)
+    }
+
+    fn store(&mut self, value: u8, _order: Ordering) {
+        crust_atomic_xchg8(&mut self.value, value);
+    }
+
+    fn swap(&mut self, value: u8, _order: Ordering) -> u8 {
+        crust_atomic_xchg8(&mut self.value, value)
+    }
+
+    // Returns the value that was there, like the C11 builtin; the swap
+    // happened iff it equals `current`.
+    fn compare_exchange(&mut self, current: u8, new: u8,
+                        _success: Ordering, _failure: Ordering) -> Result<u8, u8> {
+        let seen: u8 = crust_atomic_cas8(&mut self.value, current, new);
+        if seen == current {
+            Ok(seen)
+        } else {
+            Err(seen)
+        }
+    }
+
+    fn compare_exchange_weak(&mut self, current: u8, new: u8,
+                             success: Ordering, failure: Ordering) -> Result<u8, u8> {
+        self.compare_exchange(current, new, success, failure)
+    }
+
+    fn fetch_add(&mut self, value: u8, _order: Ordering) -> u8 {
+        crust_atomic_xadd8(&mut self.value, value)
+    }
+
+    fn fetch_sub(&mut self, value: u8, _order: Ordering) -> u8 {
+        crust_atomic_xadd8(&mut self.value, (0 as u8) - value)
+    }
+
+    fn fetch_or(&mut self, value: u8, _order: Ordering) -> u8 {
+        let mut old: u8 = crust_atomic_load8(&self.value as *mut u8);
+        loop {
+            let seen: u8 = crust_atomic_cas8(&mut self.value, old, old | value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+
+    fn fetch_and(&mut self, value: u8, _order: Ordering) -> u8 {
+        let mut old: u8 = crust_atomic_load8(&self.value as *mut u8);
+        loop {
+            let seen: u8 = crust_atomic_cas8(&mut self.value, old, old & value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+}
+
+struct AtomicU16 {
+    value: u16,
+}
+
+impl AtomicU16 {
+    fn new(value: u16) -> AtomicU16 {
+        AtomicU16 { value: value }
+    }
+
+    fn load(&self, _order: Ordering) -> u16 {
+        crust_atomic_load16(&self.value as *mut u16)
+    }
+
+    fn store(&mut self, value: u16, _order: Ordering) {
+        crust_atomic_xchg16(&mut self.value, value);
+    }
+
+    fn swap(&mut self, value: u16, _order: Ordering) -> u16 {
+        crust_atomic_xchg16(&mut self.value, value)
+    }
+
+    // Returns the value that was there, like the C11 builtin; the swap
+    // happened iff it equals `current`.
+    fn compare_exchange(&mut self, current: u16, new: u16,
+                        _success: Ordering, _failure: Ordering) -> Result<u16, u16> {
+        let seen: u16 = crust_atomic_cas16(&mut self.value, current, new);
+        if seen == current {
+            Ok(seen)
+        } else {
+            Err(seen)
+        }
+    }
+
+    fn compare_exchange_weak(&mut self, current: u16, new: u16,
+                             success: Ordering, failure: Ordering) -> Result<u16, u16> {
+        self.compare_exchange(current, new, success, failure)
+    }
+
+    fn fetch_add(&mut self, value: u16, _order: Ordering) -> u16 {
+        crust_atomic_xadd16(&mut self.value, value)
+    }
+
+    fn fetch_sub(&mut self, value: u16, _order: Ordering) -> u16 {
+        crust_atomic_xadd16(&mut self.value, (0 as u16) - value)
+    }
+
+    fn fetch_or(&mut self, value: u16, _order: Ordering) -> u16 {
+        let mut old: u16 = crust_atomic_load16(&self.value as *mut u16);
+        loop {
+            let seen: u16 = crust_atomic_cas16(&mut self.value, old, old | value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+
+    fn fetch_and(&mut self, value: u16, _order: Ordering) -> u16 {
+        let mut old: u16 = crust_atomic_load16(&self.value as *mut u16);
+        loop {
+            let seen: u16 = crust_atomic_cas16(&mut self.value, old, old & value);
+            if seen == old {
+                return old;
+            }
+            old = seen;
+        }
+    }
+}
+
 struct AtomicBool {
     value: u32,
 }
@@ -1292,12 +1473,17 @@ impl AtomicBool {
     }
 
     fn compare_exchange(&mut self, current: bool, new: bool,
-                        _success: Ordering, _failure: Ordering) -> bool {
-        crust_atomic_cas32(&mut self.value, current as u32, new as u32) != 0
+                        _success: Ordering, _failure: Ordering) -> Result<bool, bool> {
+        let seen: bool = crust_atomic_cas32(&mut self.value, current as u32, new as u32) != 0;
+        if seen == current {
+            Ok(seen)
+        } else {
+            Err(seen)
+        }
     }
 
     fn compare_exchange_weak(&mut self, current: bool, new: bool,
-                             success: Ordering, failure: Ordering) -> bool {
+                             success: Ordering, failure: Ordering) -> Result<bool, bool> {
         self.compare_exchange(current, new, success, failure)
     }
 }
