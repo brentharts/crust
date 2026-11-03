@@ -17,14 +17,55 @@ from tests.test_crust_extras import _rs
 
 class TestAtomics(unittest.TestCase):
 
+    def test_compare_exchange_returns_a_result(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let mut a: AtomicU32 = AtomicU32::new(5);
+    let mut bad = 0;
+    if !a.compare_exchange(5, 6, Ordering::AcqRel, Ordering::Acquire).is_ok() { bad += 1; }
+    if !a.compare_exchange(5, 7, Ordering::AcqRel, Ordering::Acquire).is_err() { bad += 2; }
+    match a.compare_exchange(6, 8, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(prev) => { if prev != 6 { bad += 4; } }
+        Err(_) => { bad += 8; }
+    }
+    if a.load(Ordering::SeqCst) != 8 { bad += 16; }
+    let mut f: AtomicBool = AtomicBool::new(false);
+    if f.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() { bad += 32; }
+    if f.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() { bad += 64; }
+    bad
+}
+"""), 0)
+
+    def test_narrow_atomics_wrap_at_their_width(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let mut b: AtomicU8 = AtomicU8::new(250);
+    let mut h: AtomicU16 = AtomicU16::new(65530);
+    let mut bad = 0;
+    let p: u8 = b.fetch_add(10, Ordering::SeqCst);
+    let q: u16 = h.fetch_add(10, Ordering::SeqCst);
+    if p != 250 { bad += 1; }
+    if b.load(Ordering::SeqCst) != 4 { bad += 2; }
+    if q != 65530 { bad += 4; }
+    if h.load(Ordering::SeqCst) != 4 { bad += 8; }
+    b.store(0x0F, Ordering::Release);
+    b.fetch_or(0xF0, Ordering::SeqCst);
+    b.fetch_and(0x3C, Ordering::SeqCst);
+    if b.load(Ordering::Acquire) != 0x3C { bad += 16; }
+    if b.swap(1, Ordering::SeqCst) != 0x3C { bad += 32; }
+    if b.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst).is_err() { bad += 64; }
+    bad
+}
+"""), 0)
+
     def test_operations_and_their_return_values(self):
         self.assertEqual(_rs("""
 fn main() -> i32 {
     let mut a: AtomicU32 = AtomicU32::new(40);
     let p: u32 = a.fetch_add(2, Ordering::SeqCst);
     let q: u32 = a.swap(7, Ordering::SeqCst);
-    let r: u32 = a.compare_exchange(7, 9, Ordering::SeqCst, Ordering::SeqCst);
-    let s: u32 = a.compare_exchange(7, 1, Ordering::SeqCst, Ordering::SeqCst);
+    let r: u32 = a.compare_exchange(7, 9, Ordering::SeqCst, Ordering::SeqCst).unwrap();
+    let s: u32 = a.compare_exchange(7, 1, Ordering::SeqCst, Ordering::SeqCst).unwrap_err();
     a.fetch_or(0x10, Ordering::SeqCst);
     a.fetch_sub(1, Ordering::SeqCst);
     let mut bad = 0;

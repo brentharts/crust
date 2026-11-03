@@ -1631,12 +1631,14 @@ fn main() -> i32 { if cfg!(feature = "nope") { 1 } else { 42 } }
 """, suffix=".rs"), 42)
 
     def test_unsupported_macro_is_named(self):
-        # `format!` is supported now; `asm!` is deliberately not -- dropping
-        # inline assembly silently would change behaviour invisibly, and a
-        # kernel is exactly where that matters.
+        # `format!` and `asm!` are supported now. `global_asm!` inside a body
+        # is not, and must be refused by name -- dropping assembly silently
+        # would change behaviour invisibly, and a kernel is exactly where
+        # that matters. (At module level it is erased on purpose; see
+        # `test_global_asm_is_erased`.)
         with self.assertRaises(crust.CrustError) as cm:
-            crust.translate('fn f() { asm!("nop"); }')
-        self.assertIn("asm", str(cm.exception))
+            crust.translate('fn f() { global_asm!(".text"); }')
+        self.assertIn("global_asm", str(cm.exception))
 
     def test_macro_rules_single_arg(self):
         self.assertEqual(_run("""
