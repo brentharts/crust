@@ -161,6 +161,164 @@ fn main() -> i32 {
         self.assertIn("takes 0 arguments", str(cm.exception))
 
 
+class TestByteConversions(unittest.TestCase):
+
+    def test_from_bytes_forms(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let a = u32::from_le_bytes([1, 2, 3, 4]);
+    let b = u32::from_be_bytes([1, 2, 3, 4]);
+    let arr: [u8; 2] = [0x34, 0x12];
+    let c = u16::from_le_bytes(arr);
+    if a != 0x04030201 { return 1; }
+    if b != 0x01020304 { return 2; }
+    if c != 0x1234 { return 3; }
+    0
+}
+"""), 0)
+
+    def test_slice_try_into_and_amp_array_argument(self):
+        self.assertEqual(_rs("""
+fn rd(bytes: &[u8], off: usize) -> Option<u32> {
+    let w: [u8; 4] = bytes[off..off + 4].try_into().ok()?;
+    Some(u32::from_le_bytes(w))
+}
+fn main() -> i32 {
+    let data = [1u8, 0, 0, 0, 2, 0, 0, 0];
+    let a = rd(&data, 0).unwrap();
+    let b = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if a != 1 || b != 2 { return 1; }
+    0
+}
+"""), 0)
+
+    def test_to_bytes_binds_with_let(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let b = 0x0102u16.to_be_bytes();
+    let l = 0x01020304u32.to_le_bytes();
+    if b[0] != 1 || b[1] != 2 { return 1; }
+    if l[0] != 4 || l[3] != 1 { return 2; }
+    0
+}
+"""), 0)
+
+    def test_length_mismatch_aborts(self):
+        st = _rs("""
+fn main() -> i32 {
+    let v = [1u8, 2, 3];
+    let s: &[u8] = &v;
+    u32::from_le_bytes(s.try_into().unwrap()) as i32
+}
+""")
+        self.assertNotEqual(st, 0)
+
+
+class TestGetRangeAndArrayValues(unittest.TestCase):
+
+    def test_get_with_a_range(self):
+        self.assertEqual(_rs("""
+fn rd(b: &[u8]) -> Option<u32> {
+    let w: [u8; 4] = b.get(2..6)?.try_into().ok()?;
+    Some(u32::from_le_bytes(w))
+}
+fn main() -> i32 {
+    let d = [0u8, 0, 1, 0, 0, 0, 9];
+    let s: &[u8] = &d;
+    if rd(s).unwrap() != 1 { return 1; }
+    if rd(&d[..5]).is_some() { return 2; }
+    if s.get(5..).unwrap().len() != 2 { return 3; }
+    if s.get(..=2).unwrap().len() != 3 { return 4; }
+    if s.get(4..2).is_some() { return 5; }
+    if d.get(1..8).is_some() { return 6; }
+    0
+}
+"""), 0)
+
+    def test_arrays_as_return_param_and_option_payload(self):
+        self.assertEqual(_rs("""
+struct L { a: u64 }
+fn mk(base: u64) -> [L; 2] { [L { a: base }, L { a: base + 1 }] }
+fn sum(x: [L; 2]) -> u64 { x[0].a + x[1].a }
+fn opt(b: u64) -> Option<[L; 2]> { Some(mk(b)) }
+fn take<const N: usize>(b: u64) -> Option<[u64; N]> {
+    let mut o = [0u64; N]; let mut i = 0;
+    while i < N { o[i] = b + i as u64; i += 1; }
+    Some(o)
+}
+fn main() -> i32 {
+    let a = mk(1);
+    let [p, q] = opt(10).unwrap();
+    let r: [L; 2] = mk(100);
+    let n = a.len() + r.len();
+    let [z] = take::<1>(7).unwrap();
+    let t = take::<3>(1).map(|f| f[2]).unwrap();
+    (sum(a) + p.a + q.a + r[1].a + n as u64 + z + t) as i32 - 139
+}
+"""), 0)
+
+    def test_array_param_in_match(self):
+        self.assertEqual(_rs("""
+fn f(a: [i32; 3]) -> i32 { match a { [1, _, z] => z, [x, y, z] => x + y + z } }
+fn main() -> i32 { f([1, 2, 30]) + f([2, 3, 4]) - 39 }
+"""), 0)
+
+
+class TestOptionUnitAndPointerForms(unittest.TestCase):
+
+    def test_option_of_unit(self):
+        self.assertEqual(_rs("""
+fn check(x: u32) -> Option<()> { if x > 5 { return None; } Some(()) }
+fn chain(x: u32) -> Option<u32> { check(x)?; Some(x + 1) }
+fn set_once(slot: &mut Option<u64>, v: u64) -> Option<()> {
+    if slot.is_some() { return None; }
+    *slot = Some(v);
+    Some(())
+}
+fn main() -> i32 {
+    if chain(3).unwrap() != 4 { return 1; }
+    if chain(9).is_some() { return 2; }
+    let mut s: Option<u64> = None;
+    if set_once(&mut s, 5).is_none() { return 4; }
+    if set_once(&mut s, 6).is_some() { return 5; }
+    check(2).unwrap();
+    if check(2).ok_or(7u32).is_err() { return 6; }
+    0
+}
+"""), 0)
+
+    def test_starts_with_ends_with_and_as_ref(self):
+        self.assertEqual(_rs("""
+struct I { a: u32 }
+const H: &[u8] = b"AB";
+fn first(p: *const I) -> u32 { let Some(i) = (unsafe { p.as_ref() }) else { return 0 }; i.a }
+fn main() -> i32 {
+    let d = [65u8, 66, 67];
+    let s: &[u8] = &d;
+    if !s.starts_with(H) { return 1; }
+    if !s.ends_with(&[66u8, 67]) { return 2; }
+    if s.starts_with(&[66u8]) { return 3; }
+    let i = I { a: 9 };
+    if first(&i as *const I) != 9 { return 4; }
+    if first(0 as *const I) != 0 { return 5; }
+    0
+}
+"""), 0)
+
+    def test_array_reference_keeps_length_for_copy_from_slice(self):
+        self.assertEqual(_rs("""
+const M: &[u8; 4] = b"GINX";
+fn fill(b: &mut [u8]) -> usize { b[..4].copy_from_slice(M); M.len() }
+fn main() -> i32 {
+    let mut buf = [0u8; 8];
+    let n = fill(&mut buf);
+    buf[4..8].copy_from_slice(&0x01020304u32.to_le_bytes());
+    if n != 4 || buf[0] != 71 || buf[4] != 4 || buf[7] != 1 { return 1; }
+    0
+}
+"""), 0)
+
+
 class TestNotSupported(unittest.TestCase):
 
     def test_unknown_array_method_is_still_named(self):

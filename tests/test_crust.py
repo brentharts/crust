@@ -855,10 +855,10 @@ class TestCrustSlices(unittest.TestCase):
                             " let s: &[i32] = &a[1..3]; }")
         self.assertIn("a + 1", c)
 
-    def test_array_reference_is_not_a_slice(self):
-        # `&[T; N]` is a reference to an array, not a slice.
-        c = crust.translate("fn f(a: &[i32; 4]) -> i32 { a[0] }")
-        self.assertNotIn("crust_slice", c)
+    def test_array_reference_keeps_its_length(self):
+        # `&[T; N]` is carried as a slice, so the N survives the call.
+        c = crust.translate("fn f(a: &[i32; 4]) -> usize { a.len() }")
+        self.assertIn("crust_slice_int", c)
 
     def test_slicing_a_raw_pointer_needs_an_end_bound(self):
         with self.assertRaises(crust.CrustError):
@@ -948,9 +948,9 @@ fn find(xs: &[i32], want: i32) -> Option<i32> {
         c = crust.translate("fn f() -> Option<Option<i32>> { None }")
         self.assertIn("crust_option_crust_option_int", c)
 
-    def test_option_of_unit_is_rejected(self):
-        with self.assertRaises(crust.CrustError):
-            crust.translate("fn f() -> Option<()> { None }")
+    def test_option_of_unit_is_just_the_flag(self):
+        c = crust.translate("fn f() -> Option<()> { None }")
+        self.assertIn("struct crust_option_void { _Bool some; }", c)
 
     def test_is_some_and_is_none(self):
         c = crust.translate("fn f(o: Option<i32>) -> bool "
