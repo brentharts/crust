@@ -720,6 +720,7 @@ class Unit:
         self.derives = {}       # type name -> [derived trait names]
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
+        self.generic_tuples = set()  # generic structs declared in tuple form
         self.unit_structs = set()    # struct names declared as `struct S;`
         self.consts = {}        # const/static name -> RustCType
         self.const_values = {}  # const name -> initializer text
@@ -815,7 +816,8 @@ class Unit:
         self.fn_thunks = set()      # thunks already written
         # The atomic helpers the bundled core's atomics are written against.
         # Their bodies are `_ATOMIC_C`, put in any unit that mentions one.
-        for w, cty in ((32, "unsigned int"), (64, "unsigned long")):
+        for w, cty in ((8, "unsigned char"), (16, "unsigned short"),
+                       (32, "unsigned int"), (64, "unsigned long")):
             t, pt = RustCType(cty), RustCType(cty, 1)
             self.fn_sigs["crust_atomic_load%d" % w] = (t, [pt])
             self.fn_sigs["crust_atomic_xchg%d" % w] = (t, [pt, t])
@@ -1109,6 +1111,7 @@ class Parser:
         # no code of its own. `tail_type` is None until the target or the
         # first arm fixes it.
         self.method_targs = None        # a method call's turbofish
+        self.call_targs = None          # the same, kept for the call itself
         self.tail_name = None
         self.tail_type = None
         self.tail_hint = None           # the target, for arms like `None`
@@ -1819,7 +1822,11 @@ class Parser:
             sub = dict(zip(params, args))
             p = Parser(list(toks), self.unit, sub)
             p.impl_type = mangled
-            _, fields = p.parse_struct()
+            if name in self.unit.generic_tuples:
+                _, fields = p.parse_tuple_struct()
+                self.unit.tuple_structs.add(mangled)
+            else:
+                _, fields = p.parse_struct()
             self.unit.structs[mangled] = fields
             self.unit.struct_order.append(mangled)
             self.unit.instances[mangled] = (name, args)
@@ -2069,6 +2076,198 @@ class Parser:
         return _BUILTIN_MACROS[name](self, self.macro_args(), line)
 
     # -- the built-in macros ----------------------------------------------
+    # -- inline assembly --------------------------------------------------
+
+    # Explicit registers, by the GCC constraint letter ShivyCX understands.
+    _ASM_LETTER = {
+        "a": ("rax", "eax", "ax", "al"), "b": ("rbx", "ebx", "bx", "bl"),
+        "c": ("rcx", "ecx", "cx", "cl"), "d": ("rdx", "edx", "dx", "dl"),
+        "S": ("rsi", "esi", "si", "sil"), "D": ("rdi", "edi", "di", "dil"),
+    }
+    _ASM_BOUND = ("r8", "r9", "r10", "r11")     # bound with `register .. asm`
+
+    def m_asm(self, args, line):
+        """`asm!("template", operands.., options(..))`.
+
+        The template stays Intel syntax, which is what Rust writes and what
+        ShivyCX's own output uses; the statement is handed to the C front
+        end as `__asm__ volatile` with a leading `.intel_syntax noprefix`.
+        Operands are numbered the way GCC does -- outputs first -- and the
+        Rust `{}` / `{0}` / `{name}` placeholders are rewritten to `%N`.
+        """
+        pieces, ops, never = [], [], False
+        i = 0
+        while i < len(args) and len(args[i]) == 1 and args[i][0].kind == "str":
+            text = args[i][0].val
+            if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+                text = text[1:-1]
+            pieces.append(text)
+            i += 1
+        if not pieces:
+            self.err("`asm!` needs a template string")
+        clobbers = []
+        for a in args[i:]:
+            op = self._asm_operand(a, clobbers)
+            if op == "noreturn":
+                never = True
+            elif op is not None:
+                ops.append(op)
+
+        # GCC numbering: every output first, then every input. A constant
+        # takes no register, so it takes no number either.
+        regs = [o for o in ops if o["const"] is None]
+        outs = [o for o in regs if o["out"]]
+        ins = [o for o in regs if not o["out"]]
+        extras = [o["extra"] for o in outs if o.get("extra")]
+        for n, o in enumerate(outs + ins + extras):
+            o["gcc"] = n
+        for x in extras:
+            x["constraint"] = str(x["tie"]["gcc"])
+        ins = ins + extras
+
+        # Rust positions count every operand in the order written.
+        named = {o["name"]: o for o in ops if o["name"]}
+        template = "\\n".join(pieces)   # the C escape, not a raw newline
+        counter = [0]
+
+        def placeholder(m):
+            body = m.group(1)
+            if ":" in body:
+                self.err("`asm!` operand modifiers such as `{%s}` are not "
+                         "supported", body)
+            if body == "":
+                k = counter[0]
+                counter[0] += 1
+            elif body.isdigit():
+                k = int(body)
+            else:
+                o = named.get(body)
+                if o is None:
+                    self.err("`asm!` template names `{%s}`, which is not an "
+                             "operand", body)
+                k = ops.index(o)
+            if k >= len(ops):
+                self.err("`asm!` template uses operand %d but only %d were "
+                         "given", k, len(ops))
+            o = ops[k]
+            if o["const"] is not None:
+                return o["const"]
+            if o["fixed"]:
+                self.err("`asm!` cannot refer to the explicit-register "
+                         "operand %d from its template", k)
+            return "%%%d" % o["gcc"]
+
+        template = template.replace("{{", "\x01").replace("}}", "\x02")
+        template = re.sub(r"\{([^{}]*)\}", placeholder, template)
+        template = template.replace("\x01", "{").replace("\x02", "}")
+
+        def fmt(group):
+            return ", ".join('"%s"(%s)' % (o["constraint"], o["expr"])
+                             for o in group)
+        cl = ", ".join('"%s"' % c for c in clobbers)
+        code = '__asm__ volatile(".intel_syntax noprefix\\n%s" : %s : %s%s);' \
+            % (template, fmt(outs), fmt(ins), (" : " + cl) if cl else "")
+        for o in regs:
+            for decl in o.get("decl", ()):
+                self.pending.append(decl)
+        self.pending.append(code)
+        e = Expr("0", INT)
+        e.never = never
+        return e
+
+    def _asm_operand(self, toks, clobbers):
+        """One `asm!` argument -> an operand dict, or None / "noreturn"."""
+        j = 0
+        name = None
+        if len(toks) > 2 and toks[0].kind == "ident" and toks[1].val == "=":
+            name, j = toks[0].val, 2
+        head = toks[j].val
+        if head == "options":
+            flags = [t.val for t in toks[j + 2:-1] if t.val != ","]
+            if "att_syntax" in flags:
+                self.err("`asm!` with `att_syntax` is not supported")
+            return "noreturn" if "noreturn" in flags else None
+        if head == "clobber_abi":
+            return None
+        if head == "const":
+            e = self.sub_expr(toks[j + 1:])
+            return {"name": name, "out": False, "const": e.code,
+                    "fixed": False}
+        if head == "sym":
+            self.err("`asm!` operand `sym` is not supported")
+        if head not in ("in", "out", "inout", "lateout", "inlateout"):
+            self.err("unrecognised `asm!` operand `%s`", head)
+        if toks[j + 1].val != "(" or toks[j + 3].val != ")":
+            self.err("malformed `asm!` operand `%s`", head)
+        spec = toks[j + 2]
+        rest = toks[j + 4:]
+        is_in = head == "in"
+        is_out = head in ("out", "lateout")
+        both = head in ("inout", "inlateout")
+        tie = None
+        in_toks = out_toks = rest
+        if both:
+            for k, t in enumerate(rest):
+                if t.val == "=>" and t.kind == "punc":
+                    in_toks, out_toks = rest[:k], rest[k + 1:]
+                    break
+        # `lateout("rcx") _`: a clobber, not an operand.
+        if len(out_toks) == 1 and out_toks[0].val == "_" and not is_in:
+            if spec.kind != "str":
+                self.err("`asm!` discards an output only for an explicit "
+                         "register")
+            clobbers.append(self._asm_reg_name(spec.val.strip('"')))
+            return None
+        op = {"name": name, "const": None, "fixed": False, "decl": [],
+              "out": not is_in, "tie": None}
+        reg = spec.val.strip('"') if spec.kind == "str" else None
+        letter = None
+        if reg is not None:
+            op["fixed"] = True
+            for ltr, names in self._ASM_LETTER.items():
+                if reg in names:
+                    letter = ltr
+            if letter is None and reg not in self._ASM_BOUND:
+                self.err("`asm!` register `%s` is not supported", reg)
+        elif spec.val not in ("reg", "reg_byte"):
+            self.err("`asm!` register class `%s` is not supported", spec.val)
+        if both and in_toks is not out_toks:
+            # `inout(reg) x => y`: input x tied to output y.
+            xin = self.sub_expr(in_toks)
+            yout = self.sub_expr(out_toks)
+            op["out"], op["expr"] = True, yout.code
+            op["constraint"] = "=" + (letter or "r")
+            tin = {"name": None, "const": None, "fixed": True, "decl": [],
+                   "out": False, "tie": op, "expr": xin.code,
+                   "constraint": "r"}
+            op["extra"] = tin
+            return op
+        e = self.sub_expr(rest)
+        if reg in self._ASM_BOUND:
+            if not is_in:
+                self.err("`asm!` cannot bind the output register `%s`", reg)
+            tmp = "_crust_asm%d" % self.new_asm_id()
+            ty = e.type.decl(tmp) if e.type is not None \
+                else "unsigned long " + tmp
+            op["decl"].append('register %s __asm__("%s") = %s;'
+                              % (ty, reg, e.code))
+            op["expr"], op["constraint"] = tmp, "r"
+            return op
+        op["expr"] = e.code
+        base = letter or "r"
+        op["constraint"] = ("+" if both else "=" if is_out else "") + base
+        return op
+
+    def _asm_reg_name(self, reg):
+        for names in self._ASM_LETTER.values():
+            if reg in names:
+                return names[0]
+        return reg
+
+    def new_asm_id(self):
+        self.tmp_n += 1
+        return self.tmp_n
+
 
     def m_abort(self, args, line, _msg=None):
         """`panic!` / `unreachable!` / `todo!` -- diverge immediately.
@@ -2477,7 +2676,16 @@ class Parser:
         lhs = self.parse_binary(0)
         if self.cur.kind == "punc" and self.cur.val in ASSIGN_OPS:
             op = self.next().val
-            rhs = self.parse_assign()
+            if op == "=" and lhs.type is not None:
+                # The place being assigned names the type of the value:
+                # `self.slot = None`, `v = Vec::new()`, `x = y.into()`.
+                self.expected.append(lhs.type)
+                try:
+                    rhs = self.parse_assign()
+                finally:
+                    self.expected.pop()
+            else:
+                rhs = self.parse_assign()
             # Simple `dst = src` of owning locals: free the old destination
             # (if live), copy, then zero the source so Drop does not
             # double-free. Compound assigns (`+=`, …) are left alone.
@@ -2982,12 +3190,29 @@ class Parser:
                 over = self._from_overloads(e.code)
                 if over is not None:
                     params = []         # no one signature to hint with
+                if not params and e.code in self.unit.tuple_structs \
+                        and e.code in self.unit.structs:
+                    # `Self(Inner { .. })`: the fields are the parameters, so
+                    # a generic literal inside learns its type from them.
+                    params = [ty for _, ty in self.unit.structs[e.code]]
                 if not params and e.code in self.unit.variants:
                     # a variant's payload is its signature: `Box::new(3)`
                     # as a `Box<i64>` payload is `Box_long_new`
                     payload = self._payload_of(e.code)
                     if payload:
                         params = [ty for _, ty in payload]
+                if e.code in self.unit.generic_tuples \
+                        and e.code not in self.unit.structs:
+                    # `let p: Pair<i32, i32> = Pair(3, 4)`: a generic tuple
+                    # struct is named by the type it is being made into.
+                    want = self.target
+                    inst = self.unit.instances.get(want.base) \
+                        if want is not None else None
+                    if inst is None or inst[0] != e.code:
+                        self.err("cannot tell which instantiation of `%s` "
+                                 "this is; annotate it (`let x: %s<i32> = "
+                                 "..`)", e.code, e.code)
+                    e = Expr(want.base, None)
                 if sig is None and not generic and e.from_path \
                         and e.type is None:
                     # `UnsafeCell::new(MaybeUninit::uninit())` into a field of
@@ -4194,12 +4419,36 @@ class Parser:
         if ty is None:
             return None
         if ty.ptr:
-            if ty.ptr != 1 and name not in ("is_null",):
-                return None
             if name not in _PTR_METHODS:
                 return None
+            if ty.ptr != 1 and name not in ("is_null", "cast", "cast_mut",
+                                            "cast_const", "add", "sub",
+                                            "offset"):
+                return None
+            if name in _PTR_DEREF_METHODS:
+                pointee = RustCType(ty.base, ty.ptr - 1)
+                known = (pointee.ptr or pointee.base in _RANK
+                         or pointee.base in ("float", "double", "_Bool")
+                         or pointee.base in self.unit.structs
+                         or pointee.base in self.unit.enums)
+                if not known:
+                    return None
             args = [a.code for a in self._scalar_args()]
             return self._ptr_method(recv, name, args)
+        if ty.base == "_Bool" and name == "then":
+            # `cond.then(|| value)`: the closure runs only when `cond` holds,
+            # so its body is inlined into the true arm like `Option::map`.
+            args = self.raw_call_args()
+            self._arity(name, args, 1)
+            s = self.once(recv)
+            e, w = self._apply_in_branch(args[0], [])
+            if e.type is None or e.type.is_void():
+                self.err("cannot infer what this `then` produces")
+            rty = self.unit.option_type(e.type)
+            some = Expr("(%s){1, %s}" % (rty.base, e.code), rty)
+            some.never = e.never
+            return self.branch_value(rty, s, w, some, [],
+                                     Expr("(%s){0}" % rty.base, rty))
         if ty.base == "_Bool":
             if name != "then_some":
                 return None
@@ -4237,6 +4486,30 @@ class Parser:
         if name == "write_volatile":
             return Expr("(*(volatile %s *)%s = %s)"
                         % (elem.decl(), recv.code, args[0]), VOID)
+        want = {"read": 0, "read_unaligned": 0, "write": 1,
+                "write_unaligned": 1, "cast": 0, "cast_mut": 0,
+                "cast_const": 0}
+        if name in want and len(args) != want[name]:
+            self.err("`%s` takes %d argument%s, got %d", name, want[name],
+                     "" if want[name] == 1 else "s", len(args))
+        if name in ("cast", "cast_mut", "cast_const"):
+            if name == "cast" and self.call_targs:
+                to = self.call_targs[0]
+            elif name == "cast":
+                tgt = self.target
+                if tgt is None or not tgt.ptr:
+                    self.err("cannot tell what `.cast()` converts to; write "
+                             "`.cast::<T>()` or annotate the target")
+                to = RustCType(tgt.base, tgt.ptr - 1)
+            else:
+                return recv                 # mutability is not tracked
+            return Expr("((%s)%s)" % (RustCType(to.base, to.ptr + 1).decl(),
+                                      recv.code),
+                        RustCType(to.base, to.ptr + 1))
+        if name in ("read", "read_unaligned"):
+            return Expr("(*%s)" % recv.code, elem)
+        if name in ("write", "write_unaligned"):
+            return Expr("(*%s = %s)" % (recv.code, args[0]), VOID)
         if name in ("add", "offset", "wrapping_add"):
             return Expr("(%s + %s)" % (recv.code, args[0]), ty)
         if name in ("sub", "wrapping_sub"):
@@ -4327,6 +4600,9 @@ class Parser:
             return mk("(%s > 0 ? 1 : (%s < 0 ? -1 : 0))" % (a, a))
         if name == "is_power_of_two":
             return mk("(%s != 0 && (%s & (%s - 1)) == 0)" % (a, a, a),
+                      RustCType("_Bool"))
+        if name == "is_multiple_of":
+            return mk("(%s == 0 ? %s == 0 : %s %% %s == 0)" % (b, a, a, b),
                       RustCType("_Bool"))
         if name == "div_ceil":
             return mk("(%s)(%s / %s + (%s %% %s != 0))" % (T, a, b, a, b))
@@ -4528,6 +4804,7 @@ class Parser:
             ch.subj = recv
             ch.ops = [(name, [])]
             return self.iter_value(ch)
+        self.call_targs = self.method_targs     # `p.cast::<T>()` reads this
         self.method_targs = None
         if recv.type is not None and not recv.type.array \
                 and recv.type.base in self.unit.structs \
@@ -4624,6 +4901,10 @@ class Parser:
             return Expr(call, elem if ret == "elem" else
                         (RustCType("void") if ret is None else RustCType(ret)))
 
+        if info is None and recv.type is not None:
+            got = self.seq_method(recv, name, args, aexprs)
+            if got is not None:
+                return got
         if recv.type is not None and recv.type.base in self.unit.slices:
             if name == "len":
                 return Expr("%s.len" % recv.code, RustCType("unsigned long"))
@@ -4693,6 +4974,113 @@ class Parser:
                 and self.owning_free(info.ret) is not None:
             out.borrowed = True
         return out
+
+    _SEQ_METHODS = frozenset((
+        "len", "is_empty", "get", "get_mut", "first", "last", "first_mut",
+        "last_mut", "copy_from_slice", "clone_from_slice", "fill", "contains",
+        "swap"))
+
+    def _seq_parts(self, recv):
+        """(pointer to element 0, length, element type) of an array or slice.
+
+        Both are C expressions that are safe to repeat. None when `recv` is
+        neither -- a slice is `{ptr, len}`, an array carries its length in its
+        type, and a reference to an array is that array behind one `*`.
+        """
+        ty = recv.type
+        if ty.base in self.unit.slices and not ty.ptr and not ty.array:
+            s = self.once(recv)
+            return s + ".ptr", s + ".len", self.unit.slices[ty.base]
+        if ty.array and len(ty.array) == 1 and ty.ptr <= 1:
+            # `ptr` here is a pointer *to the array* when it is 1 and the
+            # element type itself already carries its own stars in `base`.
+            code = recv.code if not ty.ptr else "(*%s)" % self.once(recv)
+            return code, ty.array[0], RustCType(ty.base, 0)
+        return None
+
+    def seq_method(self, recv, name, args, aexprs):
+        """Methods shared by arrays and slices, or None if not applicable."""
+        if name not in self._SEQ_METHODS:
+            return None
+        if name in ("len", "is_empty") and recv.type.base in self.unit.slices \
+                and not recv.type.array:
+            return None                 # slices already have these
+        parts = self._seq_parts(recv)
+        if parts is None:
+            return None
+        ptr, n, elem = parts
+        usize = RustCType("unsigned long")
+        BOOL = RustCType("_Bool")
+
+        def arity(k):
+            if len(args) != k:
+                self.err("`%s` takes %d argument%s, got %d", name, k,
+                         "" if k == 1 else "s", len(args))
+
+        if name == "len":
+            arity(0)
+            return Expr("(%s)" % n, usize)
+        if name == "is_empty":
+            arity(0)
+            return Expr("((%s) == 0)" % n, BOOL)
+        if name in ("get", "get_mut", "first", "last", "first_mut",
+                    "last_mut"):
+            arity(1 if name.startswith("get") else 0)
+            opt = self.unit.option_type(RustCType(elem.base, elem.ptr + 1))
+            if name.startswith("get"):
+                i = self.once(Expr(args[0], usize))
+                at = i
+            elif name.startswith("first"):
+                at = "0"
+            else:
+                at = "(%s) - 1" % n
+            cond = ("(%s) < (%s)" % (at, n)) if name.startswith("get") \
+                else "(%s) > 0" % n
+            return Expr("(%s ? (%s){1, &%s[%s]} : (%s){0})"
+                        % (cond, opt.base, ptr, at, opt.base), opt)
+        if name in ("copy_from_slice", "clone_from_slice"):
+            arity(1)
+            src = self._seq_parts(aexprs[0]) \
+                if aexprs[0].type is not None else None
+            if src is None:
+                self.err("`%s` needs a slice or array argument", name)
+            self.unit.needs.add("memcpy")
+            self.unit.needs.add("abort")
+            self.pending.append(
+                "if ((%s) != (%s)) abort(); memcpy(%s, %s, (%s) * sizeof(%s));"
+                % (src[1], n, ptr, src[0], n, elem.decl()))
+            return Expr("(void)0", RustCType("void"))
+        if name == "fill":
+            arity(1)
+            v = self.once(Expr(args[0], elem))
+            k = self.new_temp()
+            self.pending.append("for (unsigned long %s = 0; %s < (%s); %s++) "
+                                "%s[%s] = %s;" % (k, k, n, k, ptr, k, v))
+            return Expr("(void)0", RustCType("void"))
+        if name == "contains":
+            arity(1)
+            a0 = args[0].strip()
+            # `contains(&7)` hands over a reference to a literal; read the
+            # value straight off rather than taking its address and back.
+            v = self.once(Expr(a0[1:].strip() if a0.startswith("&")
+                               and not a0.startswith("&&")
+                               else "(*%s)" % a0, elem))
+            k, hit = self.new_temp(), self.new_temp()
+            self.pending.append(
+                "_Bool %s = 0; for (unsigned long %s = 0; %s < (%s); %s++) "
+                "if (%s[%s] == %s) { %s = 1; break; }"
+                % (hit, k, k, n, k, ptr, k, v, hit))
+            return Expr(hit, BOOL)
+        if name == "swap":
+            arity(2)
+            a = self.once(Expr(args[0], usize))
+            b = self.once(Expr(args[1], usize))
+            t = self.new_temp()
+            self.pending.append("%s = %s[%s]; %s[%s] = %s[%s]; %s[%s] = %s;"
+                                % (elem.decl(t), ptr, a, ptr, a, ptr, b,
+                                   ptr, b, t))
+            return Expr("(void)0", RustCType("void"))
+        return None
 
     def parse_struct_literal(self, name, line):
         """Lower `Name { f: e, .. }` to a C compound literal."""
@@ -5493,6 +5881,9 @@ class Parser:
                 out.write(" %s(&%s);" % (info.mangled, name))
 
     def _parse_stmt(self, out, indent, tail_returns):
+        if self.at(";", "punc"):
+            self.next()                 # an empty statement
+            return
         if self.at("#", "punc"):
             # Attributes on a statement: `#[allow(..)]` and friends are
             # ignored as they are on items; `#[invariant]`/`#[variant]`
@@ -5612,6 +6003,7 @@ class Parser:
             # { 6 } }` at a function's tail: the C computed `5;` and
             # returned whatever was in the register.
             self.parse_block(out, indent, tail_returns)
+            self.accept(";")            # `{ .. };` -- a harmless empty statement
             return
 
         if (t.val == "unsafe" and t.kind == "kw"
@@ -5622,6 +6014,7 @@ class Parser:
             # (`unsafe fn` is handled with the other item modifiers.)
             self.next()
             self.parse_block(out, indent, tail_returns)
+            self.accept(";")
             return
 
         # expression statement, or a trailing expression
@@ -8420,6 +8813,8 @@ class Parser:
         self.skip_visibility()
         self.expect("struct")
         name = self.expect_ident()
+        if self.at("<", "punc"):
+            self.skip_generic_params()     # bound by the instantiation
         self.expect("(")
         fields = []
         while not self.at(")", "punc"):
@@ -8479,6 +8874,13 @@ class Parser:
             if self.toks[j].val == "#":
                 return False                     # attribute; let the parser
             j += 1                               # handle it normally
+            if self.toks[j - 1].val == "pub" and self.toks[j].val == "(":
+                depth = 0                        # `pub(crate)`, `pub(in p)`
+                while j < len(self.toks):
+                    depth += (self.toks[j].val == "(") - (self.toks[j].val == ")")
+                    j += 1
+                    if depth == 0:
+                        break
         if not (self.toks[j].val == "const" and self.toks[j].kind == "kw"):
             return False
         # `const fn new(..)` is a function whose `const` promises it can run
@@ -8934,6 +9336,7 @@ def wider(a, b):
 
 
 _BUILTIN_MACROS = {
+    "asm": Parser.m_asm,
     "assert": Parser.m_assert,
     "body_invariant": Parser.m_body_invariant,
     "debug_assert": Parser.m_dbg_noop,
@@ -9208,7 +9611,56 @@ def _gpu_barrier(p, args, atys, targs):
     return Expr("gpu_barrier()", RustCType("void"))
 
 
+def _ci_cpuid(counted):
+    """`__cpuid(leaf)` / `__cpuid_count(leaf, sub)` -> `CpuidResult::query`."""
+    def lower(p, args, atys, targs):
+        ensure_core_concrete(p.unit, "CpuidResult")
+        if len(args) != (2 if counted else 1):
+            p.err("`__cpuid%s` takes %d argument%s", "_count" if counted
+                  else "", 2 if counted else 1, "s" if counted else "")
+        return Expr("CpuidResult_query(%s, %s)"
+                    % (args[0], args[1] if counted else "0"),
+                    RustCType("CpuidResult"))
+    return lower
+
+
+def _prim_from(target):
+    """`u64::from(x)` -- a lossless conversion, so a cast of the right type."""
+    def lower(p, args, atys, targs):
+        if len(args) != 1:
+            p.err("`%s::from` takes one argument", target)
+        ct = RustCType(PRIMITIVES[target])
+        return Expr("((%s)%s)" % (ct.decl(), args[0]), ct)
+    return lower
+
+
+def _prim_try_from(target):
+    """`u8::try_from(x)` -- `Ok(x as u8)` if the value survives the cast.
+
+    A value fits iff casting it and comparing gives the same number and the
+    same sign; both halves are needed, because C converts the signed side of
+    a mixed comparison to unsigned (`-1` against `u64::MAX` compares equal).
+    The error is a one-byte placeholder for `TryFromIntError`, which carries
+    nothing a caller can read.
+    """
+    def lower(p, args, atys, targs):
+        if len(args) != 1:
+            p.err("`%s::try_from` takes one argument", target)
+        ct = RustCType(PRIMITIVES[target])
+        rty = p.unit.result_type(ct, RustCType("unsigned char"))
+        src = Expr(args[0], atys[0])
+        x = p.once(src)
+        ok = "((%s)%s == %s && ((%s < 0) == ((%s)%s < 0)))" \
+            % (ct.decl(), x, x, x, ct.decl(), x)
+        return Expr("(%s ? (%s){.ok = 1, .value = (%s)%s} : (%s){.ok = 0, "
+                    ".error = 0})" % (ok, rty.base, ct.decl(), x, rty.base),
+                    rty)
+    return lower
+
+
 _CORE_FNS = {
+    "__cpuid": _ci_cpuid(False),
+    "__cpuid_count": _ci_cpuid(True),
     "gpu_barrier": _gpu_barrier,
     "gpu_atomic_add": _gpu_atomic("gpu_atomic_add", 1),
     "gpu_atomic_sub": _gpu_atomic("gpu_atomic_sub", 1),
@@ -9249,6 +9701,14 @@ _CORE_FNS = {
     "from_raw_parts": _ci_from_raw_parts,
     "from_raw_parts_mut": _ci_from_raw_parts,
 }
+
+
+for _t in ("i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64",
+           "usize", "f32", "f64"):
+    _CORE_FNS["%s_from" % _t] = _prim_from(_t)
+for _t in ("i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64",
+           "usize"):
+    _CORE_FNS["%s_try_from" % _t] = _prim_try_from(_t)
 
 
 def _core_intrinsic(name):
@@ -9431,7 +9891,8 @@ def _atomic_helpers():
     the compiler must not keep the value in a register across a spin loop.
     """
     out = []
-    for w, cty, sfx in ((32, "unsigned int", "l"), (64, "unsigned long", "q")):
+    for w, cty, sfx in ((8, "unsigned char", "b"), (16, "unsigned short", "w"),
+                        (32, "unsigned int", "l"), (64, "unsigned long", "q")):
         out.append(
             "static inline %(t)s crust_atomic_load%(w)d(%(t)s *p) { "
             "%(t)s v = *(volatile %(t)s *)p; "
@@ -10293,9 +10754,30 @@ def find_rust_items(code, rust_file=False):
                               "unit_struct"))
             continue
 
+        gen_end = _iend
+        if kw == "struct" and after.lstrip().startswith("<"):
+            # `struct W<T>(Inner<T>);` -- step over the parameter list so the
+            # `(` that follows it is seen; otherwise the scan runs on to the
+            # next `{` and swallows whatever item comes after.
+            lt = scan.index("<", _iend)
+            depth, k = 0, lt
+            while k < len(scan):
+                if scan[k] == "<":
+                    depth += 1
+                elif scan[k] == ">" and scan[k - 1] != "-":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif scan[k] in "{;(" and depth > 0 and scan[k] != "(":
+                    break               # not a parameter list after all
+                k += 1
+            if depth == 0 and k < len(scan) and scan[k] == ">" \
+                    and scan[k + 1:].lstrip().startswith("("):
+                gen_end = k + 1
+                after = scan[gen_end:]
         if kw == "struct" and after.lstrip().startswith("("):
             # Tuple struct: `struct P(f64, f64);`
-            open_idx = scan.index("(", _iend)
+            open_idx = scan.index("(", gen_end)
             close_paren = _match_paren(scan, open_idx)
             if close_paren is None:
                 raise CrustError("unterminated tuple struct near offset %d"
@@ -11101,8 +11583,10 @@ def _generic_params_of(toks, kind):
     and whitespace cannot confuse it, and so `impl<T>` and `impl <T>` are the
     same thing.
     """
-    if kind not in ("struct", "fn", "impl"):
+    if kind not in ("struct", "tuple_struct", "fn", "impl"):
         return None
+    if kind == "tuple_struct":
+        kind = "struct"                 # same head: `struct Name<T>(..);`
     p = Parser(list(toks))
     try:
         p.skip_attributes()
@@ -11175,8 +11659,10 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 unit.core_names.discard(name)
                 unit.generic_impls[:] = [g for g in unit.generic_impls
                                          if g[1] != name]
-            if kind == "struct":
+            if kind in ("struct", "tuple_struct"):
                 unit.generic_structs[name] = (params, toks)
+                if kind == "tuple_struct":
+                    unit.generic_tuples.add(name)
             elif kind == "fn":
                 unit.generic_fns[name] = (params, toks)
             elif kind == "impl":
@@ -12128,20 +12614,26 @@ def _load_core_unit():
         _CORE_CACHE["full"] = unit
         return unit
     spans = find_rust_items(text, rust_file=True)
-    collect_items(text, spans, unit, [])
-    # Emit bodies for concrete (non-generic) impls so callers can link them
-    # into a using unit. Generic impls stay as templates.
-    for start, end, kind in spans:
-        if kind != "impl" or _is_generic_span(text, start, end, kind):
-            continue
-        line0 = _line_of(text, start)
-        parser = Parser(tokenize(text[start:end], line0), unit)
-        out = Out(line0)
-        try:
-            parser.parse_impl(out)
-        except CrustError:                              # pragma: no cover
-            continue
-        unit.emitted.append(out.text())
+    # While the core is read its own types are already in `unit`; a type named
+    # in a signature (`Result<u32, u32>`) must not start a second load.
+    _CORE_CACHE["loading"] = True
+    try:
+        collect_items(text, spans, unit, [])
+        # Emit bodies for concrete (non-generic) impls so callers can link
+        # them into a using unit. Generic impls stay as templates.
+        for start, end, kind in spans:
+            if kind != "impl" or _is_generic_span(text, start, end, kind):
+                continue
+            line0 = _line_of(text, start)
+            parser = Parser(tokenize(text[start:end], line0), unit)
+            out = Out(line0)
+            try:
+                parser.parse_impl(out)
+            except CrustError:                          # pragma: no cover
+                continue
+            unit.emitted.append(out.text())
+    finally:
+        _CORE_CACHE["loading"] = False
     _CORE_CACHE["full"] = unit
     return unit
 
@@ -12184,8 +12676,11 @@ def ensure_core_concrete(unit, name):
             or name in unit.generic_structs:
         return
     # Atomics depend on Ordering for their method signatures.
-    if name in ("AtomicU32", "AtomicUsize", "AtomicU64", "AtomicBool"):
+    if name in ("AtomicU8", "AtomicU16", "AtomicU32", "AtomicUsize",
+                "AtomicU64", "AtomicBool"):
         ensure_core_concrete(unit, "Ordering")
+    if _CORE_CACHE.get("loading"):
+        return            # the core is being read: its types are all there
     core = _load_core_unit()
     if name in core.generic_structs:
         return
@@ -12209,6 +12704,13 @@ def ensure_core_concrete(unit, name):
         unit.methods[(owner, mname)] = info
         if info.mangled in core.fn_sigs:
             unit.fn_sigs[info.mangled] = core.fn_sigs[info.mangled]
+            # A method returning `Result<..>` (`compare_exchange`) names a
+            # result struct the user's unit has never seen; register it so
+            # `is_ok`, `unwrap` and `?` work on the value.
+            for ty in [core.fn_sigs[info.mangled][0]]:
+                if ty is not None and ty.base in core.results \
+                        and ty.base not in unit.results:
+                    unit.result_type(*core.results[ty.base])
     # Copy method bodies for this type from the core's emitted list.
     prefix = name + "_"
     for text in core.emitted:
@@ -12651,7 +13153,13 @@ def _strip_compound_casts(text):
 
 
 _PTR_METHODS = ("is_null", "read_volatile", "write_volatile", "add", "sub",
-                "offset", "wrapping_add", "wrapping_sub")
+                "offset", "wrapping_add", "wrapping_sub", "cast", "cast_mut",
+                "cast_const", "read", "write", "read_unaligned",
+                "write_unaligned")
+# Methods that load or store through the pointer. Only taken for a pointee
+# Crust knows, so `file.read(buf)` on some unrelated type is still an error
+# rather than a silent dereference.
+_PTR_DEREF_METHODS = ("read", "write", "read_unaligned", "write_unaligned")
 _INT_UNARY = ("wrapping_neg", "abs", "is_positive", "is_negative", "signum",
               "is_power_of_two", "next_power_of_two", "count_ones",
               "count_zeros", "leading_zeros", "trailing_zeros")
@@ -12659,7 +13167,7 @@ _INT_METHODS = frozenset(_INT_UNARY) | frozenset((
     "wrapping_add", "wrapping_sub", "wrapping_mul", "saturating_add",
     "saturating_sub", "checked_add", "checked_sub", "checked_mul", "min",
     "max", "clamp", "abs_diff", "pow", "div_ceil", "next_multiple_of",
-    "rem_euclid", "rotate_left", "rotate_right"))
+    "is_multiple_of", "rem_euclid", "rotate_left", "rotate_right"))
 
 
 def _fold_int_const(init, env):
