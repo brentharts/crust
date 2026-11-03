@@ -2462,6 +2462,39 @@ are accepted wherever a slice or array argument is. Slices gain `starts_with`
 and `ends_with`, and a raw pointer gains `as_ref()` / `as_mut()` returning an
 `Option` (null is `None`).
 
+### A `None` with no annotation
+
+`None` takes its type from where it is used, and when nothing around it names
+the type yet it waits for a later use to do so. These forms all work without
+an annotation:
+
+```rust
+let mut previous = None;            // fixed by the assignment below
+for f in frames {
+    if f == id { return Some((f, previous)); }
+    previous = Some(f);
+}
+
+let action = if n == 0 { None } else { Some(read(n)) };   // sibling arm
+let (a, b) = if x { (1, None) } else { (2, Some(3)) };    // tuple position
+```
+
+A `None` that nothing ever types is still the "cannot infer the type of
+`None`" error, reported at the line of the `None`. `Vec::new()` with no
+annotation is not covered by this yet.
+
+### Receivers, ordering, `addr_of!`
+
+Methods may take `mut self` and `self: &Self`. A struct-typed `const` or
+`static` is read after the structs, so it may precede the struct it builds, and
+`Alias { .. }` builds the struct a `type Alias = Struct;` names. `addr_of!(x)` /
+`addr_of_mut!(x)` (also as `ptr::addr_of!`) give `&x`, and function-pointer
+types accept `unsafe extern "C" fn(..)`.
+
+`impl Fn(..) -> R` as a parameter, in a function *or* a method, is the closure
+object type for that signature, and the signature also types any closure
+parameters written without annotations (`call(|a| a + 1, 2)`).
+
 ### Byte conversions
 
 `u32::from_le_bytes(x)` (also `_be_`, `_ne_`, every integer width) accepts an
