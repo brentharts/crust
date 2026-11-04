@@ -1149,9 +1149,13 @@ class Parser:
         self.impl_type = None           # enclosing `impl` type name, if any
         self.impl_trait = None          # trait of the enclosing `impl`, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
+        self.cond_starts = []           # token index where each began
         self.behind_ref = 0             # >0 while parsing the pointee of `&`
         self.expected = []              # target types, for inferring `None`
         self.synth_main = False         # parsing a unit `fn main` as C main
+        # Set while an inlined closure body that says `return` is parsed:
+        # {tmp, label, want, types}; see `apply_fn`.
+        self.closure_ret = None
         self.tmp_n = 0                  # counter for generated temporaries
         self.pending = []               # statements hoisted out of `?`
         # Guards spilled to a temporary so a `*m.lock()` could reach through
@@ -2185,6 +2189,7 @@ class Parser:
         p.moved = self.moved
         p.impl_type = self.impl_type
         p.ret_type = self.ret_type
+        p.closure_ret = self.closure_ret
         p.tmp_n = self.tmp_n
         e = p.parse_expr_as(want)
         # Temporaries are numbered per parser; carry the count back so a
@@ -2819,6 +2824,24 @@ class Parser:
         del self.pending[mark:]
         return taken
 
+    def _struct_lit_ok(self):
+        """May a `Name { .. }` here be a struct literal?
+
+        Not at the top level of a condition, where the brace opens the body;
+        but inside parentheses or brackets in one -- `x == Some(P { a })` --
+        there is no such ambiguity.
+        """
+        if not self.no_struct_lit:
+            return True
+        depth = 0
+        for t in self.toks[self.cond_starts[-1]:self.i]:
+            if t.kind == "punc":
+                if t.val in ("(", "["):
+                    depth += 1
+                elif t.val in (")", "]"):
+                    depth -= 1
+        return depth > 0
+
     def parse_cond(self):
         """Parse an expression in condition position.
 
@@ -2826,10 +2849,12 @@ class Parser:
         body is unambiguous; Crust follows the same rule.
         """
         self.no_struct_lit += 1
+        self.cond_starts.append(self.i)
         try:
             e = self.parse_assign()
         finally:
             self.no_struct_lit -= 1
+            self.cond_starts.pop()
         if e.iter is not None:
             self.unconsumed()
         return e
@@ -2911,7 +2936,21 @@ class Parser:
         while self.cur.kind == "punc" and self.cur.val in ops:
             op = self.next().val
             mark = len(self.pending)
-            right = self.parse_binary(level + 1)
+            agg = op in ("==", "!=") and self._comparable(left.type)
+            if agg:
+                self.expected.append(left.type)         # `x == None`
+            try:
+                right = self.parse_binary(level + 1)
+            finally:
+                if agg:
+                    self.expected.pop()
+            if agg and right.type is not None:
+                self.unify(left.type, right.type)
+                a, b = self.once(left), self.once(right)
+                test = self._agg_eq(a, b, self.real(left.type))
+                left = Expr(test if op == "==" else "(!%s)" % test,
+                            RustCType("_Bool"))
+                continue
             if op in ("&&", "||") and len(self.pending) > mark:
                 # The right operand hoisted work -- a `?`, a block, a spilled
                 # temporary -- and that work is only allowed to run when the
@@ -2935,6 +2974,51 @@ class Parser:
                 type_ = right.type
             left = Expr("(%s %s %s)" % (left.code, op, right.code), type_)
         return left
+
+    def _comparable(self, ty, depth=0):
+        """True if `==` on a `ty` value can be spelled field by field."""
+        ty = self.real(ty)
+        if ty is None or ty.ptr or ty.array or depth > 6:
+            return False
+        if ty.base in self.unit.deferred:
+            return True                     # an untyped `None`, still open
+        if ty.base in self.unit.options:
+            elem = self.unit.options[ty.base]
+            return elem.is_void() or self._scalar_or_comparable(elem, depth)
+        u = self.unit
+        if ty.base in u.tuples or (
+                ty.base in u.structs and ty.base not in u.slices
+                and ty.base not in u.results and ty.base not in u.arrays
+                and ty.base not in u.dyn_types and ty.base not in u.fn_boxes
+                and ty.base not in u.data_enums):
+            return all(self._scalar_or_comparable(t, depth)
+                       for _f, t in u.structs[ty.base])
+        return False
+
+    def _scalar_or_comparable(self, ty, depth):
+        if ty.array:
+            return False
+        if ty.ptr or ty.base in _RANK or ty.base in ("_Bool", "float",
+                                                      "double", "crust_char"):
+            return True
+        return self._comparable(ty, depth + 1)
+
+    def _agg_eq(self, a, b, ty):
+        """C test that two values of `ty` (places) are equal, field by field."""
+        ty = self.real(ty)
+        if ty.ptr or ty.base not in self.unit.structs \
+                or ty.base in self.unit.deferred:
+            return "(%s == %s)" % (a, b)
+        if ty.base in self.unit.options:
+            elem = self.unit.options[ty.base]
+            if elem.is_void():
+                return "(%s.some == %s.some)" % (a, b)
+            inner = self._agg_eq("%s.value" % a, "%s.value" % b, elem)
+            return "(%s.some == %s.some && (!%s.some || %s))" % (a, b, a,
+                                                                 inner)
+        parts = [self._agg_eq("%s.%s" % (a, f), "%s.%s" % (b, f), t)
+                 for f, t in self.unit.structs[ty.base]]
+        return "(%s)" % (" && ".join(parts) or "1")
 
     def _ref_dyn(self):
         """`dyn ..` behind `&` / `*const`: fat already, except for `Fn`."""
@@ -3570,6 +3654,10 @@ class Parser:
         tmp = self.new_temp()
         self.pending.append("%s = %s;" % (e.type.decl(tmp), e.code))
 
+        cr = self.closure_ret
+        if cr is not None:
+            return self._closure_try(cr, tmp, src)
+
         if src in self.unit.results:
             ok, err = self.unit.results[src]
             if ret.base not in self.unit.results:
@@ -3803,6 +3891,41 @@ class Parser:
             self.variant_state[_clause_key(toks, cline)] = (prev, first)
             out.line_at(line, "long %s = 0; _Bool %s = 1;" % (prev, first),
                         indent)
+
+    def _closure_try(self, cr, tmp, src):
+        """`?` in an inlined closure: leave the closure with `None`/`Err`."""
+        want = cr["want"]
+        if src in self.unit.options:
+            if want is not None and want.base in self.unit.options:
+                ty = want
+            else:
+                ty = self.new_deferred("opt")
+                cr["types"].append(ty)
+            cr["used"] = True
+            self.pending.append("if (!%s.some) { %s = (%s){0}; goto %s; }"
+                                % (tmp, cr["tmp"], ty.base, cr["label"]))
+            elem = self.unit.options[src]
+            return Expr("(void)0", VOID) if elem.is_void() \
+                else Expr("%s.value" % tmp, elem)
+        if src in self.unit.results and want is not None \
+                and want.base in self.unit.results:
+            ok, err = self.unit.results[src]
+            _, want_err = self.unit.results[want.base]
+            conv = "%s.error" % tmp
+            if want_err.decl() != err.decl():
+                via = self.unit.from_impl(want_err, err)
+                if via is None:
+                    self.err("`?` cannot convert error type `%s` to `%s`",
+                             err.decl(), want_err.decl())
+                conv = "%s(%s.error)" % (via.mangled, tmp)
+            cr["used"] = True
+            self.pending.append(
+                "if (!%s.ok) { %s = (%s){.ok = 0, .error = %s}; goto %s; }"
+                % (tmp, cr["tmp"], want.base, conv, cr["label"]))
+            return Expr("(void)0", VOID) if ok.is_void() \
+                else Expr("%s.value" % tmp, ok)
+        self.err("`?` inside a closure needs the closure's result type to be "
+                 "known")
 
     def _early_exit_drops(self):
         """Drops for a `return` queued as text by `?`, space-terminated.
@@ -4188,13 +4311,8 @@ class Parser:
             self.err("this closure takes %d argument%s, but %d %s passed",
                      len(params), "" if len(params) == 1 else "s", len(args),
                      "is" if len(args) == 1 else "are")
-        for tok in body:
-            if (tok.kind == "kw" and tok.val == "return") or \
-                    (tok.kind == "punc" and tok.val == "?"):
-                self.err("`%s` inside a closure passed to this method is not "
-                         "supported: the closure is inlined, so it would "
-                         "leave the enclosing function instead of the "
-                         "closure", tok.val)
+        returns = any((t.kind == "kw" and t.val == "return")
+                       or (t.kind == "punc" and t.val == "?") for t in body)
         self.scope_push()
         try:
             for idx in range(len(params)):
@@ -4224,9 +4342,41 @@ class Parser:
                                          mode)
                 else:
                     self.err("a tuple pattern needs a tuple argument")
-            return self.sub_expr(body, want)
+            if not returns:
+                return self.sub_expr(body, want)
+            return self._closure_with_returns(body, want)
         finally:
             self.scope_pop()
+
+    def _closure_with_returns(self, body, want):
+        """An inlined closure body that says `return`.
+
+        The body is C statements in the enclosing function, so a `return`
+        stores its value in a temporary and jumps to a label after the body,
+        where the body's own final value is stored the same way.
+        """
+        cr = {"tmp": self.new_temp(), "want": want, "types": [],
+              "label": "_crust_cr%d" % self._next_n(), "used": False}
+        outer, self.closure_ret = self.closure_ret, cr
+        mark = len(self.pending)
+        try:
+            e = self.sub_expr(body, want)
+        finally:
+            self.closure_ret = outer
+        types = ([e.type] if e.type is not None and not e.never else []) \
+            + cr["types"]
+        for t in types[1:]:
+            self.unify(types[0], t)
+        ty = self.real(want if want is not None else
+                       (types[0] if types else None))
+        if ty is None or ty.is_void():
+            self.err("cannot infer the type this closure returns; annotate "
+                     "the target")
+        self.pending.insert(mark, "%s;" % ty.decl(cr["tmp"]))
+        if not e.never:
+            self.pending.append("%s = %s;" % (cr["tmp"], e.code))
+        self.pending.append("%s: ;" % cr["label"])
+        return Expr(cr["tmp"], ty)
 
     def _bind_param(self, pname, pty, by_ref, code, aty, mode):
         """Bind one inlined-closure parameter to the C value `code`."""
@@ -4687,8 +4837,11 @@ class Parser:
         if ty is not None and ty.ptr == 1:
             code = "%s->%s" % (recv.code, field)
         elif ty is not None and ty.ptr > 1:
-            self.err("field access through a double pointer is not "
-                     "supported")
+            # `&&T`, as a `filter` closure sees an `Option<&T>`'s item:
+            # Rust's `.` reaches through every level.
+            code = "%s->%s" % ("(" + "*" * (ty.ptr - 1) + recv.code + ")",
+                               field)
+            ty = RustCType(ty.base)
         else:
             code = "%s.%s" % (recv.code, field)
         ftype = None
@@ -4709,9 +4862,16 @@ class Parser:
         ty = recv.type
         if ty is None:
             return None
+        if ty.ptr == 1 and not ty.array and name not in _PTR_METHODS \
+                and (ty.base in _RANK or ty.base in ("float", "double")):
+            # `&u32`: Rust's `.` reaches the integer's own methods.
+            recv = Expr("(*%s)" % recv.code, RustCType(ty.base))
+            ty = recv.type
         if ty.ptr:
             if name not in _PTR_METHODS:
                 return None
+            if ty.base in self.unit.options and name in ("as_ref", "as_mut"):
+                return None         # `&Option<T>`: the Option's own method
             if ty.ptr != 1 and name not in ("is_null", "cast", "cast_mut",
                                             "cast_const", "add", "sub",
                                             "offset"):
@@ -5819,6 +5979,8 @@ class Parser:
         Only value-producing arms are accepted here; an `if` whose arms hold
         statements is a statement, and is handled by `parse_stmt`.
         """
+        if self.peek().val == "let":
+            return self.value_of("iflet", self.cur.line)    # `if let` value
         self.expect("if")
         cond = self.parse_cond()
         mark = len(self.pending)
@@ -5911,6 +6073,8 @@ class Parser:
         try:
             if kind == "match":
                 self.parse_match(out, 0, True)
+            elif kind == "iflet":
+                self.parse_if_let(out, 0, True)
             else:
                 self.parse_block(out, 0, True)
             types = self.tail_types
@@ -5929,8 +6093,17 @@ class Parser:
             self.unify(types[0], other_ty)          # `{ None }` / `{ Some(x) }`
         types = [self.real(t) for t in types]
         ty = _join_types(types)
+        if ty is None and self.closure_ret is not None \
+                and self.closure_ret["used"]:
+            # `|x| { return x; }`: every path leaves through the `return`.
+            self.pending.append(" ".join(l.strip() for l in
+                                         out.text().splitlines()
+                                         if l.strip()))
+            diverges = Expr("", None)
+            diverges.never = True
+            return diverges
         if ty is None or ty.is_void():
-            if kind == "match":
+            if kind in ("match", "iflet"):
                 self.err("cannot infer the type of this `match`; annotate "
                          "the target, or make an arm produce a typed value")
             self.err("this block ends without a value; a block used as an "
@@ -6198,7 +6371,7 @@ class Parser:
                 # named nothing, and the C front end refused it.
                 prim, code = _INT_LIMITS[name]
                 return Expr(code, RustCType(PRIMITIVES[prim]))
-            if self.at("{", "punc") and not self.no_struct_lit \
+            if self.at("{", "punc") and self._struct_lit_ok() \
                     and name not in self.unit.structs \
                     and name not in self.unit.generic_structs \
                     and self._payload_of(name) is None:
@@ -6211,7 +6384,7 @@ class Parser:
                 if alias is not None and alias.base in self.unit.structs \
                         and not alias.ptr and not alias.array:
                     name = alias.base
-            if saw_path and self.at("{", "punc") and not self.no_struct_lit \
+            if saw_path and self.at("{", "punc") and self._struct_lit_ok() \
                     and name not in self.unit.structs \
                     and name not in self.unit.generic_structs \
                     and self._payload_of(name) is None:
@@ -6221,7 +6394,7 @@ class Parser:
                     name = got
             # `Name { ... }` is a struct literal, except in a condition
             # position, where Rust also treats the brace as a block.
-            if (self.at("{", "punc") and not self.no_struct_lit
+            if (self.at("{", "punc") and self._struct_lit_ok()
                     and self._payload_of(name) is not None):
                 # `Shape::Rect { w: 3.0, h: 4.0 }` -- a struct-form variant.
                 fields = self._payload_of(name)
@@ -6241,10 +6414,10 @@ class Parser:
                              ", ".join("`%s`" % m for m in missing))
                 return self.data_variant_literal(
                     name, [given[f] for f, _ in fields])
-            if (self.at("{", "punc") and not self.no_struct_lit
+            if (self.at("{", "punc") and self._struct_lit_ok()
                     and name in self.unit.structs):
                 return self.parse_struct_literal(name, t.line)
-            if (self.at("{", "punc") and not self.no_struct_lit
+            if (self.at("{", "punc") and self._struct_lit_ok()
                     and name in self.unit.generic_structs):
                 # `Pair { a: 1, b: 2 }` names a generic, so which
                 # instantiation it is comes from context -- a `let`
@@ -6756,7 +6929,9 @@ class Parser:
             label = self.next().val
         value = None
         if self.cur.val not in ends and self.cur.kind != "eof":
-            if t.val == "return":
+            if t.val == "return" and self.closure_ret is not None:
+                value = self.parse_expr_as(self.closure_ret["want"])
+            elif t.val == "return":
                 value = self.parse_expr_as(INT if self.synth_main
                                            else self.ret_type)
             elif t.val == "break":
@@ -6830,7 +7005,17 @@ class Parser:
         `None => return 0,` or `_ => continue,`, which is an expression in
         Rust and needs the same drops a statement would.
         """
-        if kw == "return":
+        if kw == "return" and self.closure_ret is not None:
+            # `return` in an inlined closure leaves the closure, not the
+            # function: hand the value over and jump to the end of its body.
+            cr = self.closure_ret
+            if value is not None and not value.never:
+                if value.type is not None:
+                    cr["types"].append(value.type)
+                out.line_at(line, "%s = %s;" % (cr["tmp"], value.code), indent)
+            out.line_at(line, "goto %s;" % cr["label"], indent)
+            cr["used"] = True
+        elif kw == "return":
             if self.drop_owner is not None:
                 self.err("`return` inside `impl Drop for %s` would skip the "
                          "field drops appended after the body, silently "
@@ -7712,6 +7897,15 @@ class Parser:
             self.pending.append("%s = (%s){0};" % (rty.decl(R), rty.base))
             step.append("{ %s if (%s) { %s = (%s){1, %s}; break; } }"
                         % (" ".join(w), e.code, R, rty.base, v))
+        elif name == "find_map":
+            self._arity(name, args, 1)
+            e, w = self._iter_apply(args[0], [(item, False)])
+            rty = e.type
+            if rty is None or rty.ptr or rty.base not in self.unit.options:
+                self.err("`find_map`'s closure must return an `Option`")
+            self.pending.append("%s = (%s){0};" % (rty.decl(R), rty.base))
+            step.append("{ %s %s = %s; if (%s.some) break; }"
+                        % (" ".join(w), R, e.code, R))
         elif name == "position":
             self._arity(name, args, 1)
             rty = self.unit.option_type(ULONG)
@@ -10422,7 +10616,8 @@ _STAGE_OPS = {"map", "filter", "filter_map", "enumerate", "take_while",
               "skip_while", "inspect", "copied", "cloned", "skip", "take",
               "step_by"}
 _CONSUMERS = {"sum", "product", "count", "min", "max", "min_by_key",
-              "max_by_key", "any", "all", "find", "position", "fold", "last",
+              "max_by_key", "any", "all", "find", "find_map", "position", "fold",
+              "last",
               "nth", "for_each", "collect"}
 # A `for` subject's trailing `.name(..)` calls peeled off as adaptors.
 _FOR_ADAPTORS = _SOURCE_OPS | _STAGE_OPS
@@ -10430,7 +10625,8 @@ _FOR_ADAPTORS = _SOURCE_OPS | _STAGE_OPS
 # Iterator methods, named in the diagnostic when one is used outside `for`.
 _ITERATOR_METHODS = _FOR_ADAPTORS | {
     "map", "filter", "filter_map", "fold", "sum", "product", "count",
-    "collect", "zip", "chain", "any", "all", "find", "position", "max",
+    "collect", "zip", "chain", "any", "all", "find", "find_map", "position",
+    "max",
     "min", "last", "nth", "for_each", "flat_map", "take_while",
     "skip_while", "peekable", "windows", "chunks", "chars"}
 
@@ -11099,7 +11295,7 @@ def _split_top(text):
     return out
 
 
-def _walk_use_tree(prefix, text, out):
+def _walk_use_tree(prefix, text, out, aliases=None):
     """Record every name a `use` tree brings into scope.
 
     Rust nests these arbitrarily -- Redox writes
@@ -11135,13 +11331,44 @@ def _walk_use_tree(prefix, text, out):
         mod = "::".join(prefix + [x.strip() for x in segs[:-1]])
         if mod:
             out.setdefault(name, mod)
+            orig = leaf.split(" as ")[0].strip()
+            if aliases is not None and " as " in leaf and name != "_" \
+                    and name != orig and orig != "self" \
+                    and mod.split("::")[0] in ("crate", "self", "super"):
+                aliases[name] = orig
         return
     head = text[:brace].strip().rstrip(":").strip()
     close = _match_delim(text, brace)
     inner = text[brace + 1:close] if close is not None else text[brace + 1:]
     sub = prefix + [x.strip() for x in head.split("::") if x.strip()]
     for part in _split_top(inner):
-        _walk_use_tree(sub, part, out)
+        _walk_use_tree(sub, part, out, aliases)
+
+
+def rename_use_aliases(code):
+    """Spell each `use path::Orig as Alias` import (from this crate) as Orig.
+
+    Everything downstream finds an imported item by its own name, so the
+    alias is rewritten to it throughout the file -- same line, same length of
+    text elsewhere, so diagnostics still point at the right place. Skipped
+    when the original name is already something else in this file, and for
+    std paths, whose alias (`fmt::Result as FmtResult`) exists to avoid that
+    clash.
+    """
+    aliases = {}
+    scan = _blank(code)
+    imports = {}
+    for _start, after in _scan_line_items(scan, "use"):
+        semi = scan.find(";", after)
+        if semi >= 0:
+            _walk_use_tree([], code[after:semi], imports, aliases)
+    for alias, orig in aliases.items():
+        taken = re.search(r"\b(?:struct|enum|trait|type|fn|const|static|union)"
+                          r"\s+%s\b" % re.escape(orig), scan)
+        if taken or (orig in imports and orig not in aliases.values()):
+            continue
+        code = re.sub(r"\b%s\b" % re.escape(alias), orig, code)
+    return code
 
 
 def find_use_imports(code):
@@ -14355,6 +14582,7 @@ def translate(code, path=None):
     _WORKGROUP_STATICS = re.findall(
         r"#\[\s*workgroup\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?static\s+"
         r"(?:mut\s+)?(\w+)", code)
+    code = rename_use_aliases(code)
     mod_names = find_mod_decls(code) + find_use_paths(code)
     # Captured before erasure: `erase_module_items` blanks every `use`, so
     # reading them afterwards finds nothing.
