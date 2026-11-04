@@ -884,12 +884,27 @@ fn f() -> i32 { g().map(|x| x + 1).unwrap_or(0) }
 """)
         self.assertEqual(c.count("g()"), 1)
 
-    def test_return_inside_an_inlined_closure_is_rejected(self):
-        with self.assertRaises(crust.CrustError) as cm:
-            crust.translate("""
-fn f(o: Option<i32>) -> i32 { o.map(|x| { return x; }).unwrap_or(0) }
-""")
-        self.assertIn("inlined", str(cm.exception))
+    def test_return_inside_an_inlined_closure_leaves_the_closure(self):
+        self.assertEqual(_rs("""
+fn f(o: Option<i32>) -> i32 { o.map(|x| { return x + 1; }).unwrap_or(0) }
+fn main() -> i32 { f(Some(4)) + f(None) - 5 }
+"""), 0)
+
+    def test_question_mark_inside_an_inlined_closure_leaves_the_closure(self):
+        self.assertEqual(_rs("""
+fn f(o: Option<u32>) -> u32 {
+    o.and_then(|v| {
+        let w = v.checked_sub(1)?;
+        Some(w * 2)
+    }).unwrap_or(50)
+}
+fn main() -> i32 {
+    if f(Some(4)) != 6 { return 1; }
+    if f(Some(0)) != 50 { return 2; }
+    if f(None) != 50 { return 3; }
+    0
+}
+"""), 0)
 
     def test_expect_prints_its_message(self):
         rc, err = _rs_stderr("""

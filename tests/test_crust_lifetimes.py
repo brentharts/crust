@@ -288,5 +288,130 @@ fn main() -> i32 { (pair(0) + pair(1) + pair(2)) as i32 - 36 }
                       str(cm.exception))
 
 
+class TestUseAliases(unittest.TestCase):
+
+    def test_alias_is_the_imported_name(self):
+        c = crust.rename_use_aliases(
+            "use crate::cap::{Handle, Table as CapTable};\n"
+            "fn f() { let t = CapTable::new(); }\n")
+        self.assertIn("let t = Table::new();", c)
+        self.assertEqual(c.count("\n"), 2)
+
+    def test_std_alias_and_clashing_name_are_left_alone(self):
+        src = "use core::fmt::Result as FmtResult;\nfn f() -> FmtResult {}\n"
+        self.assertEqual(crust.rename_use_aliases(src), src)
+        src = ("use crate::a::Table as T2;\nstruct Table { n: i32 }\n"
+               "fn f(t: T2) {}\n")
+        self.assertEqual(crust.rename_use_aliases(src), src)
+
+
+    def test_as_ref_on_a_reference_to_option_then_filter(self):
+        self.assertEqual(_rs("""
+struct D { id: u32 }
+struct T { ds: [Option<D>; 3] }
+impl T {
+    fn get(&self, i: usize, id: u32) -> Option<&D> {
+        self.ds.get(i)?.as_ref().filter(|d| d.id == id)
+    }
+}
+fn main() -> i32 {
+    let t = T { ds: [None, Some(D { id: 5 }), None] };
+    if t.get(1, 5).is_none() { return 1; }
+    if t.get(1, 6).is_some() { return 2; }
+    if t.get(0, 5).is_some() { return 3; }
+    0
+}
+"""), 0)
+
+    def test_find_map_with_a_return_inside_the_closure(self):
+        self.assertEqual(_rs("""
+fn first_free(slots: &[Option<u32>; 4]) -> Option<(usize, u32)> {
+    slots.iter().enumerate().find_map(|(i, s)| {
+        if s.is_some() {
+            return None;
+        }
+        Some((i, i as u32 * 10))
+    })
+}
+fn main() -> i32 {
+    let a: [Option<u32>; 4] = [Some(1), Some(2), None, None];
+    let (i, v) = first_free(&a).unwrap();
+    if i != 2 || v != 20 { return 1; }
+    let full: [Option<u32>; 4] = [Some(1), Some(2), Some(3), Some(4)];
+    if first_free(&full).is_some() { return 2; }
+    0
+}
+"""), 0)
+
+    def test_return_in_an_option_closure_leaves_only_the_closure(self):
+        self.assertEqual(_rs("""
+fn half(x: Option<u32>) -> u32 {
+    let r = x.and_then(|v| {
+        if v % 2 == 1 {
+            return None;
+        }
+        Some(v / 2)
+    });
+    r.unwrap_or(99) + 1
+}
+fn main() -> i32 {
+    if half(Some(8)) != 5 { return 1; }
+    if half(Some(7)) != 100 { return 2; }
+    if half(None) != 100 { return 3; }
+    0
+}
+"""), 0)
+
+    def test_integer_methods_through_a_reference_from_get(self):
+        self.assertEqual(_rs("""
+fn bump(v: &[u32; 3], i: usize) -> Option<u32> {
+    let g = v.get(i)?.checked_add(1)?;
+    Some(g)
+}
+fn main() -> i32 {
+    let v = [1_u32, u32::MAX, 3];
+    if bump(&v, 0).unwrap() != 2 { return 1; }
+    if bump(&v, 1).is_some() { return 2; }
+    if bump(&v, 5).is_some() { return 3; }
+    0
+}
+"""), 0)
+
+    def test_equality_on_structs_options_and_tuples(self):
+        self.assertEqual(_rs("""
+#[derive(Clone, Copy, PartialEq)]
+struct P { a: u32, b: u32 }
+#[derive(Clone, Copy, PartialEq)]
+struct Q { p: P, o: Option<u32> }
+fn main() -> i32 {
+    let x = P { a: 1, b: 2 };
+    let q = Q { p: x, o: Some(3) };
+    if x != (P { a: 1, b: 2 }) { return 1; }
+    if x == (P { a: 1, b: 3 }) { return 2; }
+    if q != (Q { p: x, o: Some(3) }) { return 3; }
+    if q == (Q { p: x, o: None }) { return 4; }
+    let o: Option<P> = Some(x);
+    if o != Some(P { a: 1, b: 2 }) { return 5; }
+    if o == None { return 6; }
+    let t = (1_u32, Some(2_u32));
+    if t != (1, Some(2)) { return 7; }
+    0
+}
+"""), 0)
+
+    def test_if_let_as_a_value(self):
+        self.assertEqual(_rs("""
+fn pick(a: Option<u32>, b: u32) -> u32 {
+    let v = if let Some(x) = a { x + 1 } else { b * 2 };
+    let (p, q) = if let Some(y) = a { (y, Some(1_u32)) } else { (0, None) };
+    v + p + q.unwrap_or(0)
+}
+fn main() -> i32 {
+    if pick(Some(4), 10) != 10 { return 1; }
+    if pick(None, 10) != 20 { return 2; }
+    0
+}
+"""), 0)
+
 if __name__ == "__main__":
     unittest.main()
