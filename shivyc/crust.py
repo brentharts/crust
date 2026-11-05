@@ -1282,8 +1282,7 @@ class Parser:
         for s in reversed(self.scopes):
             if name in s:
                 t = s[name]
-                if t is not None and not t.ptr and not t.array \
-                        and t.base in self.unit.deferred:
+                if t is not None and t.base in self.unit.deferred:
                     t = s[name] = self.real(t)
                 return t
         return None
@@ -2761,6 +2760,10 @@ class Parser:
         # Associated types (`Self::Target`) and other opaque names often
         # disagree with the concrete pointer the body produces. GCC 14+
         # rejects that as an error; insert an explicit cast.
+        if ty is not None and e is not None and e.type is not None \
+                and self.is_open(e.type):
+            self.unify(e.type, ty)          # `&mut slot` into `&mut Option<T>`
+            e.type = self.real(e.type)
         if ty is not None and ty.ptr and e is not None:
             if e.type is None or (e.type.ptr and e.type.base != ty.base):
                 e = Expr("(%s)(%s)" % (ty.decl(), e.code), ty)
@@ -3533,6 +3536,13 @@ class Parser:
                     # a by-value argument that owns something be seen to move.
                     self._move_by_value_args((sig[1] if sig else []) or [],
                                              args, aexprs)
+                if sig:
+                    # A `let mut slot = None;` passed on is that parameter's
+                    # type, once the callee's signature is known.
+                    for at, pt in zip(atypes, sig[1]):
+                        if at is not None and pt is not None \
+                                and self.is_open(at):
+                            self.unify(at, pt)
                 if e.code in self.unit.variants and \
                         self._payload_of(e.code) is not None:
                     e = self.data_variant_literal(e.code, args)
@@ -4062,16 +4072,27 @@ class Parser:
         return RustCType(base)
 
     def real(self, t):
-        """`t` with any resolved placeholder replaced by its type."""
-        while t is not None and not t.ptr and not t.array \
-                and self.unit.deferred.get(t.base) is not None:
-            t = self.unit.deferred[t.base]
-        return t
+        """`t` with any resolved placeholder replaced by its type.
+
+        Pointers to and arrays of a placeholder (`&mut [None; 4]`'s items)
+        keep their shape around whatever it resolves to.
+        """
+        if t is None or t.base not in self.unit.deferred:
+            return t
+        base, changed = t.base, False
+        while self.unit.deferred.get(base) is not None:
+            r = self.unit.deferred[base]
+            if r.ptr or r.array:
+                return t if not changed else RustCType(
+                    base, t.ptr, t.array)
+            base, changed = r.base, True
+        if not changed:
+            return t
+        return RustCType(base, t.ptr, t.array)
 
     def is_open(self, t):
         t = self.real(t)
-        return t is not None and not t.ptr and not t.array \
-            and t.base in self.unit.deferred
+        return t is not None and t.base in self.unit.deferred
 
     def _fits(self, d, t):
         """True if the closed type `t` can be what open placeholder `d` is."""
@@ -4098,6 +4119,9 @@ class Parser:
         a, b = self.real(a), self.real(b)
         if a is None or b is None or a.base == b.base:
             return
+        if a.ptr != b.ptr or bool(a.array) != bool(b.array):
+            return
+        a, b = RustCType(a.base), RustCType(b.base)
         oa, ob = self.is_open(a), self.is_open(b)
         if oa and not ob:
             self.resolve(a, b)
@@ -4285,6 +4309,14 @@ class Parser:
         """
         parts = self.closure_parts(toks)
         if parts is None:
+            flat = "_".join(t.val for t in toks[::2]) \
+                if len(toks) == 3 and toks[1].val == "::" else None
+            if flat in self.unit.variants \
+                    and self._payload_of(flat) is not None:
+                # `.map(Root::Embedded)`: a variant's constructor.
+                return self.data_variant_literal(
+                    flat, [c if m != "ref" else "&" + _addressable(c)
+                           for c, _t, m in args])
             f = self.sub_expr(toks)
             codes, atys = [], []
             for c, t, m in args:
@@ -4295,6 +4327,12 @@ class Parser:
                 else:
                     codes.append(c)
                     atys.append(t)
+            if f.type is None and f.code in self.unit.tuple_structs:
+                # `.map(Handle)`: a tuple struct's constructor is a function.
+                return self.tuple_struct_literal(f.code, codes)
+            if f.code in self.unit.variants \
+                    and self._payload_of(f.code) is not None:
+                return self.data_variant_literal(f.code, codes)
             if f.type is not None and f.type.ptr <= 1 \
                     and f.type.base in self.unit.closures:
                 return self.call_closure(f, codes, atys)
@@ -5032,6 +5070,12 @@ class Parser:
             return mk("(%s > 0 ? (%s > %s - %s ? %s : (%s)(%s + %s)) : "
                       "(%s < %s - %s ? %s : (%s)(%s + %s)))"
                       % (b, a, MAX, b, MAX, T, a, b, a, MIN, b, MIN, T, a, b))
+        if name == "saturating_mul":
+            if not unsigned:
+                self.err("`saturating_mul` is supported on unsigned "
+                         "integers only")
+            return mk("(%s != 0 && %s > %s / %s ? %s : (%s)(%s * %s))"
+                      % (b, a, MAX, b, MAX, T, a, b))
         if name == "saturating_sub":
             if unsigned:
                 return mk("(%s < %s ? 0 : (%s)(%s - %s))" % (a, b, T, a, b))
@@ -5271,6 +5315,29 @@ class Parser:
         """Lower `recv.method(args)` to the free function `Type_method`."""
         recv = self.unwrap_arr(recv)
         self.expect("(")
+        if name in ("is_some", "is_none") and recv.type is not None \
+                and self.is_open(recv.type) and not recv.type.ptr \
+                and self.unit.deferred_info[self.real(recv.type).base][0] \
+                == "opt":
+            # An untyped `None` so far: its flag needs no element type.
+            self.expect(")")
+            return Expr("(%s%s.some)" % ("!" if name == "is_none" else "",
+                                         recv.code), RustCType("_Bool"))
+        if name in ("replace", "insert", "get_or_insert") \
+                and recv.type is not None and not recv.type.ptr \
+                and self.is_open(recv.type) \
+                and self.unit.deferred_info[self.real(recv.type).base][0] \
+                == "opt":
+            # `let mut slot = None; .. slot.replace(x)`: the argument types it.
+            save, mark = self.i, len(self.pending)
+            args = self.raw_call_args()
+            if len(args) == 1:
+                probe = self.sub_expr(args[0])
+                if probe.type is not None and not probe.type.is_void():
+                    self.resolve(recv.type, self.unit.option_type(probe.type))
+                    recv = Expr(recv.code, self.real(recv.type))
+            del self.pending[mark:]
+            self.i = save
         if recv.iter is not None:
             return self.iter_method(recv, name)
         if name in ("iter", "iter_mut", "into_iter") + _STR_SOURCES \
@@ -5559,6 +5626,8 @@ class Parser:
             return Expr("(void)0", RustCType("void"))
         if name == "fill":
             arity(1)
+            if aexprs and aexprs[0].type is not None:
+                self.unify(aexprs[0].type, elem)    # `fill(None)`
             v = self.once(Expr(args[0], elem))
             k = self.new_temp()
             self.pending.append("for (unsigned long %s = 0; %s < (%s); %s++) "
@@ -6161,9 +6230,16 @@ class Parser:
         while self.accept(","):
             if self.at("]", "punc"):
                 break
-            items.append(self.parse_expr())
+            f0 = items[0].type
+            if f0 is not None and not f0.ptr and not f0.array \
+                    and (f0.base in self.unit.options or self.is_open(f0)):
+                # `[Some(1), None]`: the first element types the rest.
+                items.append(self.parse_expr_as(f0))
+                self.unify(f0, items[-1].type)
+            else:
+                items.append(self.parse_expr())
         self.expect("]")
-        ty = items[0].type
+        ty = self.real(items[0].type)
         if ty is not None:
             ty = RustCType(ty.base, ty.ptr, (ty.array or []) + [str(len(items))])
         return Expr("{%s}" % ", ".join(i.code for i in items), ty)
@@ -6442,8 +6518,8 @@ class Parser:
                 # construction.
                 return Expr("(%s){0}" % name, RustCType(name))
             ty = self.lookup(name)
-            if ty is not None and self.is_open(ty) \
-                    and self.cur.kind == "punc" \
+            if ty is not None and self.is_open(ty) and not ty.ptr \
+                    and not ty.array and self.cur.kind == "punc" \
                     and self.cur.val in (",", ")", ";", "}", "]"):
                 # A `let mut prev = None;` used whole where a type is
                 # expected -- `Some((frame, prev))` -- is that type.
@@ -7647,6 +7723,27 @@ class Parser:
                                 % (" ".join(w), e.code))
                 else:
                     body.append("{ %s %s;" % (" ".join(w), e.code))
+                closers += 1
+            elif name == "flatten":
+                if args or item.parts is not None or item.ty.array \
+                        or item.ty.ptr > 1 \
+                        or item.ty.base not in self.unit.options:
+                    self.err("`flatten` is supported on an iterator of "
+                             "`Option`s")
+                inner = self.unit.options[item.ty.base]
+                v = self.new_temp()
+                if item.ty.ptr:
+                    # `&Option<T>` (from `.iter()`) yields `&T`.
+                    body.append("{ if (!(%s)->some) continue; %s = &(%s)->value;"
+                                % (item.code,
+                                   RustCType(inner.base, inner.ptr + 1,
+                                             inner.array).decl(v), item.code))
+                    item = _Item(v, RustCType(inner.base, inner.ptr + 1,
+                                              inner.array), False, None)
+                else:
+                    body.append("{ if (!(%s).some) continue; %s = (%s).value;"
+                                % (item.code, inner.decl(v), item.code))
+                    item = _Item(v, inner, False, None)
                 closers += 1
             elif name == "skip_while":
                 done = self.new_temp()
@@ -10612,7 +10709,8 @@ _SOURCE_OPS = {"iter", "iter_mut", "into_iter", "bytes", "chars",
 _SOURCE_ONLY = {"iter", "iter_mut", "into_iter", "bytes", "chars",
                 "char_indices", "rev", "zip", "chain"}
 _STR_SOURCES = ("bytes", "chars", "char_indices")
-_STAGE_OPS = {"map", "filter", "filter_map", "enumerate", "take_while",
+_STAGE_OPS = {"map", "filter", "filter_map", "flatten", "enumerate",
+              "take_while",
               "skip_while", "inspect", "copied", "cloned", "skip", "take",
               "step_by"}
 _CONSUMERS = {"sum", "product", "count", "min", "max", "min_by_key",
@@ -11320,6 +11418,10 @@ def _walk_use_tree(prefix, text, out, aliases=None):
         if not segs:
             return
         leaf = segs[-1].strip()
+        if leaf == "self" and len(segs) == 1 and len(prefix) > 1:
+            # `use crate::{initramfs::{self, T}}`: the module itself.
+            out.setdefault(prefix[-1], "::".join(prefix[:-1]))
+            return
         if leaf in ("*", "self"):
             # A glob or `self` names no single item; the module it refers to
             # is still worth recording under its own last segment.
@@ -11343,6 +11445,125 @@ def _walk_use_tree(prefix, text, out, aliases=None):
     sub = prefix + [x.strip() for x in head.split("::") if x.strip()]
     for part in _split_top(inner):
         _walk_use_tree(sub, part, out, aliases)
+
+
+def _match_close(text, i, open_ch, close_ch):
+    """Index of the bracket closing the one at `text[i]`, or -1."""
+    depth = 0
+    for j in range(i, len(text)):
+        c = text[j]
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+        elif c == "-" and text[j:j + 2] == "->":
+            continue
+    return -1
+
+
+def _split_commas(text):
+    parts, depth, cur = [], 0, []
+    for k, c in enumerate(text):
+        if c in "([{<" and not (c == "<" and k and text[k - 1] == "-"):
+            depth += 1
+        elif c in ")]}" or (c == ">" and not (k and text[k - 1] == "-")):
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return parts
+
+
+_FN_BOUND = re.compile(r"^\s*(\w+)\s*:\s*((?:Fn|FnMut|FnOnce)\s*\(.*)$", re.S)
+
+
+def _normalize_source(text):
+    """Source-level rewrites every Rust file read gets (see their docs)."""
+    return desugar_fn_bounds(rename_use_aliases(text))
+
+
+def desugar_fn_bounds(code):
+    """Spell `fn f<F>(g: F) where F: FnMut(A) -> B` as `g: impl FnMut(A) -> B`.
+
+    A generic parameter whose only bound is a closure trait is what `impl Fn`
+    already means, and an `impl Fn` parameter is lowered without making the
+    function generic. The rewrite keeps the line count: it only shortens the
+    signature, and the newlines it removes are put back after it.
+    """
+    out, pos = [], 0
+    for m in re.finditer(r"\bfn\s+\w+\s*<", code):
+        if m.start() < pos:
+            continue
+        g_open = m.end() - 1
+        g_close = _match_close(code, g_open, "<", ">")
+        if g_close < 0 or code[g_close + 1:].lstrip()[:1] != "(":
+            continue
+        p_open = code.index("(", g_close)
+        p_close = _match_close(code, p_open, "(", ")")
+        if p_close < 0:
+            continue
+        end = p_close + 1
+        while end < len(code) and code[end] not in "{;":
+            end += 1
+        tail = code[p_close + 1:end]
+        generics = code[g_open + 1:g_close]
+        params = code[p_open + 1:p_close]
+        w = re.search(r"\bwhere\b", tail)
+        ret_part = tail[:w.start()] if w else tail
+        where_part = tail[w.end():] if w else ""
+        bounds = {}
+        keep_generics = []
+        for ent in _split_commas(generics):
+            mm = _FN_BOUND.match(ent)
+            if mm:
+                bounds[mm.group(1)] = mm.group(2).strip()
+            else:
+                keep_generics.append(ent)
+        keep_where = []
+        for ent in _split_commas(where_part):
+            mm = _FN_BOUND.match(ent)
+            if mm:
+                bounds[mm.group(1)] = mm.group(2).strip()
+            else:
+                keep_where.append(ent)
+        others = [e.split(":")[0].strip() for e in keep_generics
+                  if e.split(":")[0].strip() not in bounds]
+        bounds = {n: b for n, b in bounds.items()
+                  if not any(re.search(r"\b%s\b" % o, b) for o in others)
+                  and not re.search(r"\b%s\b" % n, ret_part)
+                  and not re.search(r"\b%s\b" % n,
+                                    ",".join(keep_where))
+                  and re.search(r":\s*&?\s*(?:mut\s+)?%s\s*(?:,|$)" % n,
+                                params)}
+        if not bounds:
+            continue
+        lost = 0
+        for n, b in bounds.items():
+            b = re.sub(r"\s*\+\s*'?\w+\s*$", "", b)       # `+ 'a`, `+ Copy`
+            params = re.sub(r"(:\s*)(&\s*(?:mut\s+)?)?%s\b" % n,
+                            lambda mo: mo.group(1) + (mo.group(2) or "")
+                            + "impl " + b, params)
+        keep_generics = [e for e in keep_generics
+                         if e.split(":")[0].strip() not in bounds]
+        new_generics = ",".join(keep_generics).strip()
+        sig = code[m.start():m.end() - 1].rstrip()
+        sig += ("<%s>" % new_generics) if new_generics else ""
+        sig += "(%s)%s" % (params, ret_part)
+        if keep_where:
+            sig += " where " + ",".join(keep_where)
+        old = code[m.start():end]
+        sig += "\n" * (old.count("\n") - sig.count("\n"))
+        out.append(code[pos:m.start()])
+        out.append(sig + (" " if not sig.endswith((" ", "\n")) else ""))
+        pos = end
+    out.append(code[pos:])
+    return "".join(out)
 
 
 def rename_use_aliases(code):
@@ -11492,19 +11713,30 @@ def resolve_use_path(modpath, path, strict=False):
     """Resolve `crate::a::b` (or `super::`/`self::`) to a source file."""
     segs = modpath.split("::")
     head, rest = segs[0], segs[1:]
+    bases = []
     if head == "crate":
-        base = find_crate_root(path)
-    elif head == "self":
-        base = os.path.dirname(os.path.abspath(path)) if path else ""
-    elif head == "super":
-        base = os.path.dirname(os.path.dirname(os.path.abspath(path))) \
-            if path else ""
+        bases = [find_crate_root(path)]
+    elif head in ("self", "super") and path:
+        here = os.path.dirname(os.path.abspath(path))
+        stem = os.path.splitext(os.path.basename(path))[0]
+        mod_like = os.path.basename(path) in ("mod.rs", "lib.rs", "main.rs")
+        own = here if mod_like else os.path.join(here, stem)
+        parent = os.path.dirname(own) if mod_like else here
+        # `cpu.rs` keeps its children in `cpu/`; the plain directory is kept
+        # as a fallback for the layouts that already relied on it.
+        if head == "self":
+            bases = [own, here]
+        else:
+            bases = [parent, os.path.dirname(here)]
+    elif head in ("self", "super"):
+        bases = [""]
     else:
         base = find_workspace_crate(head, path)
         if base and not rest:
             lib = os.path.join(base, "lib.rs")
             return lib if os.path.isfile(lib) else None
-    if not base or not rest:
+        bases = [base]
+    if not rest:
         return None
     # The last segment may name an item rather than a module, so try the full
     # path first and then one segment shorter.
@@ -11516,18 +11748,22 @@ def resolve_use_path(modpath, path, strict=False):
     # `header/mod.rs` in its place pulled in declarations referring to types
     # nothing then defined.
     depths = (len(rest),) if strict else (len(rest), len(rest) - 1)
-    for depth in depths:
-        if depth < 1:
+    for base in bases:
+        if not base:
             continue
-        # Joined one segment at a time rather than `os.path.join(base, *rest)`:
-        # py2c has no starred-argument form, and the sliced list arrives as an
-        # `obj` where a `char*` is wanted.
-        stem = base
-        for seg in rest[:depth]:
-            stem = os.path.join(stem, seg)
-        for cand in (stem + ".rs", os.path.join(stem, "mod.rs")):
-            if os.path.isfile(cand):
-                return cand
+        for depth in depths:
+            if depth < 1:
+                continue
+            # Joined one segment at a time rather than
+            # `os.path.join(base, *rest)`: py2c has no starred-argument form,
+            # and the sliced list arrives as an `obj` where a `char*` is
+            # wanted.
+            stem_path = base
+            for seg in rest[:depth]:
+                stem_path = os.path.join(stem_path, seg)
+            for cand in (stem_path + ".rs", os.path.join(stem_path, "mod.rs")):
+                if os.path.isfile(cand):
+                    return cand
     return None
 
 
@@ -12959,7 +13195,7 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None,
         seen.add(filename)
         try:
             with open(filename, encoding="utf-8") as f:
-                text = f.read()
+                text = _normalize_source(f.read())
         except OSError:
             continue
         # Seeding is best effort throughout. A sibling Crust cannot parse
@@ -13576,7 +13812,7 @@ def _load_core_unit():
     unit = Unit()
     try:
         with open(path, encoding="utf-8") as f:
-            text = f.read()
+            text = _normalize_source(f.read())
     except OSError:                                    # pragma: no cover
         _CORE_CACHE["full"] = unit
         return unit
@@ -13748,7 +13984,7 @@ def demand_fn(unit, segs, targs, flat, depth=0, imports=None):
         if filename:
             try:
                 with open(filename, encoding="utf-8") as f:
-                    text = f.read()
+                    text = _normalize_source(f.read())
                 reexport = find_use_imports(text).get(last)
                 found = False
                 for span in find_rust_items(text, rust_file=True):
@@ -13776,6 +14012,11 @@ def demand_fn(unit, segs, targs, flat, depth=0, imports=None):
                     # `pub use self::inner::recover;` in a crate root.
                     saved = unit.import_from
                     unit.import_from = filename
+                    if reexport.split("::")[0] not in ("crate", "self",
+                                                       "super") \
+                            and resolve_use_path("self::" + reexport,
+                                                 filename, strict=True):
+                        reexport = "self::" + reexport  # a child module
                     try:
                         sub = demand_fn(unit, (None, [last]), targs, flat,
                                         depth + 1, {last: reexport})
@@ -13833,7 +14074,7 @@ def demand_seed(unit, name, depth=0):
         return False
     try:
         with open(filename, encoding="utf-8") as f:
-            text = f.read()
+            text = _normalize_source(f.read())
     except OSError:
         return False
     def defined():
@@ -14230,7 +14471,8 @@ _INT_UNARY = ("wrapping_neg", "abs", "is_positive", "is_negative", "signum",
               "count_zeros", "leading_zeros", "trailing_zeros")
 _INT_METHODS = frozenset(_INT_UNARY) | frozenset((
     "wrapping_add", "wrapping_sub", "wrapping_mul", "saturating_add",
-    "saturating_sub", "checked_add", "checked_sub", "checked_mul", "min",
+    "saturating_sub", "saturating_mul", "checked_add", "checked_sub",
+    "checked_mul", "min",
     "max", "clamp", "abs_diff", "pow", "div_ceil", "next_multiple_of",
     "is_multiple_of", "rem_euclid", "rotate_left", "rotate_right",
     "to_le_bytes", "to_be_bytes", "to_ne_bytes"))
@@ -14582,7 +14824,7 @@ def translate(code, path=None):
     _WORKGROUP_STATICS = re.findall(
         r"#\[\s*workgroup\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?static\s+"
         r"(?:mut\s+)?(\w+)", code)
-    code = rename_use_aliases(code)
+    code = _normalize_source(code)
     mod_names = find_mod_decls(code) + find_use_paths(code)
     # Captured before erasure: `erase_module_items` blanks every `use`, so
     # reading them afterwards finds nothing.
@@ -14820,6 +15062,12 @@ def translate(code, path=None):
     generated.extend(dyn_names)
     for name in generated:
         prelude.append("struct %s; typedef struct %s %s;" % (name, name, name))
+    for name in unit.slices:
+        # A function-pointer typedef below may take a slice by value, so its
+        # name must exist first (a repeated identical typedef is valid C11).
+        if name not in included_slices:
+            prelude.append("struct %s; typedef struct %s %s;"
+                           % (name, name, name))
     for name, (fret, fparams) in unit.fn_ptrs.items():
         prelude.append("typedef %s (*%s)(%s);"
                        % (fret.decl(), name,
