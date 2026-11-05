@@ -273,6 +273,7 @@ class InlineAsm(ILCommand):
         name_to_spot = self._NAME_TO_SPOT
         ops, slots = self._assign()
         operand_strs = []
+        operand_regs = []   # register name per operand (None for memory)
         pre_moves = []   # (dest_reg_spot, src_spot, size) before the asm
         post_moves = []  # (dest_spot, src_reg, size) after the asm
 
@@ -285,9 +286,11 @@ class InlineAsm(ILCommand):
                 # no register-size; the instruction's suffix sizes the access.)
                 pre_moves.append((spot, spotmap[v], 8))
                 operand_strs.append("(%" + name + ")")
+                operand_regs.append(None)
                 continue
             size = v.ctype.size
             operand_strs.append(_att_reg(name, size))
+            operand_regs.append(name)
             if io == "in":
                 # Load the input value into its register before the asm.
                 pre_moves.append((spot, spotmap[v], size))
@@ -304,6 +307,17 @@ class InlineAsm(ILCommand):
         self._emit_parallel(pre_moves, asm_code)
 
         text = _resolve_asm_dialect(self.template).replace("%%", "%")
+        # GCC operand modifiers: %b0/%w0/%k0/%q0 name the 8/16/32/64-bit
+        # form of a register operand whatever its own width.
+        import re as _re
+        widths = {"b": 1, "w": 2, "k": 4, "q": 8}
+
+        def _modified(m):
+            i = int(m.group(2))
+            if i < len(operand_regs) and operand_regs[i] is not None:
+                return _att_reg(operand_regs[i], widths[m.group(1)])
+            return m.group(0)
+        text = _re.sub(r"%([bwkq])(\d+)", _modified, text)
         # Substitute %N high-to-low so %1 does not partially match %10.
         for i in reversed(range(len(operand_strs))):
             text = text.replace("%" + str(i), operand_strs[i])
