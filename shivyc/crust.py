@@ -492,13 +492,14 @@ class Expr:
     """A translated expression: C text plus its inferred C type."""
 
     __slots__ = ("code", "type", "targs", "from_path", "never", "iter",
-                 "borrowed", "segs", "refof")
+                 "borrowed", "segs", "refof", "blen")
 
     def __init__(self, code, type_):
         self.targs = None            # turbofish type arguments, if any
         self.from_path = False       # name came from a `a::b` path
         self.segs = None             # (root, [segments]) of that path
         self.refof = None            # for `&place`: the place itself
+        self.blen = None             # byte count of a `b"..."` literal
         # The expression diverges (`panic!`, `unreachable!`): it has Rust's
         # type `!`, so it fits wherever a value is wanted, and is emitted as
         # a statement rather than assigned or returned.
@@ -736,6 +737,9 @@ class Unit:
         self.generic_tuples = set()  # generic structs declared in tuple form
         self.unit_structs = set()    # struct names declared as `struct S;`
         self.consts = {}        # const/static name -> RustCType
+        self.extern_statics = {}  # statics another module owns: name -> type
+        self.static_tried = set()
+        self.demand_consts = []
         self.const_values = {}  # const name -> initializer text
         self.const_inits = {}   # name -> (kw, init text) for prelude render
         self.type_aliases = {}  # name -> RustCType (fully resolved)
@@ -1156,6 +1160,9 @@ class Parser:
         # Set while an inlined closure body that says `return` is parsed:
         # {tmp, label, want, types}; see `apply_fn`.
         self.closure_ret = None
+        self._param_pats = []           # tuple patterns in fn parameters
+        self._for_nested = []           # nested tuple patterns of a `for`
+        self._flat_at = None            # body index of a `flat_map` stage
         self.tmp_n = 0                  # counter for generated temporaries
         self.pending = []               # statements hoisted out of `?`
         # Guards spilled to a temporary so a `*m.lock()` could reach through
@@ -1586,7 +1593,7 @@ class Parser:
             self.expect(";")
             size = self.parse_expr()
             self.expect("]")
-            dims = (inner.array or []) + [size.code]
+            dims = [size.code] + (inner.array or [])
             return RustCType(inner.base, inner.ptr, dims)
         if t.val == "dyn" and t.kind == "kw":
             if not self.behind_ref:
@@ -1663,6 +1670,7 @@ class Parser:
                 ok = self.parse_type()
                 if self.accept(","):
                     err = self.parse_type()
+                    self.accept(",")              # `Result<T, E,>`
                 else:
                     # `Result<T>` with one argument. A crate that fixes its
                     # error type almost always does it with
@@ -1679,6 +1687,7 @@ class Parser:
             if name == "Option":
                 self.expect("<")
                 elem = self.parse_type()
+                self.accept(",")
                 self.expect_gt()
                 return self.unit.option_type(elem)
             if name in self.tysubst:
@@ -1875,6 +1884,8 @@ class Parser:
         self.expect("<")
         args = [self._type_or_const_arg()]
         while self.accept(","):
+            if self.at(">", "punc"):          # a trailing comma: `<T,>`
+                break
             args.append(self._type_or_const_arg())
         self.expect_gt()
         return args
@@ -2275,9 +2286,12 @@ class Parser:
 
         def placeholder(m):
             body = m.group(1)
+            mod = ""
             if ":" in body:
-                self.err("`asm!` operand modifiers such as `{%s}` are not "
-                         "supported", body)
+                body, mod = body.split(":", 1)
+                if mod not in _ASM_MODS:
+                    self.err("`asm!` operand modifier `:%s` is not "
+                             "supported", mod)
             if body == "":
                 k = counter[0]
                 counter[0] += 1
@@ -2298,7 +2312,7 @@ class Parser:
             if o["fixed"]:
                 self.err("`asm!` cannot refer to the explicit-register "
                          "operand %d from its template", k)
-            return "%%%d" % o["gcc"]
+            return "%%%s%d" % (_ASM_MODS.get(mod, ""), o["gcc"])
 
         template = template.replace("{{", "\x01").replace("}}", "\x02")
         template = re.sub(r"\{([^{}]*)\}", placeholder, template)
@@ -2827,6 +2841,28 @@ class Parser:
         del self.pending[mark:]
         return taken
 
+    def _block_continues(self, k):
+        """True if the `{ .. }` starting at token `k` is followed by `.`/`?`.
+
+        Then it is the start of an expression (`unsafe { f() }.then_some(x)`),
+        not a statement of its own.
+        """
+        depth = 0
+        while k < len(self.toks) and self.toks[k].kind != "eof":
+            t = self.toks[k]
+            if t.kind == "punc":
+                if t.val in "([{":
+                    depth += 1
+                elif t.val in ")]}":
+                    depth -= 1
+                    if depth == 0:
+                        nxt = self.toks[k + 1] if k + 1 < len(self.toks) \
+                            else None
+                        return nxt is not None and nxt.kind == "punc" \
+                            and nxt.val in (".", "?")
+            k += 1
+        return False
+
     def _struct_lit_ok(self):
         """May a `Name { .. }` here be a struct literal?
 
@@ -3317,6 +3353,13 @@ class Parser:
                         or (e.type.base in self.unit.dyn_types
                             and e.type.base not in self.unit.dyn_boxes)):
                     return e            # already a fat pointer
+                if e.type is not None and e.type.array \
+                        and e.code.lstrip().startswith("{"):
+                    # A borrowed array literal needs somewhere to live.
+                    tmp = self.new_temp()
+                    self.pending.append("%s = %s;" % (e.type.decl(tmp),
+                                                      e.code))
+                    e = Expr(tmp, e.type)
                 want = self.target
                 if e.type is not None and e.type.array \
                         and len(e.type.array) == 1 and not e.type.ptr \
@@ -4299,6 +4342,43 @@ class Parser:
             seen = True
         return seen
 
+    _UFCS_OWNERS = frozenset((
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+        "i128", "isize", "f32", "f64", "bool", "char", "Option", "Result"))
+
+    def _ufcs_call(self, toks, args):
+        """`.and_then(usize::checked_next_power_of_two)`: `Type::method`.
+
+        A path to a method of a built-in type, passed where a function is
+        wanted, is the method called on the first argument.
+        """
+        if len(toks) != 3 or toks[1].val != "::" or not args \
+                or toks[0].val not in self._UFCS_OWNERS:
+            return None
+        name = toks[2].val
+        if (toks[0].val, name) in self.unit.methods:
+            return None
+        self.scope_push()
+        try:
+            names = []
+            for i, (c, t, m) in enumerate(args):
+                nm = "_crust_ufcs%d" % i
+                self._bind_param(nm, None, False, c, t, m)
+                names.append(nm)
+            line = toks[0].line
+            body = [RustToken("ident", names[0], line),
+                    RustToken("punc", ".", line),
+                    RustToken("ident", name, line),
+                    RustToken("punc", "(", line)]
+            for i, nm in enumerate(names[1:]):
+                if i:
+                    body.append(RustToken("punc", ",", line))
+                body.append(RustToken("ident", nm, line))
+            body.append(RustToken("punc", ")", line))
+            return self.sub_expr(body)
+        finally:
+            self.scope_pop()
+
     def apply_fn(self, toks, args, want=None, arg_parts=None):
         """Apply a function argument to `args`, a list of (code, type, mode).
 
@@ -4317,6 +4397,9 @@ class Parser:
                 return self.data_variant_literal(
                     flat, [c if m != "ref" else "&" + _addressable(c)
                            for c, _t, m in args])
+            ufcs = self._ufcs_call(toks, args)
+            if ufcs is not None:
+                return ufcs
             f = self.sub_expr(toks)
             codes, atys = [], []
             for c, t, m in args:
@@ -5103,6 +5186,15 @@ class Parser:
             return Expr("(%s){.some = (%s) < %s, .value = (%s) < %s ? "
                         "(%s)((%s)%s %s %s) : 0}"
                         % (opt.base, b, bits, b, bits, T, U, a, op, b), opt)
+        if name == "checked_next_power_of_two":
+            if not unsigned:
+                self.err("`checked_next_power_of_two` is for unsigned "
+                         "integers")
+            opt = self.unit.option_type(ty)
+            helper = self._int_helper("next_power_of_two", ty, uty, bits)
+            half = "((%s)%s)" % (T, _format_int_literal(1 << (bits - 1), ty))
+            return Expr("(%s){.some = %s <= %s, .value = %s <= %s ? %s(%s) "
+                        ": 0}" % (opt.base, a, half, a, half, helper, a), opt)
         if name in ("checked_add", "checked_sub", "checked_mul"):
             opt = self.unit.option_type(ty)
             if name == "checked_add":
@@ -5155,6 +5247,14 @@ class Parser:
             return mk("((%s %% %s) < 0 ? (%s)((%s %% %s) + (%s < 0 ? -%s : "
                       "%s)) : (%s)(%s %% %s))"
                       % (a, b, T, a, b, b, b, b, T, a, b))
+        if name in ("to_le", "from_le", "to_ne", "from_ne"):
+            return mk(a)                       # little-endian targets only
+        if name in ("to_be", "from_be", "swap_bytes"):
+            parts = ["(((%s)%s >> %d) & 255) << %d"
+                     % (U, a, 8 * i, bits - 8 - 8 * i)
+                     for i in range(bits // 8)]
+            return mk("((%s)(%s))" % (T, " | ".join("(%s)" % q
+                                                    for q in parts)))
         if name in ("rotate_left", "rotate_right"):
             k = "(%s %% %d)" % (b, bits)
             first, second = (("<<", ">>") if name == "rotate_left"
@@ -5361,6 +5461,16 @@ class Parser:
             self.i = save
         if recv.iter is not None:
             return self.iter_method(recv, name)
+        if name == "windows" and recv.type is not None \
+                and (recv.type.base, name) not in self.unit.methods \
+                and self.iterable(recv.type, "iter"):
+            wargs = self.raw_call_args()
+            if len(wargs) != 1:
+                self.err("`windows` takes one argument")
+            ch = IterChain()
+            ch.subj = recv
+            ch.ops = [(name, wargs[0])]
+            return self.iter_value(ch)
         if name in ("iter", "iter_mut", "into_iter") + _STR_SOURCES \
                 and recv.type is not None \
                 and (recv.type.base, name) not in self.unit.methods \
@@ -5478,7 +5588,13 @@ class Parser:
             got = self.seq_method(recv, name, args, aexprs)
             if got is not None:
                 return got
-        if recv.type is not None and recv.type.base in self.unit.slices:
+        if recv.type is not None and recv.type.array \
+                and len(recv.type.array) == 1 \
+                and name in ("as_ptr", "as_mut_ptr") and not args:
+            return Expr("(&%s[0])" % recv.code,
+                        RustCType(recv.type.base, recv.type.ptr + 1))
+        if recv.type is not None and recv.type.base in self.unit.slices \
+                and not recv.type.array:
             if name == "len":
                 return Expr("%s.len" % recv.code, RustCType("unsigned long"))
             if name in ("iter", "iter_mut"):
@@ -5490,7 +5606,7 @@ class Parser:
                 return recv
             if name == "is_empty":
                 return Expr("(%s.len == 0)" % recv.code, RustCType("_Bool"))
-            if name == "as_ptr":
+            if name in ("as_ptr", "as_mut_ptr"):
                 return Expr("%s.ptr" % recv.code,
                             RustCType(self.unit.slices[recv.type.base].base,
                                   self.unit.slices[recv.type.base].ptr + 1))
@@ -5551,7 +5667,8 @@ class Parser:
     _SEQ_METHODS = frozenset((
         "len", "is_empty", "get", "get_mut", "first", "last", "first_mut",
         "last_mut", "copy_from_slice", "clone_from_slice", "fill", "contains",
-        "swap", "try_into", "starts_with", "ends_with"))
+        "swap", "try_into", "starts_with", "ends_with", "as_chunks",
+        "as_chunks_mut"))
 
     def _seq_parts(self, recv):
         """(pointer to element 0, length, element type) of an array or slice.
@@ -5560,6 +5677,8 @@ class Parser:
         neither -- a slice is `{ptr, len}`, an array carries its length in its
         type, and a reference to an array is that array behind one `*`.
         """
+        if recv.blen is not None:
+            return recv.code, str(recv.blen), RustCType("unsigned char")
         recv = self.unwrap_arr(recv)
         ty = recv.type
         if ty.base in self.unit.slices and not ty.ptr and not ty.array:
@@ -5596,6 +5715,21 @@ class Parser:
                 self.err("`%s` takes %d argument%s, got %d", name, k,
                          "" if k == 1 else "s", len(args))
 
+        if name in ("as_chunks", "as_chunks_mut"):
+            arity(0)
+            targ = self.call_targs[0] if self.call_targs else None
+            if targ is None or not targ.base.isdigit():
+                self.err("`%s` needs its length: `%s::<4>()`", name, name)
+            k = int(targ.base)
+            arr = self.unit.array_type(RustCType(elem.base, elem.ptr, [str(k)]))
+            cs, rs = self.unit.slice_type(arr), self.unit.slice_type(elem)
+            tup = self.unit.tuple_type([cs, rs])
+            ptr_, n_ = self.once(Expr(ptr, RustCType(elem.base, elem.ptr + 1))), \
+                self.once(Expr(n, usize))
+            return Expr("(%s){(%s){(%s *)%s, %s / %d}, (%s){%s + (%s / %d) * %d,"
+                        " %s %% %d}}" % (tup.base, cs.base, arr.base, ptr_, n_,
+                                         k, rs.base, ptr_, n_, k, k, n_, k),
+                        tup)
         if name == "try_into":
             # `bytes[a..b].try_into()` -- what it converts *to* is decided by
             # the consumer (`u32::from_le_bytes`), which is also where the
@@ -5681,9 +5815,14 @@ class Parser:
                 self.err("`%s` needs a slice or array argument", name)
             self.unit.needs.add("memcmp")
             at = "0" if name == "starts_with" else "(%s) - (%s)" % (n, src[1])
-            return Expr("((%s) >= (%s) && memcmp(%s + %s, %s, (%s) * sizeof(%s)) "
-                        "== 0)" % (n, src[1], ptr, at, src[0], src[1],
-                                   elem.decl()), BOOL)
+            cmp_ = ("memcmp(%s + %s, %s, (%s) * sizeof(%s)) == 0"
+                    % (ptr, at, src[0], src[1], elem.decl()))
+            if n.isdigit() and src[1].isdigit():
+                # Both lengths known: decide the guard here (ShivyC
+                # mishandles a constant left operand of `&&`).
+                return Expr("(%s)" % (cmp_ if int(n) >= int(src[1]) else "0"),
+                            BOOL)
+            return Expr("((%s) >= (%s) && %s)" % (n, src[1], cmp_), BOOL)
         if name == "swap":
             arity(2)
             a = self.once(Expr(args[0], usize))
@@ -5748,6 +5887,7 @@ class Parser:
         """Lower `Name { f: e, .. }` to a C compound literal."""
         self.expect("{")
         inits = []
+        copies = []
         seen = set()
         base = None
         while not self.at("}", "punc"):
@@ -5769,6 +5909,17 @@ class Parser:
                 raise CrustError("line %d: struct `%s` has no field `%s`"
                                  % (line, name, field))
             seen.add(field)
+            fty = self.unit.field_type(name, field)
+            if fty is not None and fty.array and not fty.ptr:
+                v2 = self.unwrap_arr(val)
+                if v2.type is not None and v2.type.array \
+                        and not v2.code.lstrip().startswith("{"):
+                    # An array value held in a place: C cannot initialise
+                    # an array member from one, so it is copied in below.
+                    copies.append((field, v2.code))
+                    if not self.accept(","):
+                        break
+                    continue
             inits.append(".%s = %s" % (field, val.code))
             if not self.accept(","):
                 break
@@ -5785,6 +5936,17 @@ class Parser:
                              "`%s`" % (line, "" if len(missing) == 1 else "s",
                                        ", ".join("`%s`" % f for f in missing),
                                        name))
+        if copies:
+            tmp = self.new_temp()
+            self.unit.needs.add("memcpy")
+            self.pending.append(
+                "%s = (%s){%s};%s" % (RustCType(name).decl(tmp), name,
+                                       ", ".join(inits) or "0",
+                                       "".join(" memcpy((void *)&%s.%s, (void *)&%s, "
+                                                "sizeof(%s.%s));"
+                                               % (tmp, f, c, tmp, f)
+                                               for f, c in copies)))
+            return Expr(tmp, RustCType(name))
         return Expr("(%s){%s}" % (name, ", ".join(inits)), RustCType(name))
 
     def _payload_of(self, flat):
@@ -6223,11 +6385,28 @@ class Parser:
         """
         if self.at("]", "punc"):
             self.next()
+            w = self.target
+            if w is not None and w.base in self.unit.slices \
+                    and not w.ptr and not w.array:
+                return Expr("(%s){0, 0}" % w.base, w)    # `&[]` as `&[T]`
             self.err("empty array literal has no element type")
-        first = self.parse_expr()
+        ew0 = self._literal_elem_want()
+        if ew0 is not None:
+            self.expected.append(ew0)
+        try:
+            first = self.parse_expr()
+        finally:
+            if ew0 is not None:
+                self.expected.pop()
         if self.accept(";"):
             count = self.parse_expr()
             self.expect("]")
+            if re.fullmatch(r"\{+0\}+", first.code.strip() or "") \
+                    and first.type is not None and first.type.array:
+                # `[[0; 7]; N]`: zero-filling the outer array zero-fills all.
+                dims = [count.code.strip()] + list(first.type.array)
+                return Expr("{" * len(dims) + "0" + "}" * len(dims),
+                            RustCType(first.type.base, first.type.ptr, dims))
             if first.code.strip().rstrip("uUlL") in ("0", "0.0", "0.0f"):
                 zty = None
                 if first.type is not None and not first.type.array:
@@ -6236,6 +6415,31 @@ class Parser:
                                     [count.code.strip()])
                 return Expr("{0}", zty)
             n = _literal_count(count.code, self.unit)
+            if n is None and first.type is not None \
+                    and self._is_const_expr(count.code):
+                # A length only the C compiler can evaluate (`size_of`
+                # arithmetic over consts): fill a temporary in a loop.
+                v = first.code
+                if v.lstrip().startswith("{"):
+                    seed = self.new_temp()
+                    self.pending.append("%s = %s;" % (first.type.decl(seed), v))
+                    v = seed
+                else:
+                    v = self.once(first)
+                tmp, k = self.new_temp(), self.new_temp()
+                ty = RustCType(first.type.base, first.type.ptr,
+                               [count.code.strip()]
+                               + list(first.type.array or []))
+                if first.type.array:
+                    self.unit.needs.add("memcpy")
+                    store = ("memcpy((void *)&%s[%s], (void *)&%s, "
+                             "sizeof(%s[%s]));" % (tmp, k, v, tmp, k))
+                else:
+                    store = "%s[%s] = %s;" % (tmp, k, v)
+                self.pending.append(
+                    "%s; for (unsigned long %s = 0; %s < (%s); %s++) %s"
+                    % (ty.decl(tmp), k, k, count.code.strip(), k, store))
+                return Expr(tmp, ty)
             if n is None:
                 self.err("the repeat length in `[v; N]` must be an integer "
                          "literal or a `const` when the value is not 0; "
@@ -6247,7 +6451,7 @@ class Parser:
                 self.err("repeat length must be positive")
             ty = first.type
             if ty is not None:
-                ty = RustCType(ty.base, ty.ptr, (ty.array or []) + [str(n)])
+                ty = RustCType(ty.base, ty.ptr, [str(n)] + (ty.array or []))
             return Expr("{%s}" % ", ".join([first.code] * n), ty)
         items = [first]
         while self.accept(","):
@@ -6255,7 +6459,9 @@ class Parser:
                 break
             f0 = items[0].type
             if f0 is not None and not f0.ptr and not f0.array \
-                    and (f0.base in self.unit.options or self.is_open(f0)):
+                    and (f0.base in self.unit.options
+                         or f0.base in self.unit.tuples
+                         or self.is_open(f0)):
                 # `[Some(1), None]`: the first element types the rest.
                 items.append(self.parse_expr_as(f0))
                 self.unify(f0, items[-1].type)
@@ -6264,8 +6470,44 @@ class Parser:
         self.expect("]")
         ty = self.real(items[0].type)
         if ty is not None:
-            ty = RustCType(ty.base, ty.ptr, (ty.array or []) + [str(len(items))])
+            ty = RustCType(ty.base, ty.ptr, [str(len(items))] + (ty.array or []))
+            ew = self._literal_elem_want()
+            if ew is not None and ty.base == "int" and not ty.ptr \
+                    and len(ty.array) == 1 and ew.base in _RANK \
+                    and not ew.ptr and not ew.array:
+                # Untyped integer literals take the element type that the
+                # context asks for: `f(&[1, 2, 3])` with `msg: &[u16; 3]`.
+                ty = RustCType(ew.base, 0, ty.array)
         return Expr("{%s}" % ", ".join(i.code for i in items), ty)
+
+    _CTYPE_WORDS = frozenset((
+        "sizeof", "unsigned", "signed", "long", "int", "short", "char"))
+
+    def _is_const_expr(self, code):
+        """True if `code` names only consts, so C can size an array by it."""
+        for word in re.findall(r"[A-Za-z_]\w*", code):
+            if word in self._CTYPE_WORDS or word.startswith("crust_") \
+                    or (word.upper() == word and word[0].isalpha()) \
+                    or word in self.unit.consts \
+                    or word in self.unit.const_values \
+                    or word in self.unit.structs \
+                    or word in self.unit.enums:
+                continue
+            return False
+        return True
+
+    def _literal_elem_want(self):
+        """Element type the surrounding context wants of an array literal."""
+        w = self.target
+        if w is None:
+            return None
+        if w.array:
+            return RustCType(w.base, w.ptr, w.array[1:] or None)
+        if w.base in self.unit.slices and not w.ptr:
+            return self.unit.slices[w.base]
+        if w.ptr == 1:
+            return RustCType(w.base, 0)
+        return None
 
     def tuple_struct_literal(self, name, args):
         """Lower `P(a, b)` for a tuple struct to a compound literal."""
@@ -6295,7 +6537,9 @@ class Parser:
             if elem is not None and elem.base == "unsigned char" \
                     and not elem.ptr and not elem.array:
                 return Expr("(%s){%s, %d}" % (want.base, ptr, n), want)
-            return Expr(ptr, RustCType("unsigned char", 1))
+            e = Expr(ptr, RustCType("unsigned char", 1))
+            e.blen = n
+            return e
         if t.kind == "chr":
             return Expr(_char_code(t.val, self), RustCType("crust_char"))
         if t.val == "true":
@@ -6574,6 +6818,11 @@ class Parser:
                 # expected -- `Some((frame, prev))` -- is that type.
                 self.resolve(ty, self.target)
                 ty = self.lookup(name)
+            if ty is None and name not in self.unit.consts \
+                    and name in self.unit.imports and name.upper() == name \
+                    and not self.at("::", "punc") \
+                    and demand_static(self.unit, name):
+                pass
             if ty is None:
                 if name in self.unit.variants:
                     owner = self.unit.variants[name]
@@ -6707,7 +6956,8 @@ class Parser:
         t = self.cur
         if tail_returns and ((t.kind == "kw" and t.val in ("match", "if"))
                              or (t.val == "{" and t.kind == "punc")
-                             or (t.val == "unsafe" and self.peek().val == "{")):
+                             or (t.val == "unsafe" and self.peek().val == "{"
+                                 and not self._block_continues(self.i + 1))):
             # A braced statement is the block's value only if it is the last
             # thing in the block. Passing `tail_returns` into every one made
             # a mid-body `match x { 1 => t += 1, .. }` or `if c { f() }`
@@ -6725,6 +6975,9 @@ class Parser:
         if t.val == "let" and t.kind == "kw":
             self.next()
             self.accept("mut")
+            if self.at("(", "punc") and not self._plain_tuple_pattern():
+                self.parse_pattern_let(out, indent, t)
+                return
             if self.at("(", "punc"):
                 # `let (a, b) = expr;` -- destructuring a tuple. Lowered to a
                 # temporary holding the tuple and one binding per element, so
@@ -6838,7 +7091,8 @@ class Parser:
             return
 
         if (t.val == "unsafe" and t.kind == "kw"
-                and self.peek().val == "{"):
+                and self.peek().val == "{"
+                and not self._block_continues(self.i + 1)):
             # An `unsafe` block carries no meaning here: Crust has no borrow
             # checker and no safety analysis to switch off, and the C it
             # lowers to is unsafe throughout. So it is exactly its body.
@@ -7256,6 +7510,26 @@ class Parser:
             self.emit_drops(out, line, indent, fidx, skip)
             out.line_at(line, "return %s;" % e.code, indent)
 
+    def _plain_tuple_pattern(self):
+        """True if the `( .. )` ahead is only names, `mut` and `_`."""
+        k, depth = 0, 0
+        while True:
+            tk = self.peek(k)
+            if tk.kind == "eof":
+                return False
+            if tk.kind == "punc" and tk.val == "(":
+                depth += 1
+                if depth > 1:
+                    return False
+            elif tk.kind == "punc" and tk.val == ")":
+                return True
+            elif tk.kind == "ident" or (tk.kind == "kw" and tk.val == "mut") \
+                    or (tk.kind == "punc" and tk.val == ","):
+                pass
+            else:
+                return False
+            k += 1
+
     def parse_tuple_let(self, out, indent, t):
         """Lower `let (a, b) = expr;` into a temporary and one binding each."""
         self.expect("(")
@@ -7296,9 +7570,26 @@ class Parser:
         if self.accept("("):
             names = []
             while not self.at(")", "punc"):
-                by_ref = self.accept("&") is not None
-                self.accept("mut")
-                names.append((self.expect_ident(), by_ref))
+                if self.at("(", "punc"):
+                    # `(i, (a, b))`: the inner pattern becomes a `let` that
+                    # opens the loop body, over a name made up for it.
+                    a, depth = self.i, 0
+                    while True:
+                        v = self.cur
+                        if v.kind == "punc" and v.val in "([{":
+                            depth += 1
+                        elif v.kind == "punc" and v.val in ")]}":
+                            depth -= 1
+                        self.next()
+                        if depth == 0:
+                            break
+                    nm = "_crust_fp%d" % len(self._for_nested)
+                    self._for_nested.append((nm, self.toks[a:self.i]))
+                    names.append((nm, False))
+                else:
+                    by_ref = self.accept("&") is not None
+                    self.accept("mut")
+                    names.append((self.expect_ident(), by_ref))
                 if not self.accept(","):
                     break
             self.expect(")")
@@ -7515,7 +7806,7 @@ class Parser:
 
         for name, args in source_ops:
             if name not in ("rev", "skip", "take", "step_by", "zip",
-                            "chain") and args:
+                            "chain", "windows") and args:
                 self.err("`%s` takes no arguments", name)
             if name == "iter":
                 consumed = False
@@ -7536,6 +7827,18 @@ class Parser:
             # freed at scope exit, but it is not valid to use.
             self.mark_moved(moved[0], self.toks[max(self.i - 1, 0)].line)
 
+        if source_ops and source_ops[0][0] == "windows":
+            if kind != "coll":
+                self.err("`windows` needs a slice, array or `Vec`")
+            wn = self.new_temp()
+            wc = self.new_temp()
+            a = self.sub_expr(source_ops[0][1])
+            self.unit.needs.add("abort")
+            self.pending.append(
+                "unsigned long %s = (unsigned long)(%s); if (%s == 0) abort(); "
+                "unsigned long %s = (%s) >= %s ? (%s) - %s + 1 : 0;"
+                % (wn, a.code, wn, wc, count, wn, count, wn))
+            count, kind, mode = wc, "win", wn
         C, F, D = count, "0", "1"
         srcs = [_Source(kind, base, elem, mode, "0", "1")]
         for name, args in source_ops:
@@ -7647,6 +7950,10 @@ class Parser:
             return _Item("((unsigned long)(%s) < %s ? %s : %s)"
                          % (pos, s.split, li.code, ri.code), li.ty,
                          li.rc or ri.rc, None)
+        if kind == "win":
+            st = self.unit.slice_type(elem)
+            return _Item("(%s){%s + %s, %s}" % (st.base, base, pos, mode),
+                         st, False, None)
         if kind == "range":
             return _Item("(%s)((long)(%s) + (long)(%s))"
                          % (elem.decl(), base, pos), elem, False, None)
@@ -7699,6 +8006,7 @@ class Parser:
         drop.
         """
         ops = ch.ops
+        self._flat_at = None
         k = 0
         while k < len(ops) and ops[k][0] in _SOURCE_OPS:
             k += 1
@@ -7794,6 +8102,23 @@ class Parser:
                                 % (item.code, inner.decl(v), item.code))
                     item = _Item(v, inner, False, None)
                 closers += 1
+            elif name == "flat_map":
+                e, w = self._iter_apply(args, [(item, False)])
+                if e.type is None or e.type.ptr or e.type.array \
+                        or e.type.base not in self.unit.slices:
+                    self.err("`flat_map`'s closure must return a slice")
+                st = self.unit.slices[e.type.base]
+                t, kk = self.new_temp(), self.new_temp()
+                body.append("{ %s %s = %s; for (unsigned long %s = 0; %s < "
+                            "%s.len; %s++) {" % (" ".join(w),
+                                                 e.type.decl(t), e.code,
+                                                 kk, kk, t, kk))
+                if self._flat_at is None:
+                    self._flat_at = len(body)
+                item = _Item("&%s.ptr[%s]" % (t, kk),
+                             RustCType(st.base, st.ptr + 1, st.array),
+                             False, None)
+                closers += 2
             elif name == "skip_while":
                 done = self.new_temp()
                 self.pending.append("_Bool %s = 0;" % done)
@@ -8052,15 +8377,18 @@ class Parser:
             self.pending.append("%s = (%s){0};" % (rty.decl(R), rty.base))
             step.append("{ %s %s = %s; if (%s.some) break; }"
                         % (" ".join(w), R, e.code, R))
-        elif name == "position":
+        elif name in ("position", "rposition"):
             self._arity(name, args, 1)
             rty = self.unit.option_type(ULONG)
             e, w = self._iter_apply(args[0], [(item, False)])
             n = self.new_temp()
             self.pending.append("%s = (%s){0}; unsigned long %s = 0;"
                                 % (rty.decl(R), rty.base, n))
-            step.append("{ %s if (%s) { %s = (%s){1, %s}; break; } %s++; }"
-                        % (" ".join(w), e.code, R, rty.base, n, n))
+            # `rposition` is the last match, counted from the front: the
+            # whole walk, keeping the latest hit.
+            stop = "break; " if name == "position" else ""
+            step.append("{ %s if (%s) { %s = (%s){1, %s}; %s} %s++; }"
+                        % (" ".join(w), e.code, R, rty.base, n, stop, n))
         elif name == "nth":
             self._arity(name, args, 1)
             rty = self.unit.option_type(vty)
@@ -8118,9 +8446,19 @@ class Parser:
             step.append("%s_push(&%s, %s);" % (rty.base, R, v))
         else:                                        # pragma: no cover
             self.err("`%s` is not an iterator consumer", name)
+        tail = ""
+        if self._flat_at is not None:
+            # A `break` inside `flat_map`'s inner loop would only leave that
+            # loop, so the stages after it and the consumer jump out.
+            lab = "_crust_out%d" % self.new_index_n()
+            fix = lambda xs: [x.replace("break;", "goto %s;" % lab)
+                              for x in xs]
+            body = body[:self._flat_at] + fix(body[self._flat_at:])
+            step = fix(step)
+            tail = " %s:;" % lab
         self.pending.append(
-            "%s { %s }%s"
-            % (head, " ".join(top + body + step) + " }" * closers,
+            "%s { %s }%s%s"
+            % (head, " ".join(top + body + step) + " }" * closers, tail,
                "".join(" " + s for s in self._free_held(held))))
         if rty.is_void():
             return Expr("((void)0)", VOID)
@@ -8137,11 +8475,22 @@ class Parser:
         self.next()                                   # `for`
         self.for_clauses = self.body_checks_next
         self.body_checks_next = None
+        self._for_nested = []
         kind, names = self._parse_for_pattern()
         self.expect("in")
         toks = self._for_subject_tokens()
         if not toks:
             self.err("expected something to iterate over")
+        if self._for_nested and self.at("{", "punc"):
+            ln = self.cur.line
+            inject = []
+            for nm, ptoks in self._for_nested:
+                inject += ([RustToken("kw", "let", ln)] + list(ptoks)
+                           + [RustToken("punc", "=", ln),
+                              RustToken("ident", nm, ln),
+                              RustToken("punc", ";", ln)])
+            self._for_nested = []
+            self.toks[self.i + 1:self.i + 1] = inject
         core, ops = _peel_adaptors(toks)
         rng = _split_range(core)
         if rng is not None and not ops and kind == "one" \
@@ -8163,6 +8512,9 @@ class Parser:
         self.scope_push("block")          # the loop's own temporaries
         out.line_at(line, "{", indent)
         head, top, body, closers, item, held, owns = self.iter_plan(ch)
+        if self._flat_at is not None:
+            self.err("`flat_map` is supported with a consumer such as "
+                     "`find` or `count`, not as a `for` subject")
         for tmp, ty in held:
             # Freed however the loop is left: a `break` to an outer label,
             # a `return`, or falling off the end.
@@ -8221,8 +8573,23 @@ class Parser:
             decls.append("%s = *%s;" % (ty.decl(cn), item.code))
             binds.append((name, ty, False, False))
             return
+        if item.ty is not None and not item.ty.ptr and not item.ty.array \
+                and item.ty.base in self.unit.arrays \
+                and len(self.unit.arrays[item.ty.base].array) == 1:
+            # An array item (`chunks.iter()`, `as_chunks_mut`) is `&[T; N]`:
+            # a pointer to its elements, which also lets the body write.
+            at = self.unit.arrays[item.ty.base]
+            pty = self.unit.slice_type(RustCType(at.base, at.ptr))
+            decls.append("%s = (%s){(%s).v, %s};" % (pty.decl(cn), pty.base,
+                                                     item.code, at.array[0]))
+            binds.append((name, pty, False, False))
+            return
         decls.append("%s = %s;" % (item.ty.decl(cn), item.code))
         binds.append((name, item.ty, owns, item.rc and not by_ref))
+
+    def new_index_n(self):
+        self.tmp_n += 1
+        return self.tmp_n
 
     def new_index(self):
         self.tmp_n += 1
@@ -8666,6 +9033,9 @@ class Parser:
                         and toks[j - 1].val != "::":
                     # A lone name: a constant or a variant is a label, any
                     # other name is a binding.
+                    if v not in self.unit.consts and v in self.unit.imports \
+                            and v.upper() == v:
+                        demand_static(self.unit, v)
                     if v not in self.unit.consts and v not in \
                             self.unit.variants and not (
                                 enum_name is not None
@@ -8919,7 +9289,9 @@ class Parser:
                 if enum_name and "%s_%s" % (enum_name, name) \
                         in self.unit.variants:
                     name = "%s_%s" % (enum_name, name)
-                elif name not in self.unit.consts:
+                elif name not in self.unit.consts and not (
+                        name in self.unit.imports and name.upper() == name
+                        and demand_static(self.unit, name)):
                     self.err("`%s` is not a constant pattern; only literals, "
                              "enum variants and `_` are supported", name)
             covered.add(name)
@@ -9051,6 +9423,9 @@ class Parser:
         while self.at("::", "punc"):
             self.next()
             name += "_" + self.expect_ident()
+        if name not in self.unit.consts and name in self.unit.imports \
+                and name.upper() == name:
+            demand_static(self.unit, name)          # `use super::*` consts
         if name in self.unit.consts:
             return name
         self.i = save
@@ -9929,9 +10304,10 @@ class Parser:
         if self_kind != "none":
             self.accept(",")
         params = []
+        self._param_pats = []
         while not self.at(")", "punc"):
             self.accept("mut")
-            pname = self.expect_ident()
+            pname = self._param_name()
             self.expect(":")
             params.append((pname, self.parse_type()))
             if not self.accept(","):
@@ -9998,6 +10374,28 @@ class Parser:
         self.expect("}")
         self.impl_type = None
 
+    def _param_name(self):
+        """A parameter's name; a tuple pattern gets a synthetic one.
+
+        `(a, _): (u64, u64)` binds through a `let` that opens the body.
+        """
+        if not self.at("(", "punc"):
+            return self.expect_ident()
+        a = self.i
+        depth = 0
+        while True:
+            v = self.cur
+            if v.kind == "punc" and v.val in "([{":
+                depth += 1
+            elif v.kind == "punc" and v.val in ")]}":
+                depth -= 1
+            self.next()
+            if depth == 0:
+                break
+        pname = "_crust_pat%d" % len(self._param_pats)
+        self._param_pats.append((pname, self.toks[a:self.i]))
+        return pname
+
     def parse_fn_signature(self):
         """Parse `[pub] [unsafe] [extern "C"] fn name(params) [-> T]`."""
         self.skip_attributes()
@@ -10016,6 +10414,7 @@ class Parser:
         self.expect("(")
         self.impl_n = 0
         params = []
+        self._param_pats = []
         next_binding = 0
         while not self.at(")", "punc"):
             # `#[binding(N)] buf: &[f32]` pins a kernel buffer to the binding
@@ -10036,7 +10435,7 @@ class Parser:
                     self.err("unsupported parameter attribute `#[%s]`", aname)
                 self.expect("]")
             self.accept("mut")
-            pname = self.expect_ident()
+            pname = self._param_name()
             self.expect(":")
             ptype = None
             if self.fn_kernel is not None and self.at("&", "punc"):
@@ -10171,6 +10570,16 @@ class Parser:
             raise CrustError("line %d: expected function body" % open_tok.line)
         self.expect("{")
         out.line_at(open_tok.line, "{", 0)
+        if self._param_pats:
+            inject = []
+            for pn, ptoks in self._param_pats:
+                ln = open_tok.line
+                inject += ([RustToken("kw", "let", ln)] + list(ptoks)
+                           + [RustToken("punc", "=", ln),
+                              RustToken("ident", pn, ln),
+                              RustToken("punc", ";", ln)])
+            self._param_pats = []
+            self.toks[self.i:self.i] = inject
         prev_contracts, prev_olds = self.cur_contracts, self.olds
         self.cur_contracts = self._fn_clauses(name)
         self.olds = {}
@@ -10754,17 +11163,17 @@ def _join_types(types):
 # `skip`/`take`/`step_by` are also valid as stages, lowered differently.
 _SOURCE_OPS = {"iter", "iter_mut", "into_iter", "bytes", "chars",
                "char_indices", "copied", "cloned", "rev", "skip", "take",
-               "step_by", "zip", "chain"}
+               "step_by", "zip", "chain", "windows"}
 _SOURCE_ONLY = {"iter", "iter_mut", "into_iter", "bytes", "chars",
-                "char_indices", "rev", "zip", "chain"}
+                "char_indices", "rev", "zip", "chain", "windows"}
 _STR_SOURCES = ("bytes", "chars", "char_indices")
-_STAGE_OPS = {"map", "filter", "filter_map", "flatten", "enumerate",
+_STAGE_OPS = {"map", "filter", "filter_map", "flatten", "flat_map", "enumerate",
               "take_while",
               "skip_while", "inspect", "copied", "cloned", "skip", "take",
               "step_by"}
 _CONSUMERS = {"sum", "product", "count", "min", "max", "min_by_key",
-              "max_by_key", "any", "all", "find", "find_map", "position", "fold",
-              "last",
+              "max_by_key", "any", "all", "find", "find_map", "position",
+              "rposition", "fold", "last",
               "nth", "for_each", "collect"}
 # A `for` subject's trailing `.name(..)` calls peeled off as adaptors.
 _FOR_ADAPTORS = _SOURCE_OPS | _STAGE_OPS
@@ -11290,8 +11699,24 @@ def _cpp_wants_core(code, path):
     return False
 
 
+_BLANK_CACHE = {}
+
+
+# Rust's register-width modifiers as GCC operand modifiers.
+_ASM_MODS = {"": "", "x": "w", "e": "k", "r": "q", "l": "b"}
+
+
 def _blank(code):
     """Return `code` with comments and literals blanked, offsets preserved."""
+    hit = _BLANK_CACHE.get(code)
+    if hit is None:
+        if len(_BLANK_CACHE) > 20000:
+            _BLANK_CACHE.clear()
+        hit = _BLANK_CACHE[code] = _blank_uncached(code)
+    return hit
+
+
+def _blank_uncached(code):
     out = list(code)
     i, n = 0, len(code)
     while i < n:
@@ -11532,9 +11957,35 @@ def _split_commas(text):
 _FN_BOUND = re.compile(r"^\s*(\w+)\s*:\s*((?:Fn|FnMut|FnOnce)\s*\(.*)$", re.S)
 
 
-def _normalize_source(text):
+_INCLUDE = re.compile(r'\binclude!\s*\(\s*"([^"]+)"\s*\)\s*;?')
+
+
+def expand_includes(text, path, depth=0):
+    """Splice `include!("file.rs");` in place, relative to `path`.
+
+    The included text is what the compiler would see at that point, so it is
+    pasted rather than parsed on its own. Line numbers after an include
+    shift by its length. Only a literal path is understood.
+    """
+    if not path or depth > 8 or "include!" not in text:
+        return text
+    base = os.path.dirname(os.path.abspath(path))
+
+    def splice(m):
+        target = os.path.join(base, m.group(1))
+        try:
+            with open(target, encoding="utf-8") as f:
+                inner = f.read()
+        except OSError:
+            return m.group(0)
+        return expand_includes(inner, target, depth + 1)
+
+    return _INCLUDE.sub(splice, text)
+
+
+def _normalize_source(text, path=None):
     """Source-level rewrites every Rust file read gets (see their docs)."""
-    return desugar_fn_bounds(rename_use_aliases(text))
+    return desugar_fn_bounds(rename_use_aliases(expand_includes(text, path)))
 
 
 def desugar_fn_bounds(code):
@@ -11641,7 +12092,67 @@ def rename_use_aliases(code):
     return code
 
 
-def find_use_imports(code):
+_ITEM_NAME = re.compile(
+    r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|unsafe\s+|async\s+|"
+    r"extern\s+\"[^\"]*\"\s+)*(?:fn|struct|enum|static|const|type|union)"
+    r"\s+(?:mut\s+)?([A-Za-z_]\w*)")
+
+
+def _glob_names(code):
+    """Names of the items defined at the top level of `code`."""
+    scan = _blank(code)
+    depths = _depths(scan)
+    return [m.group(1) for m in _ITEM_NAME.finditer(scan)
+            if depths[m.start(1)] == 0]
+
+
+def _glob_modules(code):
+    """Module paths of the `use path::*;` items in `code`."""
+    scan = _blank(code)
+    mods = []
+    for _start, after in _scan_line_items(scan, "use"):
+        semi = scan.find(";", after)
+        text = scan[after:semi].strip() if semi >= 0 else ""
+        if text.endswith("::*") and "{" not in text:
+            mods.append(text[:-3].strip())
+    return mods
+
+
+def _expand_use_globs(code, path, out, depth=0, prefix=None):
+    """`use super::*;` -- import each item the named module defines.
+
+    A glob in that module is followed too (`use linux_abi::*;`), a couple of
+    levels down, with each name's module path made relative to `path`.
+    """
+    if not path or depth > 2 or "::*" not in code:
+        return
+    for mod in _glob_modules(code):
+        if prefix is not None:
+            if mod.startswith("self::"):
+                mod = mod[6:]
+            if mod.split("::")[0] in ("crate", "super"):
+                if mod.split("::")[0] == "super":
+                    continue
+                full = mod
+            else:
+                full = prefix + "::" + mod
+        else:
+            full = mod
+        try:
+            filename = resolve_use_path(full, path, strict=True)
+            if not filename:
+                continue
+            with open(filename, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, CrustError, RecursionError):
+            continue
+        for n in _glob_names(text):
+            out.setdefault(n, full)
+        _expand_use_globs(text, filename if False else path, out, depth + 1,
+                          full)
+
+
+def find_use_imports(code, path=None):
     """Map each name a `use` brings into scope to the module it came from.
 
     `use crate::sync::wait_queue::WaitQueue;` gives
@@ -11657,6 +12168,7 @@ def find_use_imports(code):
         if semi < 0:
             continue
         _walk_use_tree([], code[after:semi], out)
+    _expand_use_globs(code, path, out)
     return out
 
 
@@ -11785,6 +12297,16 @@ def resolve_use_path(modpath, path, strict=False):
             lib = os.path.join(base, "lib.rs")
             return lib if os.path.isfile(lib) else None
         bases = [base]
+    if not rest and head == "super" and path \
+            and os.path.basename(path) not in ("lib.rs", "main.rs"):
+        # Bare `super` (`use super::{..}`): the parent module's own file.
+        here = os.path.dirname(os.path.abspath(path))
+        up = os.path.dirname(here) if os.path.basename(path) == "mod.rs" \
+            else here
+        for cand in (up + ".rs", os.path.join(up, "mod.rs")):
+            if os.path.isfile(cand):
+                return cand
+        return None
     if not rest:
         return None
     # The last segment may name an item rather than a module, so try the full
@@ -11834,7 +12356,21 @@ def resolve_mod_path(name, path):
     return None
 
 
+_ITEMS_CACHE = {}
+
+
 def find_rust_items(code, rust_file=False):
+    """Cached `_find_rust_items`: modules are re-read once per demanded name."""
+    key = (code, rust_file)
+    hit = _ITEMS_CACHE.get(key)
+    if hit is None:
+        if len(_ITEMS_CACHE) > 32:
+            _ITEMS_CACHE.clear()
+        hit = _ITEMS_CACHE[key] = _find_rust_items(code, rust_file)
+    return list(hit)
+
+
+def _find_rust_items(code, rust_file=False):
     """Return (start, end, kind) spans of top-level Rust items in `code`.
 
     `kind` is "fn", "struct", "tuple_struct", "impl", "enum", "trait"
@@ -13244,7 +13780,7 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None,
         seen.add(filename)
         try:
             with open(filename, encoding="utf-8") as f:
-                text = _normalize_source(f.read())
+                text = _normalize_source(f.read(), filename)
         except OSError:
             continue
         # Seeding is best effort throughout. A sibling Crust cannot parse
@@ -14033,7 +14569,7 @@ def demand_fn(unit, segs, targs, flat, depth=0, imports=None):
         if filename:
             try:
                 with open(filename, encoding="utf-8") as f:
-                    text = _normalize_source(f.read())
+                    text = _normalize_source(f.read(), filename)
                 reexport = find_use_imports(text).get(last)
                 found = False
                 for span in find_rust_items(text, rust_file=True):
@@ -14100,6 +14636,62 @@ def demand_fn(unit, segs, targs, flat, depth=0, imports=None):
     return mangled
 
 
+def demand_static(unit, name):
+    """Declare a `static`/`const` that another module defines, as `extern`.
+
+    Only its type is read; the defining unit owns the storage. A `const` is
+    left to the existing const machinery, so this serves statics.
+    """
+    if name in unit.static_tried:
+        return name in unit.consts
+    unit.static_tried.add(name)
+    filename = resolve_use_path(unit.imports[name], unit.import_from,
+                                strict=True)
+    if not filename:
+        return False
+    try:
+        with open(filename, encoding="utf-8") as f:
+            text = _normalize_source(f.read(), filename)
+        spans = find_rust_items(text, rust_file=True)
+    except (OSError, CrustError, RecursionError):
+        return False
+    for start, end, kind in spans:
+        if kind != "const":
+            continue
+        toks = tokenize(text[start:end], _line_of(text, start))
+        p = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)], unit)
+        try:
+            p.skip_attributes()
+            p.skip_visibility()
+            kw = p.next().val
+            p.accept("mut")
+            if p.expect_ident() != name:
+                continue
+            p.expect(":")
+            saved = dict(unit.imports)
+            for n in _glob_names(text):
+                unit.imports.setdefault(n, unit.imports[name])
+            for iname, imod in find_use_imports(text, filename).items():
+                unit.imports.setdefault(iname, _rebase_import(
+                    imod, unit.imports.get(name), filename))
+            ty = p.parse_type()
+            if kw == "const":
+                p2 = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)],
+                            unit)
+                _kw, _n, cty, init = p2.parse_const_signature()
+        except (CrustError, RecursionError):
+            continue
+        unit.consts[name] = ty
+        if kw == "const":
+            unit.const_inits[name] = ("const", init.code)
+            unit.const_values[name] = init.code
+            unit.demand_consts.append(name)
+        else:
+            unit.extern_statics[name] = ty
+        return True
+    return False
+
+
 def demand_seed(unit, name, depth=0):
     """Seed the module that a `use` says defines `name`, if there is one.
 
@@ -14123,7 +14715,7 @@ def demand_seed(unit, name, depth=0):
         return False
     try:
         with open(filename, encoding="utf-8") as f:
-            text = _normalize_source(f.read())
+            text = _normalize_source(f.read(), filename)
     except OSError:
         return False
     def defined():
@@ -14150,7 +14742,7 @@ def demand_seed(unit, name, depth=0):
     # a *fallback* -- the compiled file's own always win -- so a name reached
     # only through a seeded module can still be found. `unit.demanded` keeps
     # each module to one read.
-    for iname, imod in find_use_imports(text).items():
+    for iname, imod in find_use_imports(text, filename).items():
         if iname not in unit.imports:
             unit.imports[iname] = _rebase_import(imod, unit.imports.get(name),
                                                  filename)
@@ -14450,6 +15042,8 @@ def _render_const(kw, name, ty, init):
     elif init.lstrip().startswith("(") and "){" in init \
             and not ty.ptr and not ty.array:
         init = _strip_compound_casts(init)
+    for atom in re.findall(r"\b(Atomic\w+)_new\(", init):
+        init = _expand_new_calls(init, atom)         # atomics nested in fields
     prefix = "static const " if kw == "const" else "static "
     return "%s%s = %s;" % (prefix, ty.decl(name), init)
 
@@ -14517,7 +15111,9 @@ _PTR_METHODS = ("is_null", "read_volatile", "write_volatile", "add", "sub",
 _PTR_DEREF_METHODS = ("read", "write", "read_unaligned", "write_unaligned")
 _INT_UNARY = ("wrapping_neg", "abs", "is_positive", "is_negative", "signum",
               "is_power_of_two", "next_power_of_two", "count_ones",
-              "count_zeros", "leading_zeros", "trailing_zeros")
+              "count_zeros", "leading_zeros", "trailing_zeros",
+              "to_le", "from_le", "to_ne", "from_ne", "to_be", "from_be",
+              "swap_bytes", "checked_next_power_of_two")
 _INT_METHODS = frozenset(_INT_UNARY) | frozenset((
     "wrapping_add", "wrapping_sub", "wrapping_mul", "saturating_add",
     "saturating_sub", "saturating_mul", "checked_add", "checked_sub",
@@ -14760,6 +15356,13 @@ def _render_consts(code, spans, unit):
                 else:
                     out.append("#define %s %s" % (name, text))
                 continue
+        if kw == "const" and "sizeof" in init and not ty.ptr \
+                and not ty.array and ty.base in _RANK:
+            # `size_of` arithmetic is a C constant expression only once the
+            # struct is complete; a macro expands where it is used, which
+            # is after that, so it can still size an array.
+            out.append("#define %s ((%s)(%s))" % (name, ty.decl(), init))
+            continue
         out.append(_render_const(kw, name, ty, init))
     return out
 
@@ -14848,6 +15451,29 @@ def erase_module_items(code):
         for k in range(_estart, min(i, n)):
             if out[k] != "\n":
                 out[k] = " "
+        # Attributes written on the erased item (`#[cfg(test)] extern
+        # crate std;`) belong to it, not to whatever item follows.
+        j = _estart - 1
+        while True:
+            while j >= 0 and scan[j] in " \t\r\n":
+                j -= 1
+            if j < 0 or scan[j] != "]":
+                break
+            depth, k = 0, j
+            while k >= 0:
+                if scan[k] == "]":
+                    depth += 1
+                elif scan[k] == "[":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k -= 1
+            if k <= 0 or scan[k - 1] != "#":
+                break
+            for m in range(k - 1, j + 1):
+                if out[m] != "\n":
+                    out[m] = " "
+            j = k - 2
     return "".join(out)
 
 
@@ -14873,11 +15499,11 @@ def translate(code, path=None):
     _WORKGROUP_STATICS = re.findall(
         r"#\[\s*workgroup\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?static\s+"
         r"(?:mut\s+)?(\w+)", code)
-    code = _normalize_source(code)
+    code = _normalize_source(code, path)
     mod_names = find_mod_decls(code) + find_use_paths(code)
     # Captured before erasure: `erase_module_items` blanks every `use`, so
     # reading them afterwards finds nothing.
-    use_imports = find_use_imports(code)
+    use_imports = find_use_imports(code, path)
     code = erase_module_items(code)
     spans = find_rust_items(
         code, rust_file=bool(path) and path.endswith(".rs"))
@@ -15109,6 +15735,7 @@ def translate(code, path=None):
     generated.extend(unit.tuples)
     generated.extend(unit.arrays)
     generated.extend(dyn_names)
+    consts_mark = len(prelude)
     for name in generated:
         prelude.append("struct %s; typedef struct %s %s;" % (name, name, name))
     for name in unit.slices:
@@ -15171,10 +15798,26 @@ def translate(code, path=None):
         if name in unit.const_inits:
             kw, init = unit.const_inits[name]
             prelude.append(_render_const(kw, name, unit.consts[name], init))
+    hoisted = []
+    for name in unit.demand_consts:
+        text = _render_const("const", name, unit.consts[name],
+                             unit.const_inits[name][1])
+        if text.startswith(("enum {", "#define ")):
+            hoisted.append(text)
+        else:
+            prelude.append(text)
     for text in _render_consts(code, spans, unit):
-        prelude.append(text)
+        # Integer constants are plain numbers, and a struct field's array
+        # length may name one, so they must precede the struct bodies.
+        if text.startswith(("enum {", "#define ")):
+            hoisted.append(text)
+        else:
+            prelude.append(text)
+    prelude[consts_mark:consts_mark] = hoisted
     prelude.extend(local["impl_consts"])
     prelude.extend(unit.inherited_consts)
+    for name, ty in unit.extern_statics.items():
+        prelude.append("extern %s;" % ty.decl(name))
     for name, info in sorted(unit.extern_fns.items()):
         if name in unit.fn_sigs or name in included_fns:
             continue
