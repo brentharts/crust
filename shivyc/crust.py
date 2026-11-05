@@ -4922,6 +4922,20 @@ class Parser:
                          or pointee.base in self.unit.enums)
                 if not known:
                     return None
+            if name in ("write", "write_unaligned") and ty.ptr == 1:
+                # The pointee types the value: `p.write(None)`, `p.write([0; 4])`.
+                pointee = RustCType(ty.base, 0, ty.array)
+                val = self.parse_expr_as(pointee)
+                self.expect(")")
+                if ty.array:
+                    tmp = self.new_temp()
+                    self.unit.needs.add("memcpy")
+                    self.pending.append("%s = %s;" % (pointee.decl(tmp),
+                                                       val.code))
+                    self.pending.append("memcpy((void *)%s, %s, sizeof(%s));"
+                                        % (recv.code, tmp, tmp))
+                    return Expr("(void)0", VOID)
+                return self._ptr_method(recv, name, [val.code])
             args = [a.code for a in self._scalar_args()]
             return self._ptr_method(recv, name, args)
         if ty.base == "_Bool" and name == "then":
@@ -5082,6 +5096,13 @@ class Parser:
             return mk("(%s > 0 ? (%s < %s + %s ? %s : (%s)(%s - %s)) : "
                       "(%s > %s + %s ? %s : (%s)(%s - %s)))"
                       % (b, a, MIN, b, MIN, T, a, b, a, MAX, b, MAX, T, a, b))
+        if name in ("checked_shl", "checked_shr"):
+            opt = self.unit.option_type(ty)
+            bits = "(sizeof(%s) * 8)" % T
+            op = "<<" if name == "checked_shl" else ">>"
+            return Expr("(%s){.some = (%s) < %s, .value = (%s) < %s ? "
+                        "(%s)((%s)%s %s %s) : 0}"
+                        % (opt.base, b, bits, b, bits, T, U, a, op, b), opt)
         if name in ("checked_add", "checked_sub", "checked_mul"):
             opt = self.unit.option_type(ty)
             if name == "checked_add":
@@ -5357,7 +5378,9 @@ class Parser:
                 and (recv.type.base, name) not in self.unit.methods \
                 and self._deref_info(recv.type) is not None:
             recv = self.auto_deref(recv)
-        if recv.type is not None and not recv.type.array \
+        if recv.type is not None \
+                and (not recv.type.array
+                     or (recv.type.ptr == 1 and name == "write")) \
                 and (recv.type.base, name) not in self.unit.methods:
             got = self.scalar_method(recv, name)
             if got is not None:
@@ -6283,6 +6306,29 @@ class Parser:
             if self.at(")", "punc"):
                 self.next()
                 return Expr("0", VOID)              # the unit value
+            if (self.at("|", "punc") or self.at("||", "punc")
+                    or (self.at("move", "kw") and self.peek().val in
+                        ("|", "||"))):
+                # `(|| { .. })()`: a closure called where it is written is
+                # just its body, so `return` and `?` leave only it.
+                depth, j = 0, self.i
+                while j < len(self.toks) and self.toks[j].kind != "eof":
+                    v = self.toks[j]
+                    if v.kind == "punc" and v.val in "([{":
+                        depth += 1
+                    elif v.kind == "punc" and v.val in ")]}":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    j += 1
+                if j + 2 < len(self.toks) and self.toks[j].val == ")" \
+                        and self.toks[j + 1].val == "(" \
+                        and self.toks[j + 2].val == ")":
+                    body = self.toks[self.i:j]
+                    if body and body[0].val == "move":
+                        body = body[1:]
+                    self.i = j + 3
+                    return self.apply_fn(body, [], self.target)
             # A tuple literal where a tuple type is expected takes that
             # type, element by element: `(1, 2)` as an `(i64, i64)` argument
             # is that tuple, not an `(i32, i32)` one C cannot convert.
@@ -6478,7 +6524,10 @@ class Parser:
                 given = {}
                 while not self.at("}", "punc"):
                     fname = self.expect_ident()
-                    self.expect(":")
+                    if self.at(",", "punc") or self.at("}", "punc"):
+                        self.i -= 1         # shorthand: `V { slot }`
+                    else:
+                        self.expect(":")
                     want = dict((f, t) for f, t in fields).get(fname)
                     given[fname] = self.parse_expr_as(want).code
                     if not self.accept(","):
@@ -14472,7 +14521,7 @@ _INT_UNARY = ("wrapping_neg", "abs", "is_positive", "is_negative", "signum",
 _INT_METHODS = frozenset(_INT_UNARY) | frozenset((
     "wrapping_add", "wrapping_sub", "wrapping_mul", "saturating_add",
     "saturating_sub", "saturating_mul", "checked_add", "checked_sub",
-    "checked_mul", "min",
+    "checked_mul", "checked_shl", "checked_shr", "min",
     "max", "clamp", "abs_diff", "pow", "div_ceil", "next_multiple_of",
     "is_multiple_of", "rem_euclid", "rotate_left", "rotate_right",
     "to_le_bytes", "to_be_bytes", "to_ne_bytes"))
