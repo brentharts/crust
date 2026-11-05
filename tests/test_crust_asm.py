@@ -127,8 +127,8 @@ class TestAsmRefusals(unittest.TestCase):
             'asm!("nop", options(att_syntax));'))
 
     def test_operand_modifiers(self):
-        self.assertIn("modifiers", self._err(
-            'asm!("mov {:e}, 1", out(reg) _x);'))
+        self.assertIn("modifier", self._err(
+            'asm!("mov {:z}, 1", out(reg) _x);'))
 
     def test_sym_operands(self):
         self.assertIn("`sym`", self._err('asm!("call {}", sym f);'))

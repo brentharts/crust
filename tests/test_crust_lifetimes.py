@@ -658,5 +658,353 @@ fn main() -> i32 {
 }
 """), 0)
 
+class TestGinuxSmallForms(unittest.TestCase):
+    """Small forms Ginux uses: unsafe-block receivers, array pointers, ..."""
+
+    def test_small_forms_together(self):
+        self.assertEqual(_rs(r"""
+const N: usize = 4;
+#[derive(Clone, Copy)]
+struct E { a: u32, b: u32 }
+impl E { const EMPTY: E = E { a: 7, b: 9 }; }
+struct T { es: [E; N], fs: [Option<u32>; N], gs: [u8; N] }
+fn mk() -> T { T { es: [E::EMPTY; N], fs: [None; N], gs: [3; N] } }
+fn ptr_sum(msg: &[u16; 3]) -> u64 {
+    let p = msg.as_ptr();
+    unsafe { *p as u64 + *p.add(2) as u64 }
+}
+fn bytes_sum(b: &[u8]) -> u64 { let p = b.as_ptr(); unsafe { *p as u64 } }
+fn ok(g: u32) -> Option<u32> { unsafe { g > 1 }.then_some(g) }
+fn main() -> i32 {
+    let t = mk();
+    if t.es[3].a != 7 || t.es[0].b != 9 { return 1; }
+    if t.fs[2].is_some() || t.gs[3] != 3 { return 2; }
+    if ptr_sum(&[1, 2, 3]) != 4 { return 3; }
+    if bytes_sum(&[5, 6]) != 5 { return 4; }
+    if ok(1).is_some() || ok(2).unwrap() != 2 { return 5; }
+    let mut buf = [0_u64; 2];
+    unsafe { (buf.as_mut_ptr()).add(1).write(0x1234_u64.to_le()); }
+    if buf[1] != 0x1234 { return 6; }
+    if !b"ab\\n".ends_with(b"\\n") { return 7; }
+    let (up, _): (u64, u64) = (5, 6);
+    if up != 5 { return 8; }
+    0
+}
+"""), 0)
+
+    def test_byte_string_ends_with(self):
+        self.assertEqual(_rs(r"""
+fn main() -> i32 {
+    if !b"ab\n".ends_with(b"\n") { return 1; }
+    if !b"ab\n".starts_with(b"ab") { return 2; }
+    if b"ab\n".ends_with(b"x") { return 3; }
+    0
+}
+"""), 0)
+
+    def test_array_field_from_array_value(self):
+        self.assertEqual(_rs(r"""
+const N: usize = 4;
+struct S { a: [u8; N], b: u8 }
+fn f(x: [u8; N]) -> S { S { a: x, b: 1 } }
+fn main() -> i32 {
+    let s = f([1, 2, 3, 4]);
+    if s.a[2] != 3 { return 1; }
+    0
+}
+"""), 0)
+
+    def test_repeat_length_from_size_of(self):
+        self.assertEqual(_rs(r"""
+use core::mem::size_of;
+#[derive(Clone, Copy)]
+struct Entry { a: u64, b: u32 }
+impl Entry { const EMPTY: Entry = Entry { a: 3, b: 4 }; }
+const PAGE: usize = 128;
+const PER: usize = (PAGE - 8) / size_of::<Entry>();
+struct Page { entries: [Entry; PER], n: u8 }
+fn mk() -> Page { Page { entries: [Entry::EMPTY; PER], n: 2 } }
+fn main() -> i32 {
+    let p = mk();
+    if p.entries[PER - 1].a != 3 || p.n != 2 { return 1; }
+    0
+}
+"""), 0)
+
+    def test_method_paths_as_functions(self):
+        self.assertEqual(_rs(r"""
+fn half(x: usize) -> Option<usize> { if x % 2 == 0 { Some(x / 2) } else { None } }
+fn main() -> i32 {
+    let a: usize = 3;
+    let r = a.checked_mul(2).and_then(usize::checked_next_power_of_two);
+    if r != Some(8) { return 1; }
+    let h = (4 as usize).checked_add(4).and_then(half);
+    if h != Some(4) { return 2; }
+    let mut v = [Some(1_u32), None];
+    let s = v.get_mut(0).and_then(Option::as_mut);
+    if s.is_none() { return 3; }
+    0
+}
+"""), 0)
+
+    def test_include_macro_splices_a_file(self):
+        import os, tempfile
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "spec"))
+        with open(os.path.join(d, "spec", "abi.rs"), "w") as f:
+            f.write("pub const A: u16 = 1;\npub const B: u16 = 2;\n")
+        src = ('include!("spec/abi.rs");\n'
+               "fn f(x: u16) -> bool { matches!(x, A | B) }\n"
+               "fn main() -> i32 { if f(2) && !f(3) { 0 } else { 1 } }\n")
+        out = crust.translate(src, path=os.path.join(d, "m.rs"))
+        self.assertIn("A = 1", out)
+
+    def test_nested_arrays_with_unequal_dimensions(self):
+        self.assertEqual(_rs(r"""
+use core::mem::size_of;
+#[derive(Clone, Copy)]
+struct File { a: u64 }
+const PAGE: usize = 128;
+const PER: usize = (PAGE - 8) / size_of::<Option<File>>();
+struct Pg { files: [Option<File>; PER], n: u8 }
+fn mk() -> Pg { Pg { files: [None; PER], n: 2 } }
+struct G { gdt: [[u64; 7]; PAGE], q: [[File; 2]; PAGE] }
+fn main() -> i32 {
+    let p = mk();
+    if p.files[PER - 1].is_some() || p.n != 2 { return 1; }
+    second()
+}
+#[derive(Clone, Copy)]
+struct Q { v: u32 }
+impl Q { const EMPTY: Q = Q { v: 9 }; }
+const OUT: usize = 3;
+struct W { gdt: [[u64; 7]; OUT], q: [[Q; 2]; PER] }
+fn mkw() -> W { W { gdt: [[0; 7]; OUT], q: [[Q::EMPTY; 2]; PER] } }
+fn second() -> i32 {
+    let w = mkw();
+    if w.gdt[2][6] != 0 { return 5; }
+    if w.q[PER - 1][1].v != 9 { return 6; }
+    if w.q[0][0].v != 9 { return 7; }
+    0
+}
+"""), 0)
+
+    def test_nested_array_dimension_order(self):
+        self.assertEqual(_rs(r"""
+fn main() -> i32 {
+    let mut g = [[0_u8; 7]; 3];
+    g[2][6] = 5;
+    let h = [[1, 2, 3], [4, 5, 6]];
+    if g[2][6] != 5 || h[1][2] != 6 || h[0][2] != 3 { return 1; }
+    0
+}
+"""), 0)
+
+    def test_tuple_patterns_in_parameters(self):
+        self.assertEqual(_rs(r"""
+fn sum((a, _): (u64, u64), k: u64) -> u64 { a + k }
+struct S;
+impl S {
+    fn two(&self, (x, y): (u32, u32)) -> u32 { x * 10 + y }
+}
+fn main() -> i32 {
+    if sum((5, 6), 2) != 7 { return 1; }
+    if S.two((3, 4)) != 34 { return 2; }
+    0
+}
+"""), 0)
+
+    def test_refutable_and_nested_tuple_patterns(self):
+        self.assertEqual(_rs(r"""
+fn two(a: u32) -> Option<u32> { if a > 0 { Some(a) } else { None } }
+fn f(x: u32, y: u32) -> u32 {
+    let (Some(a), Some(b)) = (two(x), two(y)) else {
+        return 0;
+    };
+    a + b
+}
+fn g() -> bool {
+    let words = [(1_u32, 2_u32), (3, 4)];
+    let expected = [1_u32, 3];
+    expected.iter().enumerate().any(|(index, w)| *w == words[index].0)
+}
+fn h() -> u32 {
+    let words = [(1_u32, 2_u32), (3, 4)];
+    let mut n = 0;
+    for (index, (a, _)) in words.iter().enumerate() { n += *a + index as u32; }
+    n
+}
+fn main() -> i32 {
+    if f(1, 2) != 3 || f(0, 2) != 0 { return 1; }
+    if !g() { return 2; }
+    if h() != 5 { return 3; }
+    0
+}
+"""), 0)
+
+    def test_trailing_comma_in_generic_arguments(self):
+        self.assertEqual(_rs(r"""
+fn f(x: u32) -> Result<
+    (u32, u32),
+    u8,
+> {
+    let o: Option<
+        u32,
+    > = Some(x);
+    Ok((o.unwrap(), 2))
+}
+fn main() -> i32 { match f(4) { Ok((a, b)) => (a + b - 6) as i32, Err(_) => 1 } }
+"""), 0)
+
+    def test_attribute_on_an_erased_item_does_not_leak(self):
+        self.assertEqual(_rs(r"""
+#[cfg(test)]
+extern crate std;
+struct A { m: u8 }
+impl A {
+    const fn f(n: u8) -> Self {
+        Self {
+            m: n,
+        }
+    }
+}
+struct B<'a> { s: &'a [u8] }
+impl<'a> B<'a> {
+    const fn new() -> Self { Self { s: &[] } }
+}
+fn main() -> i32 {
+    let b = B::new();
+    if b.s.len() != 0 { return 2; }
+    if A::f(3).m == 3 { 0 } else { 1 }
+}
+"""), 0)
+
+    def test_as_chunks_and_as_chunks_mut(self):
+        self.assertEqual(_rs(r"""
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut sum = 0_u32;
+    let (words, rest) = bytes.as_chunks::<2>();
+    for word in words { sum += u32::from(u16::from_be_bytes([word[0], word[1]])); }
+    if let Some(last) = rest.first() { sum += u32::from(*last) << 8; }
+    sum
+}
+fn main() -> i32 {
+    if checksum(&[0, 1, 0, 2, 3]) != 1 + 2 + 0x300 { return 1; }
+    let mut out = [0_u8; 16];
+    for c in out.as_chunks_mut::<8>().0 { c[0] = 7; }
+    if out[8] != 7 || out[0] != 7 || out[1] != 0 { return 2; }
+    extra()
+}
+fn extra() -> i32 {
+    let mut out = [0_u8; 16];
+    for c in out.as_chunks_mut::<8>().0 { c.copy_from_slice(&5_u64.to_ne_bytes()); }
+    if out[0] != 5 || out[8] != 5 || out[9] != 0 { return 1; }
+    0
+}
+"""), 0)
+
+    def test_atomics_nested_in_a_static_struct(self):
+        self.assertEqual(_rs(r"""
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+struct Arch { enabled: AtomicBool }
+static ARCH: Arch = Arch { enabled: AtomicBool::new(false) };
+static COUNT: AtomicU64 = AtomicU64::new(0);
+static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+fn main() -> i32 {
+    ARCH.enabled.store(true, Ordering::Release);
+    COUNT.fetch_add(3, Ordering::SeqCst);
+    COUNTS[2].store(5, Ordering::Relaxed);
+    if !ARCH.enabled.load(Ordering::Acquire) || COUNT.load(Ordering::SeqCst) != 3 { return 1; }
+    if COUNTS[2].load(Ordering::Relaxed) != 5 { return 2; }
+    0
+}
+"""), 0)
+
+    def test_static_from_the_parent_module_is_extern(self):
+        import os, tempfile
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "cpu"))
+        with open(os.path.join(d, "cpu.rs"), "w") as f:
+            f.write("pub static TICKS: u64 = 5;\n")
+        out = crust.translate(
+            "use super::TICKS;\nfn f() -> u64 { TICKS + 1 }\n",
+            path=os.path.join(d, "cpu", "child.rs"))
+        self.assertIn("extern unsigned long TICKS;", out)
+
+    def test_asm_register_width_modifier(self):
+        self.assertEqual(_rs(r"""
+use core::arch::asm;
+fn main() -> i32 {
+    let v: u16;
+    unsafe { asm!("mov {x:x}, 7", x = out(reg) v, options(nomem, nostack)); }
+    if v != 7 { return 1; }
+    0
+}
+"""), 0)
+
+    def test_iterator_windows(self):
+        self.assertEqual(_rs(r"""
+fn main() -> i32 {
+    let v = [1_u32, 3, 5, 9];
+    if !v.windows(2).all(|p| p[0] < p[1]) { return 1; }
+    let w = [1_u32, 3, 3];
+    if w.windows(2).all(|p| p[0] < p[1]) { return 2; }
+    let mut n = 0;
+    for win in v.windows(3) { n += win[0] + win[2]; }
+    if n != 1 + 5 + 3 + 9 { return 3; }
+    if v.windows(5).count() != 0 { return 4; }
+    let hay: &[u8] = b"xxabcxx";
+    if !hay.windows(3).any(|win| win[0] == b'a' && win[2] == b'c') { return 5; }
+    0
+}
+"""), 0)
+
+    def test_iterator_flat_map_over_slices(self):
+        self.assertEqual(_rs(r"""
+#[derive(Clone, Copy)]
+struct Layer { d: u32 }
+struct Entry { live: bool, ls: [Layer; 2] }
+impl Entry { fn layers(&self) -> &[Layer] { &self.ls } }
+fn find(es: &[Entry], d: u32) -> Option<Layer> {
+    es.iter().filter(|e| e.live).flat_map(Entry::layers).copied().find(|l| l.d == d)
+}
+fn main() -> i32 {
+    let es = [Entry { live: true, ls: [Layer { d: 1 }, Layer { d: 2 }] },
+              Entry { live: false, ls: [Layer { d: 3 }, Layer { d: 4 }] },
+              Entry { live: true, ls: [Layer { d: 5 }, Layer { d: 6 }] }];
+    if find(&es, 6).is_none() || find(&es, 2).is_none() { return 1; }
+    if find(&es, 3).is_some() || find(&es, 9).is_some() { return 2; }
+    let n = es.iter().flat_map(Entry::layers).count();
+    if n != 6 { return 3; }
+    0
+}
+"""), 0)
+
+    def test_iterator_rposition(self):
+        self.assertEqual(_rs(r"""
+fn main() -> i32 {
+    let v = [1_u32, 5, 3, 5, 2];
+    if v.iter().rposition(|x| *x == 5) != Some(3) { return 1; }
+    if v.iter().position(|x| *x == 5) != Some(1) { return 2; }
+    if v.iter().rposition(|x| *x == 9).is_some() { return 3; }
+    0
+}
+"""), 0)
+
+    def test_glob_imported_consts_in_patterns(self):
+        import os, tempfile
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "cpu"))
+        with open(os.path.join(d, "cpu.rs"), "w") as f:
+            f.write("mod abi;\npub(crate) use abi::*;\n")
+        with open(os.path.join(d, "cpu", "abi.rs"), "w") as f:
+            f.write("pub const A: u64 = 1;\npub const B: u64 = 2;\n")
+        out = crust.translate(
+            "use super::*;\n"
+            "fn f(x: u64) -> bool { matches!(x, A | B) }\n",
+            path=os.path.join(d, "cpu", "child.rs"))
+        self.assertIn("A = 1", out)
+
+
 if __name__ == "__main__":
     unittest.main()
