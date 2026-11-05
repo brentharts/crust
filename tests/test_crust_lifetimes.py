@@ -413,5 +413,197 @@ fn main() -> i32 {
 }
 """), 0)
 
+    def test_flatten_over_options_and_untyped_array_of_options(self):
+        self.assertEqual(_rs("""
+struct D { id: u32 }
+struct T { ds: [Option<D>; 4] }
+impl T {
+    fn has(&self, id: u32) -> bool { self.ds.iter().flatten().any(|d| d.id == id) }
+    fn total(&self) -> u32 {
+        let mut s = 0;
+        for d in self.ds.iter().flatten() { s += d.id; }
+        s
+    }
+}
+fn main() -> i32 {
+    let t = T { ds: [None, Some(D { id: 5 }), None, Some(D { id: 7 })] };
+    if !t.has(7) || t.has(6) { return 1; }
+    if t.total() != 12 { return 2; }
+    let o = [Some(1_u32), None, Some(3)];
+    let n: u32 = o.iter().flatten().sum();
+    if n != 4 { return 3; }
+    0
+}
+"""), 0)
+
+    def test_untyped_none_repeat_array_fixed_through_a_pointer(self):
+        self.assertEqual(_rs("""
+fn make(n: u32) -> Option<u32> { if n > 1 { Some(n) } else { None } }
+fn main() -> i32 {
+    let mut slots = [None; 3];
+    let mut k = 0;
+    for slot in &mut slots {
+        *slot = make(k);
+        if slot.is_none() { k += 10; }
+        k += 1;
+    }
+    let mut c = 0;
+    for s in slots.iter() { if s.is_some() { c += 1; } }
+    c - 2
+}
+"""), 0)
+
+    def test_is_some_on_a_none_not_yet_assigned_and_saturating_mul(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let mut found = None;
+    let mut hits = 0;
+    for i in 0..5_u32 {
+        if found.is_some() { hits += 1; }
+        if i == 2 { found = Some(i); }
+    }
+    if found.is_none() { return 9; }
+    let big = 4_000_000_000_u32.saturating_mul(3);
+    if big != u32::MAX { return 8; }
+    if 6_u64.saturating_mul(7) != 42 { return 7; }
+    hits - 2
+}
+"""), 0)
+
+    def test_open_none_typed_by_replace(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let mut dynamic = None;
+    let a = 5_u32;
+    if dynamic.replace(a).is_some() { return 1; }
+    if dynamic.replace(a + 1).is_none() { return 2; }
+    dynamic.unwrap() as i32 - 6
+}
+"""), 0)
+
+    def test_generic_params_bounded_by_closure_traits(self):
+        self.assertEqual(_rs("""
+struct S { n: u32 }
+impl S {
+    fn run<L, C>(&mut self, limit_for: L, class_for: C) -> u32
+    where
+        L: Fn(u64) -> usize,
+        C: Fn(u64) -> u32,
+    {
+        let a = limit_for(3).min(5) as u32;
+        a + class_for(self.n as u64)
+    }
+    fn with<F>(&self, f: F) -> usize where F: FnOnce(&[u8]) -> usize {
+        let d = [1_u8, 2, 3];
+        f(&d)
+    }
+}
+fn apply<F>(mut f: F) -> u32 where F: FnMut(u32) -> u32 { f(1) + f(2) }
+fn main() -> i32 {
+    let mut s = S { n: 4 };
+    let k = 100_u32;
+    let r = s.run(|d| d as usize * 2, |d| d as u32 + k);
+    if r != 5 + 104 { return 1; }
+    let len = s.with(|b| b.len());
+    if len != 3 { return 2; }
+    if apply(|x| x * 10) != 30 { return 3; }
+    0
+}
+"""), 0)
+
+    def test_closure_bound_signature_keeps_line_count(self):
+        src = ("fn f<F>(\n    g: F,\n) -> u32\nwhere\n    F: Fn(u32) -> u32,\n"
+               "{\n    g(1)\n}\n")
+        out = crust.desugar_fn_bounds(src)
+        self.assertEqual(out.count("\n"), src.count("\n"))
+        self.assertIn("g: impl Fn(u32) -> u32", out)
+        self.assertNotIn("where", out)
+
+    def test_untyped_none_passed_by_mutable_reference(self):
+        self.assertEqual(_rs("""
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Option<()> {
+    if slot.is_some() { return None; }
+    *slot = Some(value);
+    Some(())
+}
+fn plain(slot: &mut Option<u32>) { *slot = Some(7); }
+fn parse(a: u64, b: u64) -> Option<u64> {
+    let mut x = None;
+    let mut y = None;
+    set_once(&mut x, a)?;
+    plain2(&mut y);
+    set_once(&mut x, b)?;
+    Some(x? + y? as u64)
+}
+fn plain2(slot: &mut Option<u32>) { plain(slot); }
+fn main() -> i32 {
+    if parse(1, 2).is_some() { return 1; }
+    let mut z = None;
+    set_once(&mut z, 5_u64).unwrap();
+    if set_once(&mut z, 6_u64).is_some() { return 2; }
+    z.unwrap() as i32 - 5
+}
+"""), 0)
+
+    def test_constructors_as_function_arguments(self):
+        self.assertEqual(_rs("""
+struct Handle(u32);
+enum Root { Embedded(u32), Other }
+fn make(n: u32) -> Option<u32> { if n > 0 { Some(n) } else { None } }
+fn main() -> i32 {
+    let h = make(4).map(Handle);
+    if h.is_none() { return 1; }
+    if h.unwrap().0 != 4 { return 2; }
+    let r = make(5).map(Root::Embedded);
+    if let Some(Root::Embedded(v)) = r { if v != 5 { return 3; } } else { return 4; }
+    if make(0).map(Handle).is_some() { return 5; }
+    0
+}
+"""), 0)
+
+class TestModuleFileLayout(unittest.TestCase):
+
+    def test_self_in_a_plain_module_file_reaches_its_child_directory(self):
+        import os, tempfile
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "arch", "cpu"))
+        for rel, text in {
+            "lib.rs": "mod arch;\n",
+            "arch.rs": "pub mod cpu;\n",
+            "arch/cpu.rs": "mod inner;\npub use inner::index;\n",
+            "arch/cpu/inner.rs": "pub fn index() -> usize { 3 }\n",
+        }.items():
+            with open(os.path.join(d, rel), "w") as f:
+                f.write(text)
+        out = crust.translate(
+            "fn f() -> usize { let n = crate::arch::cpu::index(); n + 1 }\n",
+            path=os.path.join(d, "user.rs"))
+        self.assertIn("index", out)
+        self.assertEqual(
+            crust.resolve_use_path("self::inner",
+                                   os.path.join(d, "arch", "cpu.rs"),
+                                   strict=True),
+            os.path.join(d, "arch", "cpu", "inner.rs"))
+
+
+    def test_fill_with_none_and_nested_self_import(self):
+        self.assertEqual(_rs("""
+struct T { slots: [Option<u32>; 3], n: u32 }
+impl T {
+    fn clear(&mut self) { self.slots.fill(None); }
+}
+fn main() -> i32 {
+    let mut t = T { slots: [Some(1), Some(2), None], n: 0 };
+    t.clear();
+    let mut c = 0;
+    for s in t.slots.iter() { if s.is_some() { c += 1; } }
+    c + t.n as i32
+}
+"""), 0)
+        got = crust.find_use_imports(
+            "use crate::{\n    initramfs::{self, Handle},\n};\n")
+        self.assertEqual(got["initramfs"], "crate")
+        self.assertEqual(got["Handle"], "crate::initramfs")
+
 if __name__ == "__main__":
     unittest.main()
