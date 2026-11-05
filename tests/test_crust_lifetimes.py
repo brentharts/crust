@@ -605,5 +605,58 @@ fn main() -> i32 {
         self.assertEqual(got["initramfs"], "crate")
         self.assertEqual(got["Handle"], "crate::initramfs")
 
+    def test_pointer_write_of_none_and_arrays_and_variant_shorthand(self):
+        self.assertEqual(_rs("""
+struct W { cur: Option<u32>, arr: [u32; 2], th: [Option<u32>; 2] }
+enum R { Embedded(u32), Pub { slot: u8 } }
+fn init(w: *mut W) {
+    unsafe {
+        core::ptr::addr_of_mut!((*w).cur).write(None);
+        core::ptr::addr_of_mut!((*w).arr).write([4; 2]);
+        for i in 0..2 { core::ptr::addr_of_mut!((*w).th[i]).write(None); }
+    }
+}
+fn mk(slot: u8) -> R { R::Pub { slot } }
+fn main() -> i32 {
+    let mut w = W { cur: Some(1), arr: [0; 2], th: [Some(1), Some(2)] };
+    init(&mut w);
+    if w.cur.is_some() || w.arr[1] != 4 || w.th[0].is_some() { return 1; }
+    if let R::Pub { slot } = mk(7) { if slot != 7 { return 2; } } else { return 3; }
+    0
+}
+"""), 0)
+
+    def test_checked_shifts(self):
+        self.assertEqual(_rs("""
+fn main() -> i32 {
+    let a = 3_u64;
+    if a.checked_shl(32).unwrap() != 3_u64 << 32 { return 1; }
+    if a.checked_shl(64).is_some() { return 2; }
+    if 0x100_u32.checked_shr(4).unwrap() != 0x10 { return 3; }
+    if 1_u32.checked_shr(32).is_some() { return 4; }
+    0
+}
+"""), 0)
+
+    def test_immediately_invoked_closure_with_question_marks(self):
+        self.assertEqual(_rs("""
+fn step(n: u32) -> Option<u32> { if n < 5 { Some(n + 1) } else { None } }
+fn run(n: u32) -> bool {
+    let ok = (|| {
+        let a = step(n)?;
+        let b = step(a)?;
+        Some(a + b)
+    })();
+    ok.is_some()
+}
+fn main() -> i32 {
+    if !run(1) { return 1; }
+    if run(4) { return 2; }
+    let v = (|| { 5 })();
+    if v != 5 { return 3; }
+    0
+}
+"""), 0)
+
 if __name__ == "__main__":
     unittest.main()
