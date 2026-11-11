@@ -66,6 +66,10 @@ def _csrust_script():
     return _tool_script("csrust.py", "CRUST_CSRUST")
 
 
+def _goose2c_script():
+    return _tool_script("goose2c.py", "CRUST_GOOSE2C")
+
+
 def _read_or(path, fallback):
     """The child's diagnostic, or `fallback` if it did not write one."""
     try:
@@ -76,7 +80,7 @@ def _read_or(path, fallback):
         return fallback
 
 
-def _run_transpiler(script, filename, text, tag):
+def _run_transpiler(script, filename, text, tag, extra_args=()):
     """Lower a language-subset include out-of-process.
 
     Returns `(True, lowered_source)` or `(False, diagnostic)`.
@@ -126,7 +130,7 @@ def _run_transpiler(script, filename, text, tag):
 
     if sys.implementation.name != "shivyc":
         import subprocess
-        cmd = [sys.executable, script, src, "-o", out, "--basedir", basedir]
+        cmd = [sys.executable, script, src, "-o", out, "--basedir", basedir] + list(extra_args)
         for d in _extra_include_dirs:
             cmd += ["--incdir", d]
         if spec:
@@ -147,6 +151,8 @@ def _run_transpiler(script, filename, text, tag):
         # would break. Acceptable for the same reason it is in main.py.
         # stderr is dropped because the message is read back from `out`.
         extra = (" --owning " + spec) if spec else ""
+        for a in extra_args:
+            extra += " " + a
         for d in _extra_include_dirs:
             extra += " --incdir " + d
         rc = os.system("python3 " + script + " " + src + " -o " + out +
@@ -163,6 +169,11 @@ def _run_transpiler(script, filename, text, tag):
 def _run_cpprust(filename, text):
     """Lower a `.cpp` include out-of-process."""
     return _run_transpiler(_cpprust_script(), filename, text, "cpprust.py")
+
+
+def _run_goose(filename, text):
+    """Lower a `.goose` include out-of-process, as a library: no C `main`, `export fn`s as the entry points."""
+    return _run_transpiler(_goose2c_script(), filename, text, "goose2c.py", ["--lib"])
 
 
 def _run_csrust(filename, text):
@@ -1036,6 +1047,14 @@ class _Preprocessor:
                 if not ok:
                     error_collector.add(CompilerError(
                         "cpprust: %s" % text, rest[0].r))
+                    return
+            elif filename.endswith(".goose"):
+                # Goose subset (GOOSE.md): translated as a library, so the includer's
+                # C, Rust, C++ or C# can call its `export fn`s and Goose can call theirs.
+                ok, text = _run_goose(filename, text)
+                if not ok:
+                    error_collector.add(CompilerError(
+                        "goose: %s" % text, rest[0].r))
                     return
             elif filename.endswith(".cs"):
                 # C# subset (issue #25): cs2cpp → cpprust, same out-of-process
