@@ -1,0 +1,10 @@
+circle Circle { 1.0 } area 3.0
+rectangle Rect { 2.0, 3.0 } area 6.0
+other Shape.Dot area 0.0
+square Rect { 2.0, 2.0 } area 4.0
+13.0
+[Circle { 2.0 }, Rect { 4.0, 6.0 }, Shape.Dot, Rect { 4.0, 4.0 }]
+[Circle { 2.0 }, Rect { 4.0, 6.0 }, Shape.Dot, Rect { 4.0, 4.0 }]
+Shape.Dot Circle { 2.5 }
+Rect { 1.0, 1.0 }
+2.0

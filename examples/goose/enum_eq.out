@@ -1,0 +1,4 @@
+Push { 5 }
+Op.Add
+[Op.Add, Jump { 3, true }]
+true
