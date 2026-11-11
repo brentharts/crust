@@ -93,6 +93,11 @@ class _BoolAndOr(_RExprNode):
         its type, emitting no IL into the real stream. The returned ILValue's
         `.ctype` and `.literal` are valid for the folding decisions above."""
         scratch = il_gen.ILCode()
+        # Marked as a probe so the node does not cache the lvalue (and the
+        # temporaries) it builds here: the runtime path evaluates `node` again
+        # into the real IL, and a cached lvalue would refer to values whose
+        # defining commands only ever went into this throwaway buffer.
+        scratch.probe = True
         scratch.start_func("<boolop-type-probe>")
         return node.make_il(scratch, symbol_table, c)
 

@@ -25,6 +25,20 @@ def win64_passes_by_ref(ctype):
         return False
     return ctype.size not in (1, 2, 4, 8)
 
+class _ByteConst:
+    """An integer-constant initializer entry made by the compiler itself (one
+    byte of a string literal that initializes a char array member)."""
+
+    def __init__(self, value):
+        self.value = value
+        self.r = None
+
+    def make_il(self, il_code, symbol_table, c):
+        v = ILValue(ctypes.char)
+        il_code.register_literal_var(v, str(self.value))
+        return v
+
+
 class Root(CNode):
     """Root node of the program."""
 
@@ -383,6 +397,7 @@ class DeclInfo:
             # Evaluate on a probe IL so a non-constant init (e.g. a call)
             # cannot crash with KeyError when cur_func is unset at file scope.
             probe = ILCode()
+            probe.probe = True
             probe.start_func("<static-init-probe>")
             init = self.init.make_il(probe, symbol_table, c)
             if not init.literal:
@@ -448,6 +463,7 @@ class DeclInfo:
             all_zero = True
             # Probe IL: file-scope cur_func is None; never emit into real code.
             probe = ILCode()
+            probe.probe = True
             probe.start_func("<static-init-probe>")
             for off, ctype, expr in entries:
                 addr = self._static_addr_const(
@@ -500,6 +516,66 @@ class DeclInfo:
                 IndirectLValue(elem_addr(b, ctypes.unsig_char)).set_to(
                     zero, il_code, self.identifier.r)
 
+    def _needs_elision(self, ctype, sub, symbol_table, c):
+        """True if `sub` is a bare expression initializing an aggregate member
+        whose braces were elided (C11 6.7.9p20), as opposed to a nested brace
+        list or an aggregate-typed expression (a struct copy, a string
+        literal for a char array)."""
+        import shivyc.tree.primary_exprs as primary_exprs
+        if isinstance(sub, decl_nodes.InitList):
+            return False
+        if not (ctype.is_array() or ctype.is_struct_union()):
+            return False
+        if isinstance(sub, primary_exprs.String) and ctype.is_array():
+            return False
+        # An expression whose own type is a struct/union initializes the
+        # struct member directly; evaluate on a throwaway IL to find out.
+        try:
+            probe = ILCode()
+            probe.probe = True
+            probe.start_func("<elide-probe>")
+            v = sub.make_il(probe, symbol_table, c)
+            if v.ctype.is_struct_union() or v.ctype.is_array():
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _consume_elided(self, ctype, items, pos, base, out, il_code,
+                        symbol_table, c):
+        """Initialize aggregate `ctype` at `base` from items[pos:] with its
+        braces elided; returns the index of the first unused item."""
+        if ctype.is_array():
+            n = ctype.n if ctype.n is not None else 1
+            for k in range(n):
+                if pos >= len(items) or items[pos][0]:
+                    break
+                sub = items[pos][1]
+                off = base + k * ctype.el.size
+                if self._needs_elision(ctype.el, sub, symbol_table, c):
+                    pos = self._consume_elided(ctype.el, items, pos, off, out,
+                                               il_code, symbol_table, c)
+                else:
+                    self._flatten_init(ctype.el, sub, off, out, il_code,
+                                       symbol_table, c)
+                    pos += 1
+            return pos
+        for name, mctype in ctype.members:
+            if pos >= len(items) or items[pos][0]:
+                break
+            sub = items[pos][1]
+            off = base + ctype.offsets[name][0]
+            if self._needs_elision(mctype, sub, symbol_table, c):
+                pos = self._consume_elided(mctype, items, pos, off, out,
+                                           il_code, symbol_table, c)
+            else:
+                self._flatten_init(mctype, sub, off, out, il_code,
+                                   symbol_table, c)
+                pos += 1
+            if isinstance(ctype, ctypes.UnionCType):
+                break          # a union's initializer reaches only its first member
+        return pos
+
     def _flatten_init(self, ctype, init, base, out, il_code, symbol_table, c):
         """Flatten an initializer against a ctype into scalar (offset, ctype,
         expr) entries."""
@@ -507,19 +583,35 @@ class DeclInfo:
             if ctype.is_array():
                 el = ctype.el
                 idx = 0
-                for designators, sub in init.items:
+                items = init.items
+                pos = 0
+                while pos < len(items):
+                    designators, sub = items[pos]
                     for kind, val in designators:
                         if kind == "index":
                             iv = val.make_il(il_code, symbol_table, c)
                             idx = iv.literal.val
-                    self._flatten_init(el, sub, base + idx * el.size, out,
-                                       il_code, symbol_table, c)
+                    if (not designators
+                            and self._needs_elision(el, sub, symbol_table, c)):
+                        # `long a[3][2] = {0, 1, 2}`: the scalars fill the
+                        # inner aggregates in order, with the braces elided.
+                        pos = self._consume_elided(
+                            el, items, pos, base + idx * el.size, out,
+                            il_code, symbol_table, c)
+                    else:
+                        self._flatten_init(el, sub, base + idx * el.size, out,
+                                           il_code, symbol_table, c)
+                        pos += 1
                     idx += 1
             elif ctype.is_struct_union():
                 members = ctype.members
                 mi = 0
                 import shivyc.member_elim as member_elim
-                for designators, sub in init.items:
+                items = init.items
+                pos = 0
+                while pos < len(items):
+                    designators, sub = items[pos]
+                    pos += 1
                     # A positional (non-designated) struct initializer pins the
                     # member order, so the struct must keep all its members.
                     if not any(k == "member" for k, _ in designators):
@@ -560,14 +652,31 @@ class DeclInfo:
                     elif mi < len(members):
                         name, mctype = members[mi]
                         moff, _ = ctype.offsets[name]
-                        self._flatten_init(mctype, sub, base + moff, out,
-                                           il_code, symbol_table, c)
+                        if self._needs_elision(mctype, sub, symbol_table, c):
+                            # `struct { long d[4]; long n; } s = {0}`: the
+                            # scalar starts the array member, braces elided.
+                            pos = self._consume_elided(
+                                mctype, items, pos - 1, base + moff, out,
+                                il_code, symbol_table, c)
+                        else:
+                            self._flatten_init(mctype, sub, base + moff, out,
+                                               il_code, symbol_table, c)
                         mi += 1
             else:
                 # Scalar wrapped in braces, e.g. `int x = {5};`
                 if init.items:
                     self._flatten_init(ctype, init.items[0][1], base, out,
                                        il_code, symbol_table, c)
+        elif (ctype.is_array() and ctype.el.size == 1
+              and type(init).__name__ == "String"
+              and not getattr(init, "wide", False)):
+            # A string literal initializing a char array that is a member or
+            # element (`struct { int a; char n[4]; } x = {1, "abc"}`): the
+            # array holds the string's bytes, truncated to its length (the
+            # rest of it is zero-filled by the caller's gap handling).
+            n = ctype.n if ctype.n is not None else len(init.chars)
+            for i, ch in enumerate(init.chars[:n]):
+                out.append((base + i, ctype.el, _ByteConst(ch)))
         else:
             out.append((base, ctype, init))
 
