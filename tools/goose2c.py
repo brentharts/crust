@@ -2,6 +2,7 @@
 """goose2c -- translate a Goose subset program to C (see GOOSE.md).
 
     python3 tools/goose2c.py prog.goose -o prog.c
+    python3 tools/goose2c.py --lib lib.goose -o lib.c     # no C main; `export fn`s are the entry points
 
 Phase 2a: the plain subset -- scalars, `let`/`var`, control flow as
 expressions, functions (multiple results, overloads, untyped parameters as
@@ -114,7 +115,7 @@ class StructInfo:
     def __init__(self, name, decl, env=None, cn=None, targs=None):
         self.name, self.decl = name, decl
         self.env = env or {}                     # the type arguments of a generic struct's instance
-        self.cn = cn or name                     # the C name
+        self.cn = (cn or name).replace("::", "_")  # the C name
         self.gname, self.targs = name, targs
         self.display = name
         self.root = bool(getattr(decl, "root", False))
@@ -213,6 +214,8 @@ static void gs_p_quoted(const uint8_t *p, int64_t n) { gs_write("\"", 1); gs_wri
 
 #define GS_STACK_BYTES ((int64_t)1 << 28)
 static int gs_rf;
+static int gs_ready;
+static void gs_init(void);
 static int gs_argc;
 static char **gs_argv;
 static uint8_t **gs_top, **gs_lim;
@@ -323,6 +326,8 @@ class Gen:
         self.rf_throws = {}
         self.rf_ids = {}
         self.deferred_decls = {}
+        self.exports = []                        # `export fn` declarations: C-callable entry points
+        self.lib = False
         self.sinst = {}
         self.enums = {}
         self.helper_defs = []
@@ -802,6 +807,13 @@ class Gen:
 
     # -- top level -------------------------------------------------------------------
     def stdlib_path(self, name):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for d in os.environ.get("GOOSE_LIB", "").split(os.pathsep):    # the person's own versions first
+            if d and os.path.exists(os.path.join(d, name + ".goose")):
+                return os.path.join(d, name + ".goose")
+        f = os.path.join(here, "lib", "goose", "override", name + ".goose")
+        if os.path.exists(f):                             # then Crust's own versions
+            return f
         roots = [os.environ.get("GOOSE_ROOT"),
                  os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib", "goose"),
                  os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "goose")]
@@ -824,6 +836,8 @@ class Gen:
             unsupported("'import %s' (the Goose library source was not found; set GOOSE_ROOT)" % name, line)
         with open(f) as fh:
             decls = parse(fh.read(), f)
+        user_lib = any(os.path.dirname(os.path.abspath(f)) == os.path.abspath(x)
+                       for x in os.environ.get("GOOSE_LIB", "").split(os.pathsep) if x)
         ns = ""
         for d in decls:
             k = d.kind
@@ -840,6 +854,8 @@ class Gen:
                 self.fns.setdefault(d.name, []).append(d)
             elif k == "FnDecl" and "extern" in d.quals and d.body is None and not d.thread:
                 d.lib = True
+                if user_lib:                          # a library of the person's own: C, Rust or C# supplies it
+                    d.user_extern = True
                 self.fns.setdefault(d.name, []).append(d)
             elif k == "Struct" and d.generics:
                 self.gstructs.setdefault(d.name, d)
@@ -868,8 +884,14 @@ class Gen:
             elif k == "FnDecl":
                 if d.thread:
                     unsupported("'thread_fn'", d.line)
-                if "extern" in d.quals or "export" in d.quals:
-                    unsupported("'extern fn'", d.line)
+                if "extern" in d.quals:
+                    if d.body is not None or d.generics:
+                        refuse("an 'extern fn' declares a C function: no body, no type parameters", d.line)
+                    d.user_extern = True
+                elif "export" in d.quals:
+                    if d.generics:
+                        refuse("an 'export fn' cannot take type parameters", d.line)
+                    self.exports.append(d)
                 self.fns.setdefault(d.name, []).append(d)
             elif k == "Decl":
                 for n in d.names:
@@ -896,9 +918,12 @@ class Gen:
             self.global_decl(d)
         self.init_lines = self.init_lines + self.ctx.out
         self.ctx = None
-        if "main" not in self.fns:
-            refuse("no 'main' function", 1)
-        main = self.instantiate(self.fns["main"][0], [], [], self.fns["main"][0].line)
+        main = None
+        if "main" in self.fns:
+            main = self.instantiate(self.fns["main"][0], [], [], self.fns["main"][0].line)
+        elif not self.exports:
+            refuse("no 'main' function (and no 'export fn' to make this a library)", 1)
+        self.emit_exports(main)
         return self.assemble(main)
 
     def scan_long_returns(self, decls):
@@ -1032,6 +1057,91 @@ class Gen:
         if d.inits:
             self.emit("%s = %s;" % (cname, v.code))
 
+    CABLE = ("int", "float", "bool")
+
+    def c_param(self, t, line, what):
+        """How a type crosses the C boundary: (C parameter text, C argument expression builder)."""
+        if t.k in self.CABLE:
+            return [self.ctype(t)], lambda v: [v]
+        if t.k == "ref" and t.elem.k in self.CABLE:
+            return [self.ctype(t.elem) + " *"], lambda v: [v]
+        if t.k == "slice" and t.elem.k in self.CABLE:
+            return [self.ctype(t.elem) + " *", "int64_t"], None
+        refuse("%s has type %s, which has no plain C shape: use scalars, a scalar reference "
+               "or a slice of scalars" % (what, t.key), line)
+
+    def emit_exports(self, main):
+        """`export fn f(..)` becomes the C function `f`; a library's `main` becomes `goose_main`."""
+        wrapped = [(d, d.sym or d.name.replace("::", "_")) for d in self.exports]
+        if self.lib and main is not None:
+            wrapped.append((self.fns["main"][0], "goose_main"))
+        seen = set()
+        for d, sym in wrapped:
+            if sym in seen:
+                refuse("two exports are named '%s'" % sym, d.line)
+            seen.add(sym)
+            ptys = []
+            for p in d.params:
+                if p.type is None:
+                    refuse("parameter '%s' of the exported function '%s' needs a type" % (p.name, d.name), d.line)
+                ptys.append(self.resolve(p.type, {}))
+            inst = self.instantiate(d, ptys, [], d.line)
+            if inst.rets is None:
+                refuse("the exported function '%s' needs a result type" % d.name, d.line)
+            params, args = [], []
+            for i, (p, t) in enumerate(zip(d.params, ptys)):
+                shape, _ = self.c_param(t, d.line, "parameter '%s' of '%s'" % (p.name, d.name))
+                if t.k == "slice":
+                    params += ["%s %s_p" % (shape[0], p.name), "int64_t %s_n" % p.name]
+                    args.append("((%s){%s_p, %s_n})" % (self.ctype(t), p.name, p.name))
+                else:
+                    params.append("%s %s" % (shape[0], p.name))
+                    args.append(p.name)
+            rets = inst.rets
+            for t in rets:
+                if t.k not in self.CABLE:
+                    refuse("the exported function '%s' returns %s, which has no plain C shape" % (d.name, t.key), d.line)
+            for j, t in enumerate(rets[1:], 1):
+                params.append("%s *out%d" % (self.ctype(t), j))
+                args.append("out%d" % j)
+            sig = "%s %s(%s)" % (self.ctype(rets[0]) if rets else "void", sym, ", ".join(params) or "void")
+            self.protos.append(sig + ";")
+            self.bodies.append(sig + " {")
+            self.bodies.append("    gs_init();")
+            call = "%s(%s)" % (inst.cname, ", ".join(args))
+            self.bodies.append("    %s%s;" % ("return " if rets else "", call))
+            self.bodies.append("}")
+
+    def user_extern_call(self, d, vals, ptys, line):
+        """A call of a user `extern fn`: a plain C function of scalars, scalar references and slices."""
+        rets = [self.resolve(r, {}) for r in d.rets] if d.rets else []
+        if len(rets) > 1 or (rets and rets[0].k not in self.CABLE):
+            refuse("the extern function '%s' must return nothing or one scalar" % d.name, line)
+        sym = d.sym or d.name.rpartition("::")[2]
+        protos, args = [], []
+        for v, t, p in zip(vals, ptys, d.params):
+            shape, _ = self.c_param(t, line, "parameter '%s' of '%s'" % (p.name, d.name))
+            cv = self.coerce(v, t, line, "argument")
+            if t.k == "slice":
+                cv = self.spill_unless_pure(cv)
+                protos += shape
+                args += ["(%s).data" % cv.code, "(%s).len" % cv.code]
+            elif t.k == "ref":
+                protos += shape
+                args.append(cv.code)
+            else:
+                protos += shape
+                args.append(cv.code)
+        if sym not in self.extern_done:
+            self.extern_done.add(sym)
+            self.helper_defs.append("%s %s(%s);" % (self.ctype(rets[0]) if rets else "void", sym,
+                                                     ", ".join(protos) or "void"))
+        call = "%s(%s)" % (sym, ", ".join(args))
+        if not rets:
+            self.emit("%s;" % call)
+            return None
+        return Val(self.tmp(self.ctype(rets[0]), call), rets[0], lv=True, pure=True)
+
     def assemble(self, main):
         out = ["/* Generated by tools/goose2c.py from a Goose program. Do not edit. */",
                RUNTIME.strip("\n"), ""]
@@ -1043,10 +1153,13 @@ class Gen:
         out += self.printer_defs
         out += self.bodies
         out.append("static void gs_init(void) {")
+        out.append("    if (gs_ready) return;")
+        out.append("    gs_ready = 1;")
         out.append("    gs_stacks(%d);" % self.nstacks)
         out += self.init_lines
         out.append("}")
-        out.append("int main(int argc, char **argv) { gs_argc = argc; gs_argv = argv; gs_init(); %s(); fflush(stdout); return 0; }" % main.cname)
+        if main is not None and not self.lib:
+            out.append("int main(int argc, char **argv) { gs_argc = argc; gs_argv = argv; gs_init(); %s(); fflush(stdout); return 0; }" % main.cname)
         return "\n".join(out) + "\n"
 
     # -- functions ---------------------------------------------------------------
@@ -1612,6 +1725,56 @@ class Gen:
             self.emit_append(recv, sl, line)
             return None
         unsupported("the method '.%s()'" % m, line)
+
+    def abort_text(self, node, default, line):
+        """`gs_abort(..)` for an optional string-literal message."""
+        msg = default
+        if node is not None:
+            if node.kind != "Str":
+                unsupported("a message that is not a string literal", line)
+            msg = node.value.decode("latin-1")
+        msg = msg.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+        return 'gs_abort("%s", %d);' % (msg, line)
+
+    def array_checks(self, m, base, args, line):
+        """`a.check_length(n, msg?)`, `a.range_index(s, msg?)`, `dst.move_from(src)`."""
+        if m == "move_from":
+            if len(args) != 1:
+                refuse("move_from takes one slice", line)
+            dst, src = self.operands([base, args[0]], [None, None])
+            if dst.ty is None or dst.ty.k not in SEQ or src.ty is None or src.ty.k not in SEQ:
+                refuse("move_from copies one slice into another", line)
+            if dst.ty.elem != src.ty.elem:
+                refuse("expected %s, found %s" % (dst.ty.elem.key, src.ty.elem.key), line)
+            dst, src = self.spill_unless_pure(dst), self.spill_unless_pure(src)
+            dd, dl = self.seq_parts(dst)
+            sd, sl = self.seq_parts(src)
+            self.emit("if (%s != %s) gs_abort(\"move_from: lengths differ\", %d);" % (dl, sl, line))
+            self.emit("if (%s > 0) memmove(%s, %s, (size_t)%s * sizeof(%s));" % (dl, dd, sd, dl, self.ctype(dst.ty.elem)))
+            return None
+        if not 1 <= len(args) <= 2:
+            refuse("%s takes a value and an optional message" % m, line)
+        recv = self.ex(base, None)
+        if recv.ty is None or recv.ty.k not in SEQ:
+            refuse("%s needs an array" % m, line)
+        recv = self.spill_unless_pure(recv)
+        data, length = self.seq_parts(recv)
+        esz = "(int64_t)sizeof(%s)" % self.ctype(recv.ty.elem)
+        if m == "check_length":
+            v = self.spill(self.index_val(self.ex(args[0], I64), line))
+            bad = self.abort_text(args[1] if len(args) == 2 else None, "invalid length", line)
+            self.emit("if (%s < 0 || %s > GS_STACK_BYTES / %s) %s" % (v.code, v.code, esz, bad))
+            return Val(v.code, I64, lv=True, pure=True)
+        s = self.spill_unless_pure(self.coerce(self.ex(args[0], None), slice_ty(recv.ty.elem), line, "slice"))
+        sd, sl = self.seq_parts(s)
+        bad = self.abort_text(args[1] if len(args) == 2 else None, "slice is not from this array", line)
+        r = self.tmp("int64_t", "0")
+        self.emit("if (%s != 0) {" % sl)
+        self.emit("    int64_t off_ = (int64_t)((const uint8_t *)%s - (const uint8_t *)%s);" % (sd, data))
+        self.emit("    if (off_ < 0 || off_ %% %s != 0 || off_ / %s + %s > %s) %s" % (esz, esz, sl, length, bad))
+        self.emit("    %s = off_ / %s;" % (r, esz))
+        self.emit("}")
+        return Val(r, I64, lv=True, pure=True)
 
     def zero_code_elem(self, ty):
         if ty.k in ("int", "float", "bool"):
@@ -2717,7 +2880,7 @@ class Gen:
 
     def e_Index(self, n, want):
         base, idx = self.operands([n.base, n.index], [None, I64])
-        base = self.spill_unless_pure(base)
+        base = self.hold(base)
         t = base.ty
         if t is None or t.k not in SEQ:
             refuse("cannot index %s" % (t.key if t else "a constant"), n.line)
@@ -2727,6 +2890,15 @@ class Gen:
         data, length = self.seq_parts(base)
         return Val("%s[gs_chk(%s, %s, %d)]" % (data, idx.code, length, n.line), t.elem,
                    lv=base.lv or t.k != "arr")
+
+    def hold(self, v):
+        """Evaluate a base once so it can be indexed or sliced.  An array stored in place (a fixed or
+        limited array that is an lvalue, such as `nodes[i].data`) is held by address: a copy would take
+        the writes meant for the original, and a slice of it would point into the copy."""
+        if v.ty is not None and v.ty.k in ("arr", "lim") and v.lv and not v.pure and v.lit is None:
+            ptr = self.tmp("%s *" % self.ctype(v.ty), "&" + v.code)
+            return Val("(*%s)" % ptr, v.ty, lv=True, pure=True, stk=v.stk, pay=v.pay)
+        return self.spill_unless_pure(v)
 
     def spill_unless_pure(self, v):
         if v.ty is not None and not v.pure and v.lit is None:
@@ -2741,7 +2913,7 @@ class Gen:
         return Val("((int64_t)%s)" % idx.code, I64, pure=idx.pure)
 
     def e_Slice(self, n, want):
-        base = self.spill_unless_pure(self.ex(n.base, None))
+        base = self.hold(self.ex(n.base, None))
         t = base.ty
         if t is None or t.k not in SEQ:
             refuse("cannot slice %s" % (t.key if t else "a constant"), n.line)
@@ -2830,10 +3002,15 @@ class Gen:
             fields = self.enum_variants(info)[idx][1]
             parts = self.lit_parts("%s.%s" % (info.name, ty.name), fields, n)
             return Val("%s(%s)" % (self.variant_ctor(info, idx), ", ".join(parts)), info.variant_ty(idx))
-        if ty.kind != "Name" or ty.ns:
+        if ty.kind != "Name":
             unsupported("this literal (only struct and enum-variant literals are in)", n.line)
         tnode = N("Named", ty.line, name=ty, args=getattr(ty, "args", None))
-        known = ty.name in self.structs or ty.name in self.gstructs or ty.name in self.aliases
+        full = "%s::%s" % (ty.ns, ty.name) if ty.ns else ty.name
+        cur = getattr(self, "cur_ns", "")
+        names = {full} | ({"%s::%s" % (cur, full)} if cur and not ty.ns else set())
+        names |= {k for k in list(self.structs) + list(self.gstructs) + list(self.aliases)
+                  if not ty.ns and k.endswith("::" + ty.name)}
+        known = any(k in self.structs or k in self.gstructs or k in self.aliases for k in names)
         if not known:
             unsupported("this literal (only struct and enum-variant literals are in)", n.line)
         st = self.resolve(tnode, self.fn_env)
@@ -2918,6 +3095,8 @@ class Gen:
     def zero_code(self, ty):
         if ty.k in ("int", "float", "bool", "opt", "ref"):
             return "0"
+        if ty.k == "arr":                      # a struct around the C array: shivyc wants the inner braces
+            return "{{0}}"
         return "{0}"
 
     # -- calls --------------------------------------------------------------------------------
@@ -2977,6 +3156,8 @@ class Gen:
                         refuse("'.%s()' needs a growable or limited array, found %s" %
                                (m, recv.ty.key if recv.ty else "a constant"), n.line)
                     return self.seq_method(m, recv, n.args, n.line)
+            if m in ("check_length", "range_index", "move_from") and m not in self.fns:
+                return self.array_checks(m, fn.base, n.args, n.line)
             if m == "index_of" and m not in self.fns:
                 if len(n.args) != 1:
                     refuse("index_of takes one argument", n.line)
@@ -3262,6 +3443,8 @@ class Gen:
 
     def extern_call(self, d, vals, ptys, line):
         """A library function implemented in C: scalars in, a scalar (or nothing) out."""
+        if getattr(d, "user_extern", False):
+            return self.user_extern_call(d, vals, ptys, line)
         rets = [self.resolve(r, {}) for r in d.rets] if d.rets else []
         sym0 = d.sym or d.name.rpartition("::")[2]
         for t in list(ptys) + rets:
@@ -3987,10 +4170,14 @@ class Branch:
         return Val(self.tmp, ty, lv=True, pure=True)
 
 
-def translate(text, path="<goose>"):
+def translate(text, path="<goose>", lib=False):
+    """Goose source in, C out.  With `lib`, no C `main` is written: the program's own `main`, if
+    any, becomes the C function `goose_main`, and the `export fn`s are the way in."""
     decls = parse(text, path)
     try:
-        return Gen(path).module(decls)
+        g = Gen(path)
+        g.lib = lib
+        return g.module(decls)
     except GooseError as e:
         e.path = path
         raise
@@ -3999,17 +4186,25 @@ def translate(text, path="<goose>"):
 def main(argv):
     args = argv[1:]
     out = None
+    lib = False
     if "-o" in args:
         i = args.index("-o")
         out = args[i + 1]
         del args[i:i + 2]
+    if "--lib" in args:                      # no C main: for #include "x.goose" in another language's unit
+        args.remove("--lib")
+        lib = True
+    for opt in ("--basedir", "--incdir", "--owning"):      # the include protocol's options: not used here
+        while opt in args:
+            i = args.index(opt)
+            del args[i:i + 2]
     if len(args) != 1:
         print(__doc__)
         return 2
     path = args[0]
     try:
         with open(path, encoding="utf-8") as f:
-            c = translate(f.read(), path)
+            c = translate(f.read(), path, lib=lib)
     except GooseError as e:
         msg = str(e)
         if out:
