@@ -82,7 +82,7 @@ SAMPLES = {"19_vm": "vm",
            "09_sorting": "sorting", "01_tour": "tour", "03_strings": "strings",
            "21_raytrace": "raytrace", "02_memory": "memory", "22_image_filters": "image_filters",
            "15_word_freq": "word_freq", "17_calc": "calc", "08_bignum": "bignum", "06_functions": "functions",
-           "12_huffman": "huffman", "14_bst": "bst"}
+           "12_huffman": "huffman", "14_bst": "bst", "26_file_tree": "file_tree"}
 STDIN = {"17_calc": "data/calc.stdin"}                  # samples that read standard input
 
 
