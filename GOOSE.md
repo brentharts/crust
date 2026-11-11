@@ -148,6 +148,13 @@ version and Goose's own example output print, including runs past one leaf.
 `examples/goose/interop/cs_demo.{goose,cs,c}`: `Report.Longest` calls the exports
 `collatz_steps` and `count_call`.
 
+### Goose scripts in Prowl2D
+
+Prowl2D (`crustos/Prowl2D`) takes Goose as a script language beside C#, C++, Rust and RPython: `Samples/SlimeJumpGoose` is `SlimeJumpRust` ported script for script. A script is a struct with
+`// script(max_instances = 16)` on the line above it, and its callbacks are functions that take it by reference (`fn fixed_update(s: Slime&)`). Prowl2D's build (`tools/script_native.py`) writes the
+engine's calls as `extern fn`s and the pool of instances as `export fn`s after the script, runs `goose2c --lib`, compiles the C with gcc and links it into the engine library: the interop above is all it needs,
+so goose2c did not change. The tests in Prowl2D run the Goose and the Rust scripts under one driver against a stub engine and compare every engine call they make.
+
 Examples and tests: `examples/goose/interop/`, `tests/test_goose_interop.py`.
 
 ## Phase 0 findings
