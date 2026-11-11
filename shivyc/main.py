@@ -525,12 +525,45 @@ def process_file(file, args):
         return process_py_file(file, args)
     elif file[-3:] == ".rs":
         return process_c_file(file, args)
+    elif file[-6:] == ".goose":
+        return process_goose_file(file, args)
     elif file[-2:] == ".o":
         return file
     else:
         err = f"unknown file type: '{file}'"
         error_collector.add(CompilerError(err))
         return None
+
+
+def process_goose_file(file, args):
+    """Translate a Goose subset program to C with tools/goose2c.py (see GOOSE.md),
+    then compile that C like any other source.  A refusal from the translator
+    becomes an ordinary diagnostic that names the `.goose` line."""
+    if sys.implementation.name == "shivyc":                  # pragma: no cover
+        error_collector.add(CompilerError("Goose sources need the host front end"))
+        return None
+    import os
+    import tempfile
+
+    tools_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import goose2c
+    except Exception as e:                                   # pragma: no cover
+        error_collector.add(CompilerError(f"cannot import goose2c: {e}"))
+        return None
+    try:
+        with open(file, encoding="utf-8") as f:
+            code = goose2c.translate(f.read(), file)
+    except goose2c.GooseError as e:
+        error_collector.add(CompilerError(f"goose: {e}"))
+        return None
+    out_dir = tempfile.mkdtemp(prefix="shivyc_goose_")
+    out_c = os.path.join(out_dir, os.path.basename(file)[:-6] + ".c")
+    with open(out_c, "w", encoding="utf-8") as f:
+        f.write(code)
+    return process_c_file(out_c, args)
 
 
 def process_py_unit(py_files, args):
