@@ -46,6 +46,8 @@ class TestExamples(unittest.TestCase):
     def check(self, build):
         for src in sorted(glob.glob(os.path.join(EX, "*.goose"))):
             name = os.path.basename(src)[:-6]
+            if name.startswith("lib_") and goose_samples() is None:
+                continue                                  # these import Goose's library, which needs a checkout
             with self.subTest(program=name):
                 with open(os.path.join(EX, name + ".out"), encoding="utf-8") as f:
                     want = f.read()
@@ -55,11 +57,7 @@ class TestExamples(unittest.TestCase):
                         f.write(program(src))
                     exe = os.path.join(d, name)
                     build(c, exe)
-                    stdin = None
-                    if name in STDIN:
-                        with open(os.path.join(base, STDIN[name]), encoding="utf-8") as f:
-                            stdin = f.read()
-                    p = _run(exe, stdin)
+                    p = _run(exe)
                     self.assertEqual(p.returncode, 0, p.stderr)
                     self.assertEqual(p.stdout, want)
 
