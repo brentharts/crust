@@ -581,21 +581,33 @@ class Gen:
             return PRIM[node.name]
         if k == "Named":
             q = node.name
+            name = q.name
             if q.ns:
-                unsupported("a namespaced type", node.line)
-            if q.name in env:
-                return env[q.name]
-            if q.name in self.gstructs:
-                return self.struct_inst(q.name, [self.resolve(a, env) for a in (node.args or [])], node.line).ty
+                name = "%s::%s" % (q.ns, q.name)
+            else:
+                if name in env:
+                    return env[name]
+                cur = getattr(self, "cur_ns", "")         # a name inside a library namespace sees its siblings
+                if cur and "%s::%s" % (cur, name) in (self.gstructs.keys() | self.structs.keys() |
+                                                      self.enums.keys() | self.aliases.keys()):
+                    name = "%s::%s" % (cur, name)
+            if not q.ns and not any(name in t for t in (self.gstructs, self.structs, self.enums, self.aliases)):
+                # a library signature is resolved before its namespace is current: a unique `ns::name` will do
+                hits = [k for t in (self.gstructs, self.structs, self.enums, self.aliases)
+                        for k in t if k.endswith("::" + name)]
+                if len(set(hits)) == 1:
+                    name = hits[0]
+            if name in self.gstructs:
+                return self.struct_inst(name, [self.resolve(a, env) for a in (node.args or [])], node.line).ty
             if node.args:
                 unsupported("a generic type", node.line)
-            if q.name in self.aliases:
-                return self.resolve(self.aliases[q.name].type, env)
-            if q.name in self.structs:
-                return self.structs[q.name].ty
-            if q.name in self.enums:
-                return self.enums[q.name].ty
-            refuse("unknown type '%s'" % q.name, node.line)
+            if name in self.aliases:
+                return self.resolve(self.aliases[name].type, env)
+            if name in self.structs:
+                return self.structs[name].ty
+            if name in self.enums:
+                return self.enums[name].ty
+            refuse("unknown type '%s'" % name, node.line)
         if k == "VariantType":
             base = self.resolve(node.type, env)
             if base.k != "enum":
@@ -812,8 +824,16 @@ class Gen:
             unsupported("'import %s' (the Goose library source was not found; set GOOSE_ROOT)" % name, line)
         with open(f) as fh:
             decls = parse(fh.read(), f)
+        ns = ""
         for d in decls:
             k = d.kind
+            if k == "Namespace":                       # everything below belongs to it
+                ns = d.name
+                continue
+            if ns and k in ("FnDecl", "Struct", "Enum", "TypeAlias") and "::" not in d.name:
+                d.name = "%s::%s" % (ns, d.name)
+            elif ns and k == "Decl" and len(d.names) == 1 and "::" not in d.names[0]:
+                d.names = ["%s::%s" % (ns, d.names[0])]
             if k == "FnDecl" and d.body is not None and not d.thread and "extern" not in d.quals \
                     and "export" not in d.quals:
                 d.lib = True
@@ -885,32 +905,35 @@ class Gen:
         """`return E from f` out of a function other than f: find which functions can throw
         to which targets, so that exactly the calls that may need it check a flag."""
         calls, direct, self.rf_ids = {}, {}, {}
+        sh = lambda nm: nm.rpartition("::")[2]               # names are matched without their namespace
 
         def walk(x, acc, fname):
             if isinstance(x, N):
                 if x.kind == "FnDecl" and x.body is not None:        # a nested function is its own node
-                    inner = calls.setdefault(x.name, set())
-                    acc.add(x.name)
-                    walk(x.body, inner, x.name)
+                    inner = calls.setdefault(sh(x.name), set())
+                    acc.add(sh(x.name))
+                    walk(x.body, inner, sh(x.name))
                     return
                 if x.kind == "Return" and x.frm is not None:
-                    t = x.frm.name if hasattr(x.frm, "name") else str(x.frm)
+                    t = sh(x.frm.name if hasattr(x.frm, "name") else str(x.frm))
                     direct.setdefault(fname, set()).add(t)
                     self.rf_ids.setdefault(t, len(self.rf_ids) + 1)
                 if x.kind == "Call":
                     f = x.fn
                     if f.kind in ("Name", "Field"):
-                        acc.add(f.name)
+                        acc.add(sh(f.name))
                 for v in vars(x).values():
                     walk(v, acc, fname)
             elif isinstance(x, (list, tuple)):
                 for v in x:
                     walk(v, acc, fname)
 
-        for d in decls:
+        every = [d for d in decls if d.kind == "FnDecl"]
+        every += [d for ds in self.fns.values() for d in ds if d not in every]     # library functions too
+        for d in every:
             if d.kind == "FnDecl" and d.body is not None:
-                acc = calls.setdefault(d.name, set())
-                walk(d.body, acc, d.name)
+                acc = calls.setdefault(sh(d.name), set())
+                walk(d.body, acc, sh(d.name))
         throws = {f: set(t) for f, t in direct.items()}
         changed = True
         while changed and self.rf_ids:
@@ -919,9 +942,8 @@ class Gen:
                 cur = throws.setdefault(f, set())
                 before = len(cur)
                 for g in callees:
-                    for key in (g, g.rpartition("::")[2]):
-                        if key in throws:
-                            cur |= {t for t in throws[key] if t != f}
+                    if g in throws:
+                        cur |= {t for t in throws[g] if t != f}
                 if len(cur) != before:
                     changed = True
         self.rf_throws = {f: t - {f} for f, t in throws.items() if t - {f}}
@@ -929,14 +951,12 @@ class Gen:
 
     def rf_check(self, callee_name, line):
         """After a call of a function that may throw: land here or pass it on."""
-        thrown = set()
-        for key in (callee_name, callee_name.rpartition("::")[2]):
-            thrown |= self.rf_throws.get(key, set())
+        thrown = self.rf_throws.get(callee_name.rpartition("::")[2], set())
         if not thrown:
             return
         fn = self.ctx.fn
-        me = fn.decl.name if fn.decl else "main"
-        mine = [t for t in thrown if t == me or t == me.rpartition("::")[2]]
+        me = (fn.decl.name if fn.decl else "main").rpartition("::")[2]
+        mine = [t for t in thrown if t == me]
         self.emit("if (gs_rf) {")
         self.ctx.indent += 1
         if mine:
@@ -957,7 +977,7 @@ class Gen:
         self.emit("}")
 
     def may_throw(self, name):
-        return bool(self.rf_throws.get(name) or self.rf_throws.get(name.rpartition("::")[2]))
+        return bool(self.rf_throws.get(name.rpartition("::")[2]))
 
     def emit_junk_return(self, fn):
         rets = fn.rets
@@ -1641,7 +1661,11 @@ class Gen:
             if n.args:
                 a = n.args[0]
                 if a.kind != "Str":
-                    unsupported("'abort' with a message that is not a string literal", n.line)
+                    mv = self.coerce(self.ex(a, slice_ty(U8)), slice_ty(U8), n.line, "message")
+                    mv = self.spill(mv)
+                    self.emit("fflush(stdout); fprintf(stderr, \"goose: %%.*s (line %d)\\n\", (int)%s.len, (const char *)%s.data); exit(1);"
+                              % (n.line, mv.code, mv.code))
+                    return None
                 msg = a.value.decode("latin-1").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
             self.emit("gs_abort(\"%s\", %d);" % (msg, n.line))
             return None
@@ -2563,7 +2587,8 @@ class Gen:
     def long_return(self, n, target):
         """`return E from f` from a function called (somewhere below) from f."""
         fn = self.ctx.fn
-        decls = self.fns.get(target)
+        target = target.rpartition("::")[2]
+        decls = self.fns.get(target) or next((v for k, v in self.fns.items() if k.rpartition("::")[2] == target), None)
         if not decls or decls[0].rets is None or not decls[0].rets:
             refuse("'%s' needs a declared result for 'return ... from %s'" % (target, target), n.line)
         rets = [self.resolve(r, {}) for r in decls[0].rets]
