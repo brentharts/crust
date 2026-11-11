@@ -1,0 +1,1671 @@
+alloc 2 at 0 len 2
+alloc 3 at 0 len 3
+alloc 3 at 0 len 3
+alloc 2 at 3 len 5
+alloc 1 at 3 len 5
+realloc -> 4 at 4
+alloc 3 at 0 len 8
+alloc 3 at 8 len 11
+alloc 2 at 0 len 11
+alloc 3 at 11 len 14
+alloc 4 at 14 len 18
+alloc 3 at 18 len 21
+alloc 4 at 11 len 21
+alloc 4 at 21 len 25
+alloc 1 at 2 len 25
+alloc 2 at 15 len 25
+realloc -> 4 at 18
+alloc 1 at 17 len 25
+recycled, items 25
+alloc 3 at 0 len 25
+alloc 4 at 3 len 25
+alloc 3 at 7 len 25
+alloc 4 at 10 len 25
+alloc 1 at 14 len 25
+alloc 3 at 15 len 25
+realloc -> 5 at 18
+alloc 2 at 0 len 25
+realloc -> 0 at 0
+alloc 3 at 2 len 25
+realloc -> 3 at 2
+alloc 2 at 5 len 25
+alloc 4 at 7 len 25
+realloc -> 0 at 0
+realloc -> 8 at 23
+alloc 1 at 0 len 31
+realloc -> 0 at 0
+realloc -> 3 at 7
+realloc -> 5 at 7
+alloc 3 at 31 len 34
+recycled, items 34
+alloc 3 at 0 len 34
+realloc -> 2 at 0
+alloc 3 at 0 len 34
+alloc 1 at 3 len 34
+alloc 2 at 3 len 34
+realloc -> 5 at 5
+alloc 4 at 0 len 34
+alloc 4 at 0 len 34
+alloc 2 at 4 len 34
+alloc 4 at 6 len 34
+realloc -> 7 at 10
+alloc 1 at 0 len 34
+realloc -> 6 at 10
+realloc -> 4 at 10
+alloc 2 at 0 len 34
+alloc 4 at 2 len 34
+alloc 1 at 6 len 34
+alloc 2 at 7 len 34
+realloc -> 3 at 7
+realloc -> 4 at 2
+alloc 2 at 10 len 34
+alloc 2 at 12 len 34
+alloc 4 at 14 len 34
+alloc 4 at 18 len 34
+alloc 3 at 22 len 34
+realloc -> 4 at 25
+realloc -> 7 at 29
+realloc -> 4 at 6
+realloc -> 5 at 12
+alloc 2 at 0 len 36
+realloc -> 4 at 12
+alloc 3 at 16 len 36
+alloc 2 at 12 len 36
+alloc 2 at 14 len 36
+alloc 3 at 19 len 36
+realloc -> 1 at 16
+alloc 3 at 22 len 36
+realloc -> 0 at 0
+alloc 2 at 17 len 36
+realloc -> 4 at 22
+realloc -> 4 at 36
+realloc -> 6 at 40
+realloc -> 8 at 46
+alloc 3 at 2 len 54
+realloc -> 4 at 0
+realloc -> 7 at 4
+realloc -> 4 at 17
+alloc 2 at 4 len 54
+realloc -> 8 at 6
+alloc 3 at 0 len 54
+alloc 2 at 14 len 54
+alloc 4 at 16 len 54
+alloc 3 at 20 len 54
+alloc 1 at 3 len 54
+realloc -> 0 at 0
+alloc 3 at 3 len 54
+alloc 1 at 20 len 54
+realloc -> 3 at 16
+realloc -> 0 at 0
+alloc 3 at 16 len 54
+realloc -> 4 at 16
+alloc 1 at 14 len 54
+alloc 2 at 20 len 54
+alloc 4 at 6 len 54
+alloc 2 at 10 len 54
+realloc -> 4 at 15
+realloc -> 8 at 19
+alloc 3 at 6 len 54
+alloc 4 at 27 len 54
+realloc -> 6 at 19
+alloc 1 at 9 len 54
+realloc -> 6 at 31
+alloc 1 at 6 len 54
+realloc -> 7 at 31
+realloc -> 0 at 0
+alloc 3 at 7 len 54
+alloc 1 at 10 len 54
+realloc -> 8 at 11
+realloc -> 2 at 10
+alloc 4 at 12 len 54
+realloc -> 7 at 31
+alloc 3 at 16 len 54
+alloc 4 at 38 len 54
+realloc -> 7 at 19
+alloc 4 at 42 len 54
+alloc 2 at 7 len 54
+realloc -> 4 at 26
+alloc 1 at 9 len 54
+alloc 4 at 16 len 54
+realloc -> 8 at 16
+realloc -> 8 at 46
+realloc -> 5 at 0
+realloc -> 7 at 9
+alloc 3 at 16 len 54
+alloc 4 at 19 len 54
+realloc -> 7 at 23
+alloc 1 at 5 len 54
+realloc -> 7 at 54
+realloc -> 8 at 46
+alloc 2 at 6 len 61
+alloc 4 at 19 len 61
+realloc -> 0 at 0
+realloc -> 0 at 0
+alloc 2 at 0 len 61
+alloc 1 at 2 len 61
+realloc -> 6 at 38
+alloc 3 at 3 len 61
+realloc -> 0 at 0
+alloc 3 at 16 len 61
+alloc 1 at 8 len 61
+alloc 2 at 19 len 61
+realloc -> 0 at 0
+realloc -> 4 at 30
+realloc -> 8 at 30
+realloc -> 5 at 16
+alloc 4 at 38 len 61
+alloc 1 at 0 len 61
+alloc 2 at 21 len 61
+alloc 3 at 30 len 61
+alloc 2 at 33 len 61
+alloc 4 at 35 len 61
+alloc 1 at 1 len 61
+alloc 1 at 21 len 61
+realloc -> 2 at 30
+realloc -> 3 at 3
+realloc -> 7 at 39
+alloc 1 at 8 len 61
+realloc -> 7 at 46
+alloc 3 at 53 len 61
+realloc -> 6 at 56
+alloc 3 at 16 len 62
+alloc 2 at 19 len 62
+realloc -> 0 at 0
+realloc -> 3 at 56
+alloc 4 at 35 len 62
+realloc -> 0 at 0
+alloc 2 at 39 len 62
+alloc 4 at 41 len 62
+realloc -> 6 at 23
+alloc 2 at 45 len 62
+realloc -> 2 at 45
+alloc 2 at 32 len 62
+realloc -> 8 at 59
+alloc 3 at 9 len 67
+alloc 3 at 12 len 67
+realloc -> 4 at 47
+alloc 2 at 0 len 67
+realloc -> 8 at 67
+alloc 3 at 29 len 75
+realloc -> 3 at 9
+recycled, items 75
+alloc 3 at 0 len 75
+alloc 4 at 3 len 75
+realloc -> 8 at 7
+realloc -> 8 at 3
+alloc 2 at 0 len 75
+alloc 3 at 2 len 75
+alloc 4 at 5 len 75
+alloc 1 at 0 len 75
+realloc -> 8 at 5
+alloc 1 at 1 len 75
+realloc -> 3 at 5
+realloc -> 1 at 5
+alloc 1 at 0 len 75
+alloc 3 at 1 len 75
+realloc -> 8 at 0
+alloc 1 at 8 len 75
+alloc 3 at 0 len 75
+realloc -> 3 at 0
+alloc 1 at 0 len 75
+realloc -> 0 at 0
+realloc -> 4 at 0
+alloc 2 at 4 len 75
+alloc 2 at 6 len 75
+alloc 1 at 8 len 75
+realloc -> 6 at 0
+alloc 4 at 9 len 75
+realloc -> 3 at 8
+alloc 3 at 6 len 75
+alloc 3 at 0 len 75
+alloc 1 at 3 len 75
+realloc -> 8 at 4
+realloc -> 6 at 4
+realloc -> 5 at 10
+alloc 2 at 0 len 75
+alloc 2 at 2 len 75
+alloc 2 at 0 len 75
+realloc -> 6 at 10
+alloc 3 at 0 len 75
+alloc 1 at 3 len 75
+alloc 1 at 16 len 75
+realloc -> 0 at 0
+recycled, items 75
+alloc 1 at 0 len 75
+realloc -> 5 at 0
+alloc 2 at 5 len 75
+alloc 3 at 5 len 75
+alloc 3 at 8 len 75
+realloc -> 1 at 5
+alloc 2 at 5 len 75
+alloc 1 at 5 len 75
+alloc 1 at 6 len 75
+alloc 1 at 0 len 75
+alloc 4 at 1 len 75
+alloc 2 at 0 len 75
+alloc 1 at 2 len 75
+alloc 3 at 3 len 75
+realloc -> 4 at 6
+alloc 2 at 0 len 75
+realloc -> 3 at 6
+alloc 1 at 2 len 75
+alloc 3 at 9 len 75
+alloc 2 at 12 len 75
+alloc 4 at 14 len 75
+realloc -> 3 at 3
+realloc -> 5 at 14
+realloc -> 6 at 19
+alloc 4 at 25 len 75
+alloc 1 at 6 len 75
+alloc 1 at 7 len 75
+realloc -> 6 at 29
+alloc 4 at 35 len 75
+realloc -> 7 at 39
+realloc -> 1 at 39
+realloc -> 3 at 19
+realloc -> 0 at 0
+alloc 4 at 8 len 75
+alloc 4 at 22 len 75
+alloc 2 at 12 len 75
+realloc -> 0 at 0
+alloc 1 at 26 len 75
+realloc -> 7 at 35
+realloc -> 6 at 42
+alloc 3 at 7 len 75
+realloc -> 7 at 35
+alloc 4 at 48 len 75
+alloc 2 at 10 len 75
+alloc 2 at 26 len 75
+realloc -> 3 at 52
+alloc 2 at 55 len 75
+realloc -> 3 at 55
+alloc 2 at 58 len 75
+realloc -> 5 at 55
+alloc 1 at 2 len 75
+realloc -> 7 at 28
+realloc -> 7 at 48
+recycled, items 75
+alloc 3 at 0 len 75
+realloc -> 2 at 0
+alloc 1 at 0 len 75
+alloc 4 at 0 len 75
+realloc -> 1 at 0
+alloc 3 at 0 len 75
+realloc -> 6 at 0
+alloc 4 at 6 len 75
+alloc 3 at 10 len 75
+realloc -> 2 at 6
+alloc 1 at 6 len 75
+realloc -> 2 at 6
+alloc 1 at 8 len 75
+alloc 4 at 9 len 75
+alloc 3 at 9 len 75
+realloc -> 0 at 0
+realloc -> 7 at 9
+realloc -> 6 at 9
+recycled, items 75
+alloc 2 at 0 len 75
+alloc 3 at 2 len 75
+alloc 4 at 5 len 75
+alloc 1 at 9 len 75
+realloc -> 1 at 2
+realloc -> 8 at 10
+alloc 2 at 2 len 75
+alloc 1 at 4 len 75
+alloc 3 at 18 len 75
+alloc 2 at 21 len 75
+realloc -> 4 at 23
+alloc 1 at 2 len 75
+realloc -> 0 at 0
+alloc 2 at 3 len 75
+realloc -> 8 at 27
+alloc 1 at 2 len 75
+alloc 1 at 0 len 75
+alloc 3 at 18 len 75
+alloc 4 at 35 len 75
+realloc -> 2 at 3
+alloc 3 at 35 len 75
+alloc 3 at 38 len 75
+realloc -> 0 at 0
+alloc 4 at 9 len 75
+realloc -> 4 at 27
+alloc 1 at 1 len 75
+realloc -> 1 at 38
+alloc 4 at 9 len 75
+alloc 2 at 13 len 75
+alloc 1 at 0 len 75
+realloc -> 1 at 2
+realloc -> 1 at 13
+realloc -> 1 at 5
+alloc 1 at 1 len 75
+alloc 2 at 5 len 75
+alloc 2 at 7 len 75
+alloc 1 at 2 len 75
+alloc 1 at 2 len 75
+alloc 3 at 7 len 75
+realloc -> 5 at 7
+alloc 1 at 2 len 75
+alloc 4 at 12 len 75
+alloc 2 at 3 len 75
+alloc 3 at 16 len 75
+realloc -> 7 at 19
+realloc -> 0 at 0
+alloc 4 at 12 len 75
+alloc 2 at 1 len 75
+realloc -> 8 at 26
+realloc -> 3 at 26
+alloc 4 at 7 len 75
+alloc 1 at 3 len 75
+realloc -> 3 at 11
+realloc -> 6 at 26
+alloc 4 at 14 len 75
+realloc -> 4 at 32
+alloc 2 at 3 len 75
+alloc 3 at 14 len 75
+realloc -> 2 at 26
+realloc -> 8 at 36
+alloc 2 at 0 len 75
+alloc 2 at 5 len 75
+realloc -> 5 at 28
+alloc 1 at 2 len 75
+realloc -> 8 at 36
+alloc 3 at 3 len 75
+realloc -> 0 at 0
+realloc -> 5 at 36
+alloc 2 at 3 len 75
+realloc -> 3 at 19
+alloc 4 at 3 len 75
+alloc 2 at 7 len 75
+alloc 3 at 9 len 75
+alloc 2 at 12 len 75
+alloc 3 at 9 len 75
+realloc -> 3 at 14
+realloc -> 4 at 22
+realloc -> 8 at 28
+realloc -> 1 at 9
+alloc 2 at 7 len 75
+alloc 4 at 10 len 75
+alloc 1 at 2 len 75
+recycled, items 75
+alloc 1 at 0 len 75
+realloc -> 8 at 0
+alloc 2 at 8 len 75
+alloc 1 at 10 len 75
+realloc -> 5 at 0
+realloc -> 2 at 8
+realloc -> 7 at 10
+alloc 3 at 5 len 75
+realloc -> 7 at 17
+alloc 2 at 8 len 75
+realloc -> 8 at 17
+alloc 2 at 25 len 75
+realloc -> 1 at 8
+alloc 4 at 27 len 75
+realloc -> 0 at 0
+alloc 2 at 5 len 75
+alloc 2 at 5 len 75
+alloc 2 at 31 len 75
+alloc 2 at 33 len 75
+realloc -> 3 at 35
+realloc -> 8 at 35
+alloc 4 at 9 len 75
+alloc 2 at 13 len 75
+realloc -> 8 at 43
+alloc 3 at 5 len 75
+realloc -> 6 at 51
+alloc 3 at 9 len 75
+alloc 1 at 12 len 75
+alloc 1 at 15 len 75
+realloc -> 5 at 0
+alloc 3 at 57 len 75
+alloc 1 at 16 len 75
+realloc -> 7 at 17
+alloc 3 at 60 len 75
+realloc -> 5 at 24
+realloc -> 1 at 43
+realloc -> 1 at 8
+alloc 3 at 5 len 75
+alloc 3 at 44 len 75
+alloc 3 at 47 len 75
+realloc -> 4 at 17
+alloc 4 at 63 len 75
+realloc -> 8 at 67
+alloc 3 at 21 len 75
+realloc -> 6 at 24
+realloc -> 4 at 17
+alloc 2 at 12 len 75
+alloc 3 at 33 len 75
+alloc 2 at 36 len 75
+realloc -> 5 at 38
+alloc 4 at 50 len 75
+alloc 4 at 16 len 75
+alloc 2 at 12 len 75
+alloc 3 at 30 len 75
+realloc -> 6 at 54
+realloc -> 5 at 0
+alloc 2 at 5 len 75
+realloc -> 6 at 8
+recycled, items 75
+alloc 1 at 0 len 75
+alloc 1 at 0 len 75
+alloc 1 at 1 len 75
+realloc -> 1 at 0
+realloc -> 0 at 0
+alloc 1 at 0 len 75
+realloc -> 4 at 0
+alloc 1 at 4 len 75
+realloc -> 2 at 0
+alloc 2 at 2 len 75
+alloc 1 at 5 len 75
+alloc 2 at 6 len 75
+alloc 3 at 8 len 75
+alloc 2 at 6 len 75
+realloc -> 3 at 11
+alloc 2 at 0 len 75
+alloc 3 at 11 len 75
+realloc -> 8 at 14
+alloc 2 at 4 len 75
+realloc -> 3 at 6
+realloc -> 4 at 11
+alloc 4 at 0 len 75
+realloc -> 5 at 9
+alloc 4 at 14 len 75
+alloc 1 at 18 len 75
+alloc 3 at 19 len 75
+realloc -> 3 at 9
+alloc 1 at 12 len 75
+alloc 4 at 6 len 75
+realloc -> 1 at 6
+realloc -> 5 at 14
+alloc 3 at 0 len 75
+alloc 2 at 3 len 75
+realloc -> 4 at 6
+alloc 2 at 10 len 75
+realloc -> 1 at 6
+realloc -> 1 at 6
+alloc 1 at 0 len 75
+alloc 1 at 1 len 75
+alloc 3 at 7 len 75
+alloc 4 at 19 len 75
+alloc 3 at 2 len 75
+realloc -> 0 at 0
+realloc -> 2 at 2
+alloc 4 at 23 len 75
+realloc -> 2 at 10
+alloc 2 at 4 len 75
+realloc -> 5 at 27
+realloc -> 2 at 2
+realloc -> 3 at 27
+alloc 4 at 12 len 75
+recycled, items 75
+alloc 4 at 0 len 75
+alloc 3 at 4 len 75
+alloc 3 at 7 len 75
+realloc -> 2 at 0
+realloc -> 0 at 0
+alloc 4 at 0 len 75
+realloc -> 6 at 0
+realloc -> 8 at 0
+realloc -> 5 at 0
+alloc 3 at 5 len 75
+realloc -> 0 at 0
+alloc 1 at 5 len 75
+alloc 4 at 6 len 75
+realloc -> 6 at 6
+alloc 2 at 0 len 75
+realloc -> 6 at 5
+alloc 1 at 0 len 75
+alloc 3 at 1 len 75
+alloc 1 at 0 len 75
+realloc -> 0 at 0
+alloc 3 at 0 len 75
+alloc 3 at 0 len 75
+alloc 2 at 3 len 75
+alloc 2 at 0 len 75
+realloc -> 7 at 5
+realloc -> 7 at 12
+realloc -> 1 at 5
+realloc -> 8 at 12
+realloc -> 6 at 5
+alloc 2 at 0 len 75
+alloc 4 at 0 len 75
+realloc -> 1 at 0
+alloc 1 at 0 len 75
+alloc 1 at 1 len 75
+realloc -> 7 at 1
+realloc -> 4 at 1
+alloc 2 at 0 len 75
+alloc 1 at 2 len 75
+realloc -> 6 at 3
+realloc -> 2 at 3
+realloc -> 6 at 3
+recycled, items 75
+alloc 4 at 0 len 75
+alloc 3 at 0 len 75
+alloc 4 at 3 len 75
+alloc 4 at 7 len 75
+alloc 1 at 11 len 75
+alloc 3 at 12 len 75
+realloc -> 8 at 15
+alloc 2 at 3 len 75
+alloc 4 at 15 len 75
+realloc -> 5 at 19
+alloc 2 at 0 len 75
+realloc -> 3 at 5
+realloc -> 4 at 8
+alloc 2 at 0 len 75
+realloc -> 2 at 19
+realloc -> 3 at 19
+alloc 2 at 2 len 75
+realloc -> 8 at 19
+realloc -> 7 at 27
+realloc -> 8 at 34
+alloc 1 at 2 len 75
+alloc 1 at 3 len 75
+realloc -> 5 at 3
+realloc -> 1 at 34
+realloc -> 8 at 34
+realloc -> 8 at 8
+realloc -> 2 at 3
+realloc -> 8 at 16
+realloc -> 4 at 16
+alloc 1 at 2 len 75
+alloc 3 at 3 len 75
+realloc -> 6 at 27
+alloc 3 at 6 len 75
+alloc 1 at 0 len 75
+realloc -> 1 at 6
+realloc -> 1 at 27
+alloc 4 at 7 len 75
+alloc 1 at 1 len 75
+realloc -> 7 at 34
+realloc -> 5 at 2
+alloc 1 at 11 len 75
+realloc -> 8 at 16
+realloc -> 5 at 16
+realloc -> 6 at 11
+alloc 1 at 0 len 75
+realloc -> 7 at 17
+alloc 3 at 2 len 75
+alloc 1 at 0 len 75
+alloc 2 at 5 len 75
+alloc 4 at 11 len 75
+realloc -> 6 at 17
+realloc -> 4 at 7
+alloc 2 at 11 len 75
+alloc 2 at 5 len 75
+realloc -> 7 at 13
+alloc 4 at 7 len 75
+recycled, items 75
+alloc 4 at 0 len 75
+alloc 1 at 4 len 75
+alloc 1 at 5 len 75
+realloc -> 2 at 5
+alloc 3 at 0 len 75
+alloc 3 at 3 len 75
+realloc -> 7 at 0
+realloc -> 6 at 0
+realloc -> 1 at 0
+alloc 1 at 1 len 75
+alloc 2 at 1 len 75
+realloc -> 5 at 3
+realloc -> 7 at 8
+realloc -> 6 at 0
+alloc 4 at 15 len 75
+alloc 2 at 6 len 75
+alloc 4 at 0 len 75
+alloc 3 at 19 len 75
+alloc 2 at 4 len 75
+alloc 3 at 22 len 75
+alloc 4 at 25 len 75
+alloc 2 at 6 len 75
+alloc 4 at 0 len 75
+alloc 2 at 4 len 75
+alloc 2 at 6 len 75
+realloc -> 6 at 25
+alloc 4 at 0 len 75
+realloc -> 3 at 6
+alloc 4 at 4 len 75
+alloc 3 at 8 len 75
+realloc -> 5 at 8
+realloc -> 2 at 8
+realloc -> 1 at 4
+realloc -> 7 at 4
+alloc 4 at 0 len 75
+alloc 4 at 0 len 75
+alloc 1 at 4 len 75
+alloc 4 at 4 len 75
+alloc 1 at 8 len 75
+realloc -> 3 at 0
+realloc -> 4 at 0
+alloc 1 at 0 len 75
+realloc -> 0 at 0
+alloc 1 at 0 len 75
+alloc 1 at 1 len 75
+realloc -> 2 at 2
+recycled, items 75
+alloc 3 at 0 len 75
+alloc 2 at 3 len 75
+realloc -> 5 at 5
+alloc 4 at 0 len 75
+alloc 2 at 0 len 75
+alloc 1 at 2 len 75
+realloc -> 1 at 2
+alloc 2 at 3 len 75
+alloc 2 at 0 len 75
+alloc 1 at 5 len 75
+alloc 4 at 6 len 75
+alloc 3 at 10 len 75
+realloc -> 8 at 13
+recycled, items 75
+alloc 1 at 0 len 75
+alloc 4 at 0 len 75
+realloc -> 5 at 0
+realloc -> 1 at 0
+alloc 1 at 0 len 75
+realloc -> 5 at 0
+realloc -> 2 at 0
+realloc -> 0 at 0
+alloc 2 at 0 len 75
+alloc 4 at 0 len 75
+realloc -> 2 at 0
+alloc 1 at 2 len 75
+alloc 1 at 3 len 75
+alloc 4 at 4 len 75
+alloc 1 at 3 len 75
+alloc 3 at 8 len 75
+alloc 2 at 11 len 75
+alloc 3 at 13 len 75
+realloc -> 1 at 11
+realloc -> 6 at 16
+realloc -> 1 at 13
+realloc -> 2 at 4
+alloc 4 at 6 len 75
+alloc 2 at 0 len 75
+realloc -> 6 at 14
+alloc 3 at 6 len 75
+realloc -> 3 at 6
+alloc 3 at 9 len 75
+realloc -> 8 at 20
+alloc 2 at 12 len 75
+alloc 3 at 14 len 75
+realloc -> 5 at 28
+alloc 4 at 33 len 75
+alloc 2 at 0 len 75
+alloc 4 at 33 len 75
+realloc -> 2 at 6
+alloc 3 at 17 len 75
+realloc -> 4 at 2
+realloc -> 3 at 8
+alloc 1 at 0 len 75
+alloc 1 at 1 len 75
+alloc 4 at 20 len 75
+realloc -> 0 at 0
+alloc 3 at 8 len 75
+alloc 4 at 24 len 75
+alloc 2 at 11 len 75
+realloc -> 0 at 0
+realloc -> 7 at 2
+realloc -> 2 at 2
+realloc -> 2 at 0
+alloc 1 at 4 len 75
+realloc -> 0 at 0
+realloc -> 5 at 4
+alloc 2 at 0 len 75
+realloc -> 0 at 0
+alloc 2 at 2 len 75
+realloc -> 7 at 4
+alloc 4 at 11 len 75
+alloc 3 at 15 len 75
+alloc 2 at 18 len 75
+realloc -> 8 at 20
+alloc 4 at 28 len 75
+realloc -> 8 at 32
+alloc 3 at 15 len 75
+realloc -> 4 at 11
+alloc 2 at 0 len 75
+alloc 4 at 11 len 75
+realloc -> 5 at 28
+alloc 2 at 0 len 75
+alloc 1 at 33 len 75
+alloc 1 at 4 len 75
+alloc 4 at 5 len 75
+alloc 2 at 9 len 75
+realloc -> 1 at 5
+alloc 3 at 6 len 75
+alloc 1 at 15 len 75
+realloc -> 7 at 20
+realloc -> 1 at 2
+realloc -> 2 at 11
+alloc 3 at 33 len 75
+alloc 1 at 3 len 75
+realloc -> 5 at 36
+alloc 3 at 41 len 75
+realloc -> 6 at 44
+alloc 1 at 0 len 75
+realloc -> 6 at 20
+realloc -> 6 at 50
+alloc 3 at 33 len 75
+alloc 1 at 1 len 75
+realloc -> 1 at 36
+alloc 2 at 6 len 75
+alloc 2 at 13 len 75
+alloc 4 at 16 len 75
+realloc -> 8 at 56
+realloc -> 0 at 0
+alloc 4 at 37 len 75
+realloc -> 6 at 64
+alloc 4 at 33 len 75
+alloc 4 at 70 len 75
+alloc 2 at 6 len 75
+realloc -> 1 at 9
+realloc -> 1 at 28
+realloc -> 1 at 6
+alloc 4 at 29 len 75
+realloc -> 6 at 56
+alloc 2 at 7 len 75
+realloc -> 5 at 74
+alloc 1 at 0 len 79
+realloc -> 7 at 44
+realloc -> 1 at 44
+realloc -> 2 at 20
+realloc -> 3 at 13
+alloc 1 at 1 len 79
+realloc -> 3 at 22
+realloc -> 8 at 29
+realloc -> 2 at 56
+alloc 3 at 25 len 79
+alloc 2 at 4 len 79
+alloc 3 at 41 len 79
+alloc 3 at 0 len 79
+alloc 4 at 45 len 79
+alloc 2 at 20 len 79
+realloc -> 5 at 49
+realloc -> 2 at 11
+realloc -> 2 at 4
+realloc -> 6 at 49
+realloc -> 2 at 13
+alloc 3 at 58 len 79
+realloc -> 3 at 0
+alloc 4 at 70 len 79
+realloc -> 3 at 61
+realloc -> 5 at 79
+realloc -> 3 at 9
+realloc -> 1 at 58
+alloc 1 at 3 len 84
+realloc -> 2 at 64
+alloc 4 at 66 len 84
+alloc 1 at 6 len 84
+alloc 4 at 74 len 84
+realloc -> 1 at 58
+realloc -> 7 at 84
+alloc 4 at 59 len 91
+alloc 2 at 20 len 91
+alloc 2 at 55 len 91
+alloc 3 at 59 len 91
+realloc -> 2 at 20
+alloc 1 at 3 len 91
+realloc -> 7 at 29
+realloc -> 5 at 55
+alloc 1 at 6 len 91
+realloc -> 0 at 0
+alloc 1 at 7 len 91
+alloc 4 at 60 len 91
+alloc 1 at 6 len 91
+realloc -> 2 at 55
+realloc -> 4 at 49
+alloc 2 at 20 len 91
+realloc -> 6 at 74
+realloc -> 7 at 74
+alloc 1 at 3 len 91
+alloc 4 at 44 len 91
+recycled, items 91
+alloc 4 at 0 len 91
+alloc 4 at 4 len 91
+realloc -> 1 at 4
+alloc 1 at 5 len 91
+realloc -> 2 at 0
+realloc -> 4 at 5
+realloc -> 3 at 0
+alloc 3 at 0 len 91
+alloc 2 at 3 len 91
+alloc 3 at 9 len 91
+realloc -> 1 at 0
+alloc 2 at 1 len 91
+alloc 1 at 0 len 91
+alloc 3 at 5 len 91
+alloc 3 at 8 len 91
+alloc 3 at 11 len 91
+realloc -> 6 at 14
+alloc 4 at 20 len 91
+realloc -> 6 at 14
+realloc -> 2 at 8
+alloc 4 at 1 len 91
+alloc 2 at 5 len 91
+alloc 1 at 7 len 91
+alloc 3 at 1 len 91
+alloc 2 at 7 len 91
+alloc 3 at 14 len 91
+alloc 3 at 17 len 91
+alloc 4 at 20 len 91
+alloc 3 at 24 len 91
+alloc 2 at 9 len 91
+realloc -> 8 at 24
+alloc 1 at 0 len 91
+alloc 1 at 4 len 91
+alloc 2 at 32 len 91
+realloc -> 5 at 24
+alloc 2 at 14 len 91
+alloc 2 at 29 len 91
+realloc -> 2 at 11
+alloc 4 at 13 len 91
+alloc 3 at 20 len 91
+alloc 4 at 34 len 91
+alloc 2 at 38 len 91
+alloc 3 at 40 len 91
+realloc -> 0 at 0
+alloc 2 at 4 len 91
+realloc -> 1 at 0
+alloc 1 at 6 len 91
+alloc 2 at 43 len 91
+alloc 2 at 45 len 91
+alloc 4 at 47 len 91
+alloc 4 at 51 len 91
+alloc 4 at 55 len 91
+alloc 4 at 59 len 91
+realloc -> 8 at 63
+realloc -> 2 at 13
+alloc 4 at 47 len 91
+realloc -> 8 at 71
+alloc 2 at 4 len 91
+realloc -> 5 at 79
+alloc 4 at 23 len 91
+alloc 2 at 15 len 91
+realloc -> 6 at 84
+alloc 4 at 34 len 91
+realloc -> 5 at 79
+realloc -> 2 at 13
+realloc -> 7 at 71
+alloc 3 at 40 len 91
+realloc -> 8 at 90
+alloc 2 at 9 len 98
+alloc 3 at 98 len 101
+realloc -> 3 at 84
+alloc 1 at 0 len 101
+realloc -> 0 at 0
+alloc 3 at 87 len 101
+alloc 2 at 15 len 101
+alloc 4 at 98 len 102
+alloc 1 at 6 len 102
+realloc -> 2 at 4
+realloc -> 3 at 55
+alloc 3 at 20 len 102
+alloc 4 at 43 len 102
+alloc 4 at 102 len 106
+alloc 2 at 27 len 106
+alloc 2 at 15 len 106
+alloc 3 at 106 len 109
+alloc 4 at 109 len 113
+alloc 3 at 113 len 116
+realloc -> 6 at 71
+realloc -> 0 at 0
+realloc -> 5 at 113
+alloc 4 at 9 len 118
+alloc 3 at 31 len 118
+realloc -> 2 at 59
+alloc 1 at 38 len 118
+realloc -> 8 at 71
+realloc -> 2 at 43
+realloc -> 8 at 71
+alloc 3 at 84 len 118
+realloc -> 5 at 118
+recycled, items 123
+alloc 4 at 0 len 123
+realloc -> 6 at 0
+alloc 2 at 0 len 123
+realloc -> 6 at 0
+alloc 2 at 6 len 123
+alloc 3 at 8 len 123
+alloc 4 at 11 len 123
+realloc -> 1 at 0
+alloc 3 at 1 len 123
+realloc -> 4 at 4
+alloc 1 at 15 len 123
+alloc 2 at 16 len 123
+alloc 4 at 11 len 123
+alloc 2 at 8 len 123
+realloc -> 1 at 16
+alloc 1 at 0 len 123
+realloc -> 1 at 16
+realloc -> 1 at 0
+alloc 2 at 17 len 123
+realloc -> 6 at 19
+alloc 2 at 1 len 123
+realloc -> 8 at 25
+alloc 4 at 1 len 123
+alloc 4 at 25 len 123
+realloc -> 5 at 19
+alloc 4 at 29 len 123
+realloc -> 1 at 1
+realloc -> 4 at 1
+realloc -> 8 at 19
+realloc -> 8 at 19
+realloc -> 6 at 1
+realloc -> 5 at 10
+realloc -> 8 at 1
+alloc 1 at 0 len 123
+realloc -> 3 at 0
+alloc 2 at 3 len 123
+alloc 4 at 5 len 123
+alloc 3 at 27 len 123
+realloc -> 2 at 10
+realloc -> 1 at 27
+realloc -> 7 at 10
+alloc 4 at 28 len 123
+alloc 2 at 17 len 123
+realloc -> 5 at 32
+realloc -> 4 at 32
+realloc -> 5 at 10
+alloc 4 at 15 len 123
+alloc 1 at 9 len 123
+alloc 4 at 19 len 123
+realloc -> 3 at 5
+alloc 4 at 23 len 123
+realloc -> 3 at 19
+alloc 3 at 32 len 123
+alloc 3 at 35 len 123
+realloc -> 0 at 0
+alloc 1 at 3 len 123
+realloc -> 2 at 35
+realloc -> 2 at 0
+alloc 4 at 2 len 123
+alloc 4 at 6 len 123
+alloc 3 at 10 len 123
+alloc 3 at 13 len 123
+realloc -> 7 at 16
+realloc -> 6 at 16
+realloc -> 0 at 0
+realloc -> 5 at 0
+realloc -> 4 at 5
+realloc -> 1 at 0
+alloc 1 at 1 len 123
+realloc -> 6 at 16
+realloc -> 2 at 1
+alloc 1 at 3 len 123
+alloc 4 at 9 len 123
+alloc 3 at 13 len 123
+alloc 2 at 16 len 123
+realloc -> 8 at 16
+realloc -> 7 at 24
+realloc -> 3 at 5
+alloc 2 at 16 len 123
+realloc -> 1 at 9
+alloc 1 at 0 len 123
+alloc 2 at 8 len 123
+alloc 4 at 18 len 123
+alloc 3 at 4 len 123
+alloc 2 at 1 len 123
+alloc 3 at 10 len 123
+alloc 2 at 13 len 123
+realloc -> 2 at 1
+realloc -> 4 at 18
+alloc 4 at 22 len 123
+alloc 3 at 26 len 123
+realloc -> 3 at 26
+alloc 1 at 0 len 123
+realloc -> 6 at 29
+realloc -> 3 at 29
+alloc 3 at 4 len 123
+alloc 2 at 1 len 123
+alloc 2 at 13 len 123
+alloc 4 at 15 len 123
+alloc 4 at 32 len 123
+realloc -> 4 at 36
+realloc -> 8 at 13
+realloc -> 2 at 10
+alloc 2 at 7 len 123
+realloc -> 5 at 36
+realloc -> 2 at 13
+realloc -> 8 at 15
+alloc 4 at 0 len 123
+realloc -> 3 at 36
+realloc -> 2 at 13
+alloc 4 at 15 len 123
+alloc 3 at 19 len 123
+realloc -> 1 at 19
+alloc 2 at 20 len 123
+alloc 2 at 7 len 123
+realloc -> 3 at 36
+alloc 1 at 9 len 123
+alloc 1 at 12 len 123
+alloc 1 at 13 len 123
+alloc 4 at 22 len 123
+alloc 2 at 26 len 123
+realloc -> 2 at 36
+alloc 2 at 28 len 123
+alloc 1 at 14 len 123
+realloc -> 8 at 38
+alloc 4 at 46 len 123
+realloc -> 8 at 50
+alloc 1 at 4 len 123
+alloc 2 at 5 len 123
+realloc -> 4 at 58
+alloc 3 at 62 len 123
+alloc 3 at 65 len 123
+alloc 2 at 7 len 123
+realloc -> 3 at 68
+alloc 4 at 71 len 123
+alloc 2 at 7 len 123
+alloc 3 at 20 len 123
+realloc -> 1 at 36
+realloc -> 5 at 13
+alloc 1 at 7 len 123
+realloc -> 0 at 0
+alloc 3 at 0 len 123
+realloc -> 6 at 23
+alloc 3 at 29 len 123
+recycled, items 123
+alloc 3 at 0 len 123
+alloc 4 at 3 len 123
+realloc -> 3 at 3
+alloc 4 at 6 len 123
+alloc 1 at 10 len 123
+realloc -> 7 at 3
+realloc -> 4 at 10
+alloc 1 at 0 len 123
+realloc -> 4 at 10
+alloc 3 at 0 len 123
+realloc -> 2 at 10
+alloc 2 at 3 len 123
+realloc -> 3 at 0
+alloc 3 at 3 len 123
+alloc 3 at 6 len 123
+alloc 1 at 9 len 123
+alloc 2 at 10 len 123
+realloc -> 8 at 12
+realloc -> 5 at 20
+realloc -> 5 at 20
+realloc -> 0 at 0
+alloc 3 at 0 len 123
+alloc 3 at 0 len 123
+alloc 2 at 3 len 123
+alloc 2 at 5 len 123
+realloc -> 0 at 0
+alloc 4 at 3 len 123
+realloc -> 4 at 7
+realloc -> 3 at 7
+alloc 2 at 0 len 123
+realloc -> 1 at 0
+realloc -> 5 at 1
+alloc 1 at 6 len 123
+realloc -> 2 at 1
+alloc 2 at 3 len 123
+realloc -> 3 at 0
+realloc -> 0 at 0
+realloc -> 6 at 10
+alloc 1 at 5 len 123
+alloc 1 at 6 len 123
+alloc 2 at 16 len 123
+realloc -> 7 at 18
+alloc 1 at 5 len 123
+realloc -> 8 at 6
+realloc -> 7 at 6
+alloc 2 at 13 len 123
+alloc 3 at 6 len 123
+realloc -> 2 at 13
+alloc 4 at 9 len 123
+realloc -> 0 at 0
+realloc -> 2 at 6
+alloc 2 at 8 len 123
+recycled, items 123
+alloc 2 at 0 len 123
+realloc -> 2 at 0
+alloc 3 at 2 len 123
+alloc 4 at 5 len 123
+alloc 1 at 5 len 123
+alloc 4 at 6 len 123
+alloc 1 at 10 len 123
+realloc -> 8 at 11
+alloc 4 at 6 len 123
+alloc 2 at 6 len 123
+realloc -> 3 at 8
+realloc -> 0 at 0
+realloc -> 4 at 19
+realloc -> 4 at 11
+realloc -> 3 at 11
+alloc 2 at 0 len 123
+recycled, items 123
+alloc 1 at 0 len 123
+alloc 4 at 1 len 123
+alloc 3 at 5 len 123
+alloc 1 at 8 len 123
+realloc -> 0 at 0
+alloc 3 at 1 len 123
+alloc 1 at 4 len 123
+alloc 4 at 5 len 123
+realloc -> 0 at 0
+realloc -> 4 at 5
+alloc 1 at 0 len 123
+realloc -> 6 at 0
+alloc 1 at 6 len 123
+recycled, items 123
+alloc 3 at 0 len 123
+alloc 2 at 3 len 123
+alloc 2 at 0 len 123
+alloc 2 at 5 len 123
+realloc -> 2 at 0
+realloc -> 4 at 5
+realloc -> 8 at 5
+realloc -> 6 at 5
+realloc -> 2 at 0
+alloc 2 at 0 len 123
+alloc 3 at 2 len 123
+alloc 3 at 0 len 123
+alloc 2 at 3 len 123
+alloc 1 at 5 len 123
+realloc -> 3 at 6
+realloc -> 4 at 0
+realloc -> 3 at 6
+alloc 3 at 0 len 123
+alloc 1 at 3 len 123
+realloc -> 8 at 3
+alloc 3 at 11 len 123
+realloc -> 5 at 11
+alloc 1 at 16 len 123
+alloc 4 at 17 len 123
+realloc -> 2 at 21
+realloc -> 2 at 21
+alloc 3 at 3 len 123
+alloc 2 at 6 len 123
+realloc -> 8 at 23
+alloc 4 at 31 len 123
+alloc 1 at 3 len 123
+alloc 3 at 0 len 123
+realloc -> 8 at 31
+realloc -> 1 at 3
+alloc 1 at 4 len 123
+realloc -> 5 at 23
+realloc -> 6 at 31
+alloc 2 at 8 len 123
+realloc -> 2 at 21
+alloc 4 at 10 len 123
+alloc 1 at 5 len 123
+alloc 2 at 14 len 123
+alloc 1 at 16 len 123
+alloc 2 at 17 len 123
+alloc 4 at 37 len 123
+alloc 3 at 28 len 123
+realloc -> 7 at 41
+realloc -> 8 at 23
+alloc 1 at 0 len 123
+alloc 4 at 17 len 123
+realloc -> 5 at 48
+realloc -> 2 at 14
+alloc 3 at 53 len 123
+realloc -> 7 at 56
+alloc 4 at 63 len 123
+realloc -> 5 at 67
+alloc 2 at 0 len 123
+alloc 4 at 72 len 123
+alloc 4 at 76 len 123
+alloc 3 at 41 len 123
+alloc 1 at 2 len 123
+alloc 1 at 5 len 123
+realloc -> 5 at 76
+realloc -> 4 at 63
+realloc -> 3 at 17
+realloc -> 3 at 63
+alloc 4 at 37 len 123
+realloc -> 6 at 81
+alloc 4 at 44 len 123
+realloc -> 3 at 63
+realloc -> 8 at 87
+realloc -> 8 at 95
+alloc 2 at 8 len 123
+alloc 1 at 2 len 123
+realloc -> 8 at 103
+realloc -> 3 at 23
+realloc -> 2 at 10
+realloc -> 2 at 0
+alloc 1 at 2 len 123
+alloc 1 at 8 len 123
+alloc 1 at 9 len 123
+alloc 1 at 10 len 123
+realloc -> 7 at 20
+alloc 3 at 11 len 123
+alloc 2 at 0 len 123
+realloc -> 2 at 0
+realloc -> 2 at 53
+realloc -> 7 at 63
+realloc -> 8 at 87
+realloc -> 8 at 87
+alloc 4 at 20 len 123
+alloc 1 at 6 len 123
+alloc 2 at 14 len 123
+recycled, items 123
+alloc 4 at 0 len 123
+alloc 4 at 0 len 123
+alloc 4 at 0 len 123
+alloc 4 at 4 len 123
+realloc -> 3 at 4
+realloc -> 2 at 0
+alloc 3 at 7 len 123
+alloc 2 at 2 len 123
+alloc 1 at 4 len 123
+realloc -> 5 at 7
+realloc -> 0 at 0
+realloc -> 3 at 4
+alloc 4 at 12 len 123
+realloc -> 5 at 2
+alloc 3 at 16 len 123
+realloc -> 7 at 19
+alloc 3 at 0 len 123
+alloc 2 at 3 len 123
+realloc -> 1 at 12
+alloc 3 at 5 len 123
+alloc 2 at 8 len 123
+realloc -> 5 at 10
+alloc 1 at 5 len 123
+alloc 3 at 6 len 123
+alloc 3 at 26 len 123
+alloc 3 at 29 len 123
+realloc -> 0 at 0
+alloc 1 at 5 len 123
+alloc 3 at 19 len 123
+realloc -> 2 at 0
+alloc 4 at 9 len 123
+realloc -> 3 at 9
+alloc 4 at 12 len 123
+alloc 3 at 0 len 123
+realloc -> 2 at 12
+realloc -> 6 at 22
+realloc -> 4 at 12
+alloc 4 at 0 len 123
+realloc -> 0 at 0
+alloc 3 at 0 len 123
+realloc -> 3 at 12
+alloc 3 at 3 len 123
+realloc -> 7 at 15
+alloc 2 at 6 len 123
+alloc 3 at 8 len 123
+alloc 3 at 22 len 123
+alloc 4 at 25 len 123
+alloc 2 at 29 len 123
+realloc -> 7 at 31
+realloc -> 8 at 38
+alloc 4 at 46 len 123
+alloc 4 at 50 len 123
+alloc 1 at 3 len 123
+alloc 2 at 4 len 123
+alloc 2 at 25 len 123
+alloc 2 at 27 len 123
+alloc 1 at 3 len 123
+realloc -> 5 at 15
+realloc -> 6 at 54
+alloc 3 at 11 len 123
+alloc 1 at 3 len 123
+alloc 2 at 6 len 123
+alloc 4 at 20 len 123
+alloc 2 at 27 len 123
+realloc -> 0 at 0
+alloc 4 at 11 len 123
+realloc -> 5 at 31
+realloc -> 4 at 15
+alloc 1 at 3 len 123
+alloc 2 at 4 len 123
+alloc 3 at 24 len 123
+alloc 3 at 36 len 123
+realloc -> 5 at 39
+realloc -> 8 at 54
+realloc -> 3 at 0
+alloc 2 at 4 len 123
+realloc -> 8 at 62
+realloc -> 1 at 50
+alloc 2 at 0 len 123
+alloc 4 at 11 len 123
+realloc -> 5 at 62
+realloc -> 1 at 0
+alloc 1 at 1 len 123
+realloc -> 3 at 19
+realloc -> 3 at 54
+realloc -> 8 at 67
+alloc 4 at 27 len 123
+realloc -> 8 at 75
+realloc -> 7 at 83
+alloc 3 at 8 len 123
+alloc 1 at 0 len 123
+alloc 4 at 22 len 123
+alloc 4 at 2 len 123
+alloc 2 at 36 len 123
+alloc 3 at 50 len 123
+alloc 2 at 44 len 123
+alloc 2 at 57 len 123
+alloc 2 at 50 len 123
+alloc 4 at 59 len 123
+realloc -> 7 at 90
+alloc 4 at 52 len 123
+realloc -> 2 at 46
+alloc 3 at 63 len 123
+realloc -> 0 at 0
+realloc -> 8 at 97
+realloc -> 0 at 0
+recycled, items 123
+alloc 3 at 0 len 123
+realloc -> 3 at 0
+alloc 4 at 0 len 123
+alloc 3 at 0 len 123
+alloc 1 at 0 len 123
+alloc 4 at 1 len 123
+realloc -> 5 at 1
+realloc -> 7 at 6
+alloc 3 at 13 len 123
+alloc 1 at 0 len 123
+alloc 3 at 16 len 123
+realloc -> 6 at 13
+alloc 2 at 0 len 123
+alloc 1 at 2 len 123
+alloc 2 at 3 len 123
+realloc -> 3 at 13
+realloc -> 7 at 16
+alloc 3 at 23 len 123
+realloc -> 3 at 23
+realloc -> 7 at 26
+alloc 4 at 0 len 123
+alloc 2 at 4 len 123
+realloc -> 8 at 6
+alloc 2 at 14 len 123
+realloc -> 0 at 0
+alloc 1 at 0 len 123
+realloc -> 3 at 1
+alloc 3 at 23 len 123
+alloc 4 at 33 len 123
+alloc 2 at 37 len 123
+realloc -> 0 at 0
+alloc 4 at 26 len 123
+realloc -> 5 at 39
+realloc -> 4 at 26
+alloc 4 at 44 len 123
+alloc 4 at 30 len 123
+alloc 3 at 1 len 123
+realloc -> 7 at 23
+realloc -> 5 at 39
+realloc -> 6 at 44
+realloc -> 3 at 44
+alloc 3 at 6 len 123
+alloc 2 at 9 len 123
+realloc -> 6 at 23
+realloc -> 3 at 44
+alloc 2 at 11 len 123
+realloc -> 7 at 47
+realloc -> 7 at 30
+realloc -> 3 at 11
+recycled, items 123
+alloc 1 at 0 len 123
+alloc 1 at 0 len 123
+alloc 4 at 0 len 123
+alloc 4 at 0 len 123
+realloc -> 4 at 0
+alloc 3 at 4 len 123
+realloc -> 0 at 0
+realloc -> 7 at 0
+alloc 1 at 0 len 123
+alloc 4 at 0 len 123
+alloc 4 at 0 len 123
+alloc 1 at 4 len 123
+realloc -> 7 at 4
+realloc -> 1 at 4
+alloc 1 at 5 len 123
+alloc 4 at 6 len 123
+alloc 4 at 10 len 123
+alloc 4 at 14 len 123
+alloc 1 at 18 len 123
+alloc 1 at 19 len 123
+realloc -> 2 at 10
+realloc -> 8 at 19
+alloc 4 at 0 len 123
+realloc -> 1 at 18
+alloc 1 at 10 len 123
+realloc -> 8 at 6
+alloc 4 at 6 len 123
+alloc 1 at 0 len 123
+realloc -> 0 at 0
+alloc 3 at 0 len 123
+alloc 4 at 3 len 123
+alloc 2 at 7 len 123
+realloc -> 7 at 9
+alloc 3 at 0 len 123
+alloc 4 at 16 len 123
+alloc 4 at 20 len 123
+alloc 1 at 24 len 123
+alloc 1 at 9 len 123
+realloc -> 7 at 25
+alloc 2 at 7 len 123
+realloc -> 5 at 16
+alloc 2 at 10 len 123
+realloc -> 1 at 25
+realloc -> 5 at 26
+alloc 2 at 7 len 123
+alloc 2 at 10 len 123
+realloc -> 7 at 31
+alloc 2 at 12 len 123
+alloc 4 at 21 len 123
+alloc 1 at 7 len 123
+alloc 1 at 8 len 123
+realloc -> 4 at 12
+alloc 2 at 0 len 123
+alloc 3 at 7 len 123
+realloc -> 7 at 12
+alloc 4 at 2 len 123
+realloc -> 2 at 10
+realloc -> 1 at 0
+alloc 4 at 25 len 123
+realloc -> 7 at 25
+realloc -> 6 at 0
+realloc -> 7 at 0
+alloc 3 at 12 len 123
+realloc -> 4 at 21
+alloc 4 at 15 len 123
+realloc -> 6 at 32
+realloc -> 5 at 32
+alloc 2 at 10 len 123
+alloc 3 at 37 len 123
+realloc -> 7 at 37
+realloc -> 6 at 44
+realloc -> 3 at 21
+alloc 2 at 0 len 123
+realloc -> 4 at 44
+alloc 2 at 0 len 123
+realloc -> 1 at 44
+realloc -> 4 at 44
+realloc -> 5 at 25
+alloc 1 at 2 len 123
+realloc -> 3 at 3
+alloc 3 at 3 len 123
+alloc 3 at 0 len 123
+alloc 3 at 0 len 123
+alloc 2 at 0 len 123
+alloc 1 at 0 len 123
+realloc -> 8 at 0
+realloc -> 3 at 0
+alloc 4 at 3 len 123
+realloc -> 0 at 0
+realloc -> 3 at 3
+alloc 1 at 0 len 123
+alloc 1 at 0 len 123
+alloc 3 at 6 len 123
+realloc -> 5 at 0
+realloc -> 4 at 6
+alloc 1 at 0 len 123
+alloc 4 at 1 len 123
+realloc -> 8 at 5
+realloc -> 2 at 1
+realloc -> 7 at 5
+realloc -> 1 at 5
+alloc 4 at 0 len 123
+realloc -> 8 at 6
+realloc -> 2 at 0
+realloc -> 6 at 0
+alloc 4 at 6 len 123
+alloc 4 at 10 len 123
+alloc 2 at 6 len 123
+alloc 3 at 14 len 123
+realloc -> 2 at 6
+recycled, items 123
+alloc 3 at 0 len 123
+alloc 3 at 0 len 123
+alloc 1 at 0 len 123
+realloc -> 3 at 0
+alloc 2 at 3 len 123
+alloc 4 at 3 len 123
+alloc 2 at 7 len 123
+alloc 4 at 0 len 123
+alloc 3 at 4 len 123
+realloc -> 1 at 4
+alloc 3 at 5 len 123
+alloc 2 at 0 len 123
+alloc 4 at 8 len 123
+alloc 2 at 2 len 123
+realloc -> 5 at 0
+recycled, items 123
+alloc 4 at 0 len 123
+realloc -> 1 at 0
+realloc -> 2 at 0
+alloc 2 at 2 len 123
+realloc -> 6 at 0
+alloc 2 at 6 len 123
+alloc 2 at 0 len 123
+alloc 1 at 2 len 123
+realloc -> 4 at 0
+realloc -> 1 at 0
+alloc 2 at 0 len 123
+alloc 2 at 0 len 123
+realloc -> 4 at 0
+alloc 3 at 0 len 123
+alloc 2 at 3 len 123
+alloc 4 at 5 len 123
+realloc -> 4 at 5
+alloc 3 at 0 len 123
+alloc 2 at 9 len 123
+realloc -> 7 at 11
+alloc 4 at 11 len 123
+realloc -> 1 at 5
+alloc 4 at 5 len 123
+realloc -> 5 at 11
+realloc -> 5 at 16
+realloc -> 8 at 21
+alloc 1 at 0 len 123
+realloc -> 1 at 21
+alloc 3 at 1 len 123
+realloc -> 4 at 16
+alloc 4 at 4 len 123
+alloc 1 at 8 len 123
+realloc -> 5 at 9
+alloc 4 at 14 len 123
+alloc 2 at 1 len 123
+realloc -> 1 at 8
+realloc -> 5 at 14
+realloc -> 2 at 1
+realloc -> 0 at 0
+realloc -> 2 at 1
+realloc -> 1 at 4
+realloc -> 2 at 14
+realloc -> 3 at 4
+alloc 1 at 0 len 123
+realloc -> 7 at 7
+alloc 4 at 1 len 123
+realloc -> 5 at 16
+realloc -> 0 at 0
+realloc -> 1 at 14
+realloc -> 4 at 7
+alloc 2 at 5 len 123
+alloc 2 at 5 len 123
+realloc -> 2 at 5
+realloc -> 8 at 5
+alloc 2 at 13 len 123
+alloc 2 at 15 len 123
+alloc 4 at 17 len 123
+realloc -> 7 at 21
+realloc -> 8 at 17
+alloc 4 at 0 len 123
+realloc -> 2 at 0
+alloc 3 at 2 len 123
+realloc -> 7 at 17
+alloc 4 at 24 len 123
+alloc 4 at 28 len 123
+realloc -> 2 at 28
+alloc 3 at 13 len 123
+alloc 3 at 30 len 123
+alloc 2 at 33 len 123
+alloc 1 at 16 len 123
+alloc 2 at 35 len 123
+realloc -> 4 at 37
+alloc 3 at 41 len 123
+alloc 4 at 44 len 123
+alloc 3 at 48 len 123
+realloc -> 5 at 28
+realloc -> 0 at 0
+realloc -> 8 at 51
+alloc 3 at 2 len 123
+realloc -> 4 at 5
+realloc -> 0 at 0
+realloc -> 3 at 0
+realloc -> 1 at 28
+realloc -> 3 at 28
+realloc -> 6 at 5
+alloc 4 at 16 len 123
+alloc 3 at 20 len 123
+alloc 3 at 16 len 123
+alloc 4 at 23 len 123
+alloc 3 at 27 len 123
+realloc -> 0 at 0
+realloc -> 8 at 27
+realloc -> 2 at 44
+alloc 3 at 0 len 123
+realloc -> 7 at 35
+realloc -> 4 at 23
+realloc -> 8 at 23
+realloc -> 2 at 13
+alloc 2 at 3 len 123
+alloc 1 at 11 len 123
+realloc -> 0 at 0
+recycled, items 123
+alloc 4 at 0 len 123
+alloc 3 at 4 len 123
+alloc 1 at 7 len 123
+realloc -> 1 at 7
+alloc 4 at 0 len 123
+alloc 4 at 0 len 123
+realloc -> 8 at 0
+alloc 3 at 8 len 123
+alloc 1 at 11 len 123
+realloc -> 1 at 0
+alloc 4 at 1 len 123
+alloc 4 at 12 len 123
+realloc -> 4 at 1
+realloc -> 2 at 5
+alloc 1 at 5 len 123
+alloc 2 at 6 len 123
+alloc 3 at 16 len 123
+realloc -> 8 at 19
+alloc 3 at 27 len 123
+alloc 3 at 16 len 123
+alloc 3 at 30 len 123
+realloc -> 7 at 30
+alloc 2 at 16 len 123
+alloc 1 at 0 len 123
+realloc -> 8 at 30
+realloc -> 7 at 19
+alloc 4 at 6 len 123
+alloc 4 at 26 len 123
+alloc 2 at 10 len 123
+realloc -> 4 at 38
+realloc -> 5 at 10
+alloc 1 at 15 len 123
+realloc -> 5 at 42
+alloc 2 at 1 len 123
+alloc 4 at 10 len 123
+realloc -> 8 at 47
+alloc 1 at 3 len 123
+alloc 1 at 4 len 123
+true 200
+0
