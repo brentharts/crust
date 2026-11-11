@@ -22,6 +22,11 @@ def read(name):
 
 def drive(*files, out, cwd=None, env=None, extra=()):
     e = dict(os.environ, **(env or {}))
+    # shivyc leaves its .o/.s beside the sources, so build from a copy of the examples
+    work = tempfile.mkdtemp(prefix="goose_src_")
+    shutil.copytree(IX, os.path.join(work, "interop"))
+    files = [os.path.join(work, "interop", os.path.basename(f)) if os.path.dirname(f) == IX else f
+             for f in files]
     return subprocess.run([sys.executable, "-m", "shivyc.main", *extra, *files, "-o", out],
                           cwd=ROOT, capture_output=True, text=True, env=e)
 
