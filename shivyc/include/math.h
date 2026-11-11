@@ -94,6 +94,18 @@ float       sqrtf(float);
 float       tanf(float);
 float       tanhf(float);
 float       truncf(float);
+float       fmaf(float, float, float);
+float       exp2f(float);
+float       expm1f(float);
+float       log1pf(float);
+float       asinhf(float);
+float       acoshf(float);
+float       atanhf(float);
+float       nearbyintf(float);
+float       rintf(float);
+long        lroundf(float);
+long        lrintf(float);
+float       nanf(const char *);
 
 /* `long double` is `double` here, so these are the same functions under
  * different names rather than a wider format. */
