@@ -205,10 +205,14 @@ overflow checks, and the exact text of runtime aborts.
 
 ## Findings about the Crust toolchain
 
-- **shivyc miscompiles `if (K < 0 || p + n * sizeof(T) > q) ...`** when `K` is a
-  constant, `p`/`q` are pointers and the statement follows a store through a
-  struct member: the program crashes at run time. Written as two `if`s it is
-  correct. The emitted C avoids the pattern; the bug itself is not fixed here.
-- shivyc's `<stdlib.h>` has no `strtod`/`strtof`, and `<math.h>` lacks `fmaf`,
-  `exp2f`, `expm1f` and friends (which is why Goose's own emitted C does not
-  compile under shivyc). The runtime here declares `strtod` itself.
+- Found while building this and **fixed in shivyc** (regression tests: `tests/test_cfix_init_probe.py`,
+  sources in `tests/fixtures/cfix/`):
+  - `if (K < 0 || p[k] + n > q)` with a constant `K` crashed at run time. `||`/`&&` probed the
+    right operand on a scratch IL that was not marked as a probe, so the operand cached
+    temporaries only that scratch IL defined (`shivyc/tree/boolean_exprs.py`).
+  - `struct { long d[4]; long n; } x = {0}` and `long a[2][3] = {1, 2, 3, 4}` were rejected: no
+    brace elision. A string literal initializing a `char` array member or element
+    (`{1, "abc"}`, `char m[2][4] = {"ab", "cd"}`) was rejected too (`shivyc/tree/general_nodes.py`).
+  - `<stdlib.h>` lacked `strtod`, `strtof`, `strtoll`, `strtoull`, `atof`, `atoll`, `llabs`, and
+    `<math.h>` lacked `fmaf`, `exp2f`, `expm1f`, `log1pf` and a few more.
+  The emitted C still uses the two-statement `if` and `{{0}}` forms, which are right under any C compiler.
