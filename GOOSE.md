@@ -74,10 +74,28 @@ the language server and JIT, `--standalone`.
 0. **Oracle and scope** (this file; Goose built, samples verified).
 1. **Front end**: `tools/goose.py`. Parse all 32 samples, then type-check the plain subset.
 2. **Lowering**: `tools/goose2c.py`. Plain subset, then Phase 2 in the order above.
-3. **Integration**: `tests/test_goose.py` (samples against the oracle, pinned
-   refusals), `examples/goose/`, a Makefile target, `.goose` handling in the driver.
+3. **Integration** (done): `tests/test_goose.py`, `tests/test_goose2c.py` (samples against the
+   oracle, pinned refusals), `tests/test_goose_driver.py`, `examples/goose/`, `make test_goose` /
+   `make goose`, `.goose` handling in `shivyc/main.py`.
 4. **Stretch**: roots/lifetime checking tied into `shivyc/memory_safety.py`,
    bounds-check elimination, `extern fn`, stdlib modules.
+
+## Building a Goose program with Crust
+
+```
+python3 crust prog.goose -o prog          # translate to C, compile with ShivyC, link
+python3 -m shivyc.main prog.goose -o prog # the same
+make goose SRC=prog.goose OUT=prog        # the same, as a make target
+python3 tools/goose2c.py prog.goose -o prog.c   # just the C
+make test_goose                           # parser, translator, examples, samples, driver
+```
+
+`shivyc/main.py` handles a `.goose` input like a `.py` one: `process_goose_file` runs
+`tools/goose2c.py`, then hands the C to the ordinary C pipeline (`-c`, `-S`, other
+flags, and mixing in `.c` files all work). A refusal is a normal diagnostic that names
+the `.goose` line. Programs that `import` a library module (`std`, `math`, `os`, ...)
+need Goose's `stdlib/` source: set `GOOSE_ROOT`, copy it to `crust/lib/goose/`, or keep a
+`goose` checkout next to this one.
 
 ## Phase 0 findings
 
@@ -112,7 +130,7 @@ the language server and JIT, `--standalone`.
 | Relative references `T&<u32>`, `T&<u16 in pool>` | accepted and represented as plain pointers; only the *size* differs, and `bytes_of(..).len` reports Goose's packed size for such types |
 | Fixed-mode enums, variant literals, `match` on variants, case functions, `==` | done |
 | Trailing blocks and generic `<T, F>` helpers (`xs.each_pair() { a, b => .. }`, `it`, `return` inside a block leaves the enclosing function) | done; a helper taking a function is expanded inline at the call site (not recursively), and may give back a growable array |
-| Namespaces, `import std;` and other library modules | done: the library is compiled from its own Goose source (`GOOSE_ROOT`, `crust/lib/goose` or a sibling `goose` checkout), only what a program reaches; scalar/slice `extern fn`s of the library map to small C helpers |
+| Namespaces (`namespace x;` in a library, `ns::f`, `ns::Type`), `import std;` and other library modules | done (base64 and csv run; regex and json need frozen arrays of enums and variable-mode enums): the library is compiled from its own Goose source (`GOOSE_ROOT`, `crust/lib/goose` or a sibling `goose` checkout), only what a program reaches; scalar/slice `extern fn`s of the library map to small C helpers |
 | `defer`, `varint`, variable-mode enums (`Shape..`), `self`, namespaced types, `thread_fn`, user `extern fn`, `import gfx`, `to_bytes`/`from_bytes` | refused, with the line and "is not in the Crust Goose subset yet" |
 
 **Goose's own samples** (`tests/test_goose2c.py`, needs a Goose checkout; each is built with gcc and with
@@ -124,7 +142,7 @@ shivyc and compared with the output Goose ships): `01_tour 02_memory 03_strings 
 |--------|-------|
 | 05_shapes, 16_records, 18_json, 25_serialize | `varint`, variable-mode (packed) enums and structs, raw serialization |
 | 13_linked_list | `self` inside a slot-pool `alloc_with` block |
-| 26_file_tree | namespaced types |
+| 26_file_tree | `slice_pool`, which sits on Goose's C span-tree runtime (`gs_slice_pool_*`) |
 | 23_mandelbrot_threads | `thread_fn` |
 | 24_call_c | user `extern fn` against a C header that uses Goose's own generated names |
 | 27-32 | the `gfx` / `ui` / `physics` libraries (graphics; out of scope) |

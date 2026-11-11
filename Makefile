@@ -106,6 +106,18 @@ test_crust:
 test_fast_crust:
 	@python3 tools/crust_examples.py --fast -v
 
+# Goose subset (see GOOSE.md): parser, translator, the examples in examples/goose/,
+# Goose's own samples (needs a checkout: GOOSE_ROOT=/path/to/goose, or a `goose`
+# directory next to this one), and the driver building a .goose end to end.
+test_goose:
+	python3 -m unittest tests.test_goose tests.test_goose2c tests.test_goose_driver 2>&1 | tail -5
+
+# Build one program:  make goose SRC=prog.goose OUT=prog     (OUT defaults to the name without .goose)
+# Or directly:        python3 crust prog.goose -o prog
+goose:
+	@test -n "$(SRC)" || { echo "usage: make goose SRC=prog.goose [OUT=prog]"; exit 2; }
+	python3 crust $(SRC) -o $(or $(OUT),$(basename $(SRC)))
+
 # Memory safety, two tiers over the same examples/memory/ corpus.
 #
 #   make check-memory   the *static* whole-program pass: proves what it can at
