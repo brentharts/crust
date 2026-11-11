@@ -97,6 +97,59 @@ the `.goose` line. Programs that `import` a library module (`std`, `math`, `os`,
 need Goose's `stdlib/` source: set `GOOSE_ROOT`, copy it to `crust/lib/goose/`, or keep a
 `goose` checkout next to this one.
 
+## Interop: Goose beside C, Rust and C#
+
+Only plain C shapes cross the boundary, so any of the languages can call any other through
+ordinary C symbols.
+
+| Goose | C |
+|---|---|
+| `i64`, `i32`, `f64`, ... | the same scalar; `bool` is `uint8_t` |
+| `T&` (reference to a scalar) | `T *` |
+| `T[:]` (slice of scalars) | two arguments: `T *data, int64_t len` |
+| first result | the C return value |
+| further results | `T *outN` pointers after the parameters |
+
+Structs, growable arrays, enums and slice results are refused with a diagnostic that says the
+type has no plain C shape.
+
+- `export fn f(...) -> ...` defines a C function named `f`. It calls `gs_init()` first, which is
+  idempotent, so module-level `var`s are set up on the first call from any language.
+- `extern fn f(...) -> ...;` declares a C function (no body); `= "sym"` after the signature
+  names a different C symbol.
+- Library mode (`--lib`, which `#include "x.goose"` always uses): no C `main` is emitted, and
+  a Goose `main` becomes `goose_main`. A file with no `main` is accepted when it has exports.
+- `#include "x.goose"` lowers the file at the include point, like `.rs` / `.cs` / `.py`. Limit:
+  one `.goose` per translation unit.
+- Rust and C# calling a Goose export need a prototype or the `.goose` include before the
+  `.rs` / `.cs` include (the Rust subset has no `extern "C"` blocks). A C# `class Side { static
+  long CsUsesGoose }` lowers to the C name `Side_CsUsesGoose`.
+
+### A Rust span allocator behind `slice_pool`
+
+`lib/goose/rust/` holds a second `slice_pool_internal` whose free-run decisions (first fit,
+extending the last run, merging neighbours, growing in place) are made in Rust,
+`lib/goose/rust/span_runs.rs`, a port of the first-fit/coalescing idea in
+`examples/rpython2c/mbos/alloc.rs` from byte blocks to pool cells. Goose copies the runs out of
+its leaf nodes into a flat `(start, count)` array, calls `span_place` / `span_release` /
+`span_regrow` through `extern fn`, and writes the runs back, so the leaf layout `recycle_all`
+relies on is unchanged. The copy makes each operation linear in the number of free runs, as the
+pure Goose version already is.
+
+    GOOSE_LIB=lib/goose/rust python3 crust -I lib/goose/rust examples/goose/interop/rust_pool.c -o rust_pool
+
+`GOOSE_LIB` (a path list) is searched before `lib/goose/override/`, and an `extern fn` in a file
+found there is a user extern, supplied by C, Rust or C#. The Rust file must follow the Goose one
+in the same C file. `tests/test_goose_interop.py` checks that it prints what the pure Goose
+version and Goose's own example output print, including runs past one leaf.
+
+### A C# class calling Goose
+
+`examples/goose/interop/cs_demo.{goose,cs,c}`: `Report.Longest` calls the exports
+`collatz_steps` and `count_call`.
+
+Examples and tests: `examples/goose/interop/`, `tests/test_goose_interop.py`.
+
 ## Phase 0 findings
 
 - The oracle builds (Release, ~2 min on 2 cores) and `samples/01_tour.goose`
@@ -130,19 +183,19 @@ need Goose's `stdlib/` source: set `GOOSE_ROOT`, copy it to `crust/lib/goose/`, 
 | Relative references `T&<u32>`, `T&<u16 in pool>` | accepted and represented as plain pointers; only the *size* differs, and `bytes_of(..).len` reports Goose's packed size for such types |
 | Fixed-mode enums, variant literals, `match` on variants, case functions, `==` | done |
 | Trailing blocks and generic `<T, F>` helpers (`xs.each_pair() { a, b => .. }`, `it`, `return` inside a block leaves the enclosing function) | done; a helper taking a function is expanded inline at the call site (not recursively), and may give back a growable array |
+| Crust's own library versions (`lib/goose/override/`) | searched before `GOOSE_ROOT`. `slice_pool_internal.goose` replaces Goose's C span tree (`gs_slice_pool_*`) with the same four functions in plain Goose: free runs in one sorted list (first fit, merging on release, in-place regrow), stored in leaves that keep `recycle_all` working. Placements are identical to Goose's (checked against it with random alloc/free/realloc/recycle sequences, `examples/goose/lib_slice_pool.goose`); only the speed differs, linear in the number of free runs instead of logarithmic, and `trim` does nothing |
 | Namespaces (`namespace x;` in a library, `ns::f`, `ns::Type`), `import std;` and other library modules | done (base64 and csv run; regex and json need frozen arrays of enums and variable-mode enums): the library is compiled from its own Goose source (`GOOSE_ROOT`, `crust/lib/goose` or a sibling `goose` checkout), only what a program reaches; scalar/slice `extern fn`s of the library map to small C helpers |
 | `defer`, `varint`, variable-mode enums (`Shape..`), `self`, namespaced types, `thread_fn`, user `extern fn`, `import gfx`, `to_bytes`/`from_bytes` | refused, with the line and "is not in the Crust Goose subset yet" |
 
 **Goose's own samples** (`tests/test_goose2c.py`, needs a Goose checkout; each is built with gcc and with
 shivyc and compared with the output Goose ships): `01_tour 02_memory 03_strings 04_errors 06_functions
 07_sieve 08_bignum 09_sorting 10_sudoku 11_maze 12_huffman 14_bst 15_word_freq 17_calc 19_vm 20_life 21_raytrace
-22_image_filters`: 18 of 32 pass. The rest:
+22_image_filters 26_file_tree`: 19 of 32 pass. The rest:
 
 | Sample | Needs |
 |--------|-------|
 | 05_shapes, 16_records, 18_json, 25_serialize | `varint`, variable-mode (packed) enums and structs, raw serialization |
 | 13_linked_list | `self` inside a slot-pool `alloc_with` block |
-| 26_file_tree | `slice_pool`, which sits on Goose's C span-tree runtime (`gs_slice_pool_*`) |
 | 23_mandelbrot_threads | `thread_fn` |
 | 24_call_c | user `extern fn` against a C header that uses Goose's own generated names |
 | 27-32 | the `gfx` / `ui` / `physics` libraries (graphics; out of scope) |

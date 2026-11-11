@@ -110,7 +110,7 @@ test_fast_crust:
 # Goose's own samples (needs a checkout: GOOSE_ROOT=/path/to/goose, or a `goose`
 # directory next to this one), and the driver building a .goose end to end.
 test_goose:
-	python3 -m unittest tests.test_goose tests.test_goose2c tests.test_goose_driver 2>&1 | tail -5
+	python3 -m unittest tests.test_goose tests.test_goose2c tests.test_goose_driver tests.test_goose_interop 2>&1 | tail -5
 
 # Build one program:  make goose SRC=prog.goose OUT=prog     (OUT defaults to the name without .goose)
 # Or directly:        python3 crust prog.goose -o prog
